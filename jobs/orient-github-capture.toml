@@ -1,0 +1,25 @@
+name = "orient-github-capture"
+description = "Captures GitHub activity into Orient every fifteen minutes. Useful rather than required, so a fresh install does not start it."
+label = "com.convivy.orient-github-capture"
+command = [
+  "{deploy}/convivy-orient/.venv/bin/python",
+  "{deploy}/convivy-orient/github_capture.py",
+]
+platforms = ["macos", "linux"]
+scope = "user"
+enabled-by-default = false
+working-directory = "{deploy}/convivy-orient"
+
+[log]
+stdout = "{state}/orient-github-capture.log"
+stderr = "{state}/orient-github-capture.err.log"
+
+[environment]
+HOME = "{home}"
+ORIENT_CONFIG_ROOT = "{state}/orient"
+ORIENT_STATE_ROOT = "{state}/orient"
+PATH = "{bin}:/usr/bin:/bin"
+VAULTS_ON_LIBRARY = "1"
+
+[schedule]
+every-seconds = 900

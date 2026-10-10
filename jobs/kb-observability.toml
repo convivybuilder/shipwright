@@ -1,0 +1,25 @@
+name = "kb-observability"
+description = "Builds the Reference Room's health report once each morning. A reporting job, so a fresh install does not start it."
+label = "com.convivy.kb-observability"
+command = [
+  "{deploy}/convivy-orient/.venv/bin/python",
+  "{deploy}/convivy-orient/kb_build.py",
+]
+platforms = ["macos", "linux"]
+scope = "user"
+enabled-by-default = false
+working-directory = "{deploy}/convivy-orient"
+
+[log]
+stdout = "{state}/kb-observability.log"
+stderr = "{state}/kb-observability.err.log"
+
+[environment]
+HOME = "{home}"
+ORIENT_CONFIG_ROOT = "{state}/orient"
+ORIENT_STATE_ROOT = "{state}/orient"
+PATH = "{bin}:/usr/bin:/bin"
+
+[[schedule.calendar]]
+hour = 7
+minute = 48

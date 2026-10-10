@@ -1,0 +1,31 @@
+name = "ci-result-fetch"
+description = "Fetches CI results for the Library's own pull requests every fifteen minutes. Only useful once a crew is opening them, so a fresh install does not start it."
+label = "com.convivy.library.ci-result-fetch"
+command = [
+  "{deploy}/library/.venv/bin/python3",
+  "{deploy}/library/bin/ci_result_fetch.py",
+]
+platforms = ["macos", "linux"]
+scope = "user"
+enabled-by-default = false
+working-directory = "{deploy}/library"
+
+[log]
+stdout = "{state}/ci-result-fetch.log"
+stderr = "{state}/ci-result-fetch.log"
+
+# The fetcher keeps its cursor and its token in `LIBRARY_STATE_DIR`, which
+# defaults to `~/.library`. It points at the Library's one state directory, the
+# same one `library.toml` gives the server.
+[environment]
+HOME = "{home}"
+LIBRARY_STATE_DIR = "{state}/library"
+# The projects registry it derives the repositories to fetch CI results for
+# from, the same file the Library job names under the same two names.
+PROJECTS_JSON = "{deploy}/agent-platform/config/projects.json"
+AGENT_PLATFORM_PROJECTS = "{deploy}/agent-platform/config/projects.json"
+PATH = "{bin}:/usr/bin:/bin"
+
+[schedule]
+at-load = true
+every-seconds = 900

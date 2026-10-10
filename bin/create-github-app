@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""Create the GitHub App a single-account install's agents act as, from a
+manifest the operator confirms in the browser.
+
+    bin/create-github-app [--org <name>] [--port <n>]   open the page this prints, confirm on GitHub
+    bin/create-github-app --code <code>                 finish with the code from the address bar
+    bin/create-github-app --read-only ...               the optional second App, read-only
+
+**THE MANIFEST FIXES THE PERMISSIONS, AND THE OPERATOR ONLY CONFIRMS THEM.**
+The App gets contents write, pull requests write, checks read, actions read
+and metadata read, and never administration, so it cannot change the ruleset
+that gates main. `--read-only` makes the second App, with contents and
+metadata read alone, for repositories agents read and never write.
+
+**HOW THE CODE COMES BACK.** This serves a page on 127.0.0.1 that posts the
+manifest to GitHub. After the operator clicks Create, GitHub redirects the
+browser to this listener with a one-time code, which is exchanged for the
+App's id and private key. Over SSH, forward the port first
+(`ssh -L <port>:127.0.0.1:<port> <host>`, with the same `--port` here). When
+the redirect cannot reach the listener, the browser's address bar still holds
+`?code=...`: run again with `--code`.
+
+**IT NEVER REPLACES A KEY.** The id and key are written to the `github-app`
+directory under Builder's configuration directory, `~/.config/convivy`
+(`github-app-read-only` for `--read-only`), the key at mode 600, and an
+existing key there stops the run. The App's client and webhook secrets are
+not stored: nothing on the install uses them.
+
+Install the App on your repositories afterwards, at the address this prints.
+"""
+
+from __future__ import annotations
+
+import argparse
+import html
+import http.server
+import json
+import os
+import pathlib
+import secrets
+import sys
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+
+PROG = "create-github-app"
+API = "https://api.github.com"
+WEB = "https://github.com"
+WAIT_SECONDS = 600
+
+PERMISSIONS = {
+    "write": {"contents": "write", "pull_requests": "write", "checks": "read",
+              "actions": "read", "metadata": "read"},
+    "read-only": {"contents": "read", "metadata": "read"},
+}
+# A permission that would let the App change what gates main.
+FORBIDDEN = ("administration",)
+
+
+class Refused(Exception):
+    """Something the operator has to decide about. Never a stack trace."""
+
+
+def config_dir(read_only: bool) -> pathlib.Path:
+    # Overridable so the tests run against a temporary directory.
+    base = os.environ.get("BUILDER_CONFIG_DIR")
+    root = pathlib.Path(base) if base else pathlib.Path.home() / ".config" / "convivy"
+    return root / ("github-app-read-only" if read_only else "github-app")
+
+
+def manifest(kind: str, redirect: str, name: str) -> dict:
+    return {
+        "name": name,
+        "url": WEB,
+        "redirect_url": redirect,
+        "public": False,
+        "hook_attributes": {"url": WEB, "active": False},
+        "default_permissions": dict(PERMISSIONS[kind]),
+        "default_events": [],
+    }
+
+
+def create_url(org: str | None, state: str) -> str:
+    where = f"/organizations/{urllib.parse.quote(org)}" if org else ""
+    return f"{WEB}{where}/settings/apps/new?state={state}"
+
+
+def form_page(action: str, body: dict) -> bytes:
+    return f"""<!doctype html>
+<meta charset="utf-8"><title>Create the Builder GitHub App</title>
+<form method="post" action="{html.escape(action)}">
+<p>This creates the GitHub App Builder's agents act as. GitHub shows its permissions next.</p>
+<input type="hidden" name="manifest" value="{html.escape(json.dumps(body))}">
+<button type="submit">Continue to GitHub</button>
+</form>
+""".encode()
+
+
+# The code.
+
+class Listener(http.server.ThreadingHTTPServer):
+    page: bytes
+    state: str
+    code: str | None = None
+    done: threading.Event
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server: Listener
+
+    def log_message(self, *args) -> None:
+        pass
+
+    def reply(self, status: int, body: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        url = urllib.parse.urlsplit(self.path)
+        if url.path == "/":
+            self.reply(200, self.server.page)
+            return
+        if url.path == "/callback":
+            query = urllib.parse.parse_qs(url.query)
+            code, state = query.get("code", [""])[0], query.get("state", [""])[0]
+            if not code or not secrets.compare_digest(state, self.server.state):
+                self.reply(400, b"This is not the redirect this run is waiting for.")
+                return
+            self.server.code = code
+            self.reply(200, b"Done. Return to the terminal.")
+            self.server.done.set()
+            return
+        self.reply(404, b"")
+
+
+def wait_for_code(kind: str, org: str | None, port: int, name: str,
+                  wait: float = WAIT_SECONDS, ready=None) -> str:
+    try:
+        server = Listener(("127.0.0.1", port), Handler)
+    except OSError as e:
+        raise Refused(f"cannot listen on 127.0.0.1:{port} ({e.strerror}). Choose another "
+                      f"--port, or finish with --code.")
+    server.state = secrets.token_urlsafe(24)
+    server.done = threading.Event()
+    bound = server.server_address[1]
+    redirect = f"http://127.0.0.1:{bound}/callback"
+    server.page = form_page(create_url(org, server.state), manifest(kind, redirect, name))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        print(f"Open http://127.0.0.1:{bound}/ in a browser on this machine, then create "
+              f"the App on GitHub. Waiting up to {int(wait // 60)} minutes.", flush=True)
+        if ready:
+            ready(bound)
+        if not server.done.wait(wait):
+            raise Refused("no redirect arrived. If GitHub showed an address with ?code= in "
+                          "it, run again with --code <that code>.")
+        return server.code
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def convert(code: str, opener=urllib.request.urlopen) -> dict:
+    if not code or not all(c.isalnum() or c in "-_" for c in code):
+        raise Refused("--code takes the value after ?code= in the address GitHub redirected to.")
+    req = urllib.request.Request(f"{API}/app-manifests/{code}/conversions", method="POST",
+                                 headers={"Accept": "application/vnd.github+json",
+                                          "X-GitHub-Api-Version": "2022-11-28",
+                                          "User-Agent": PROG})
+    try:
+        with opener(req, timeout=30) as resp:
+            status, raw = resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        status, raw = e.code, e.read()
+    except urllib.error.URLError as e:
+        raise Refused(f"GitHub could not be reached ({e.reason}).")
+    try:
+        app = json.loads(raw or b"{}")
+    except ValueError:
+        app = {}
+    if status != 201 or not isinstance(app, dict) or not app.get("id") or not app.get("pem"):
+        said = app.get("message") if isinstance(app, dict) else None
+        raise Refused(f"GitHub would not exchange the code ({status}): {said or 'no message'}. "
+                      f"A code works once, within an hour.")
+    return app
+
+
+def permission_problem(app: dict, kind: str) -> str | None:
+    granted = app.get("permissions") or {}
+    bad = [p for p in FORBIDDEN if p in granted]
+    if bad:
+        return f"the App holds {', '.join(bad)}, which can change the ruleset that gates main"
+    want = PERMISSIONS[kind]
+    wrong = {p: granted.get(p) for p in want if granted.get(p) != want[p]}
+    extra = sorted(set(granted) - set(want))
+    if wrong or extra:
+        return f"the App's permissions are {granted}, not {want}"
+    return None
+
+
+def store(app: dict, cfg: pathlib.Path) -> None:
+    key = cfg / "app.pem"
+    if os.path.lexists(key):
+        raise Refused(f"{key} already exists, and this never replaces a key. Move it aside "
+                      f"first if this App replaces that one.")
+    cfg.mkdir(parents=True, exist_ok=True)
+    os.chmod(cfg, 0o700)
+    fd = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(app["pem"])
+    (cfg / "app-id").write_text(f"{app['id']}\n")
+    for stale in ("installation-id", "token.json"):
+        try:
+            (cfg / stale).unlink()
+        except FileNotFoundError:
+            pass
+
+
+def main(argv: list[str], opener=urllib.request.urlopen) -> int:
+    parser = argparse.ArgumentParser(prog=PROG, description=__doc__.splitlines()[0])
+    parser.add_argument("--org", help="create the App under this organisation "
+                                      "(default: your own account)")
+    parser.add_argument("--port", type=int, default=0,
+                        help="the local port to listen on (default: any free one)")
+    parser.add_argument("--code", help="finish with the code GitHub redirected to")
+    parser.add_argument("--read-only", action="store_true",
+                        help="create the second App, which reads and never writes")
+    parser.add_argument("--name", help="the App's name on GitHub (must be unique there)")
+    args = parser.parse_args(argv)
+    kind = "read-only" if args.read_only else "write"
+    cfg = config_dir(args.read_only)
+    name = args.name or ("Builder agents (read-only)" if args.read_only else "Builder agents")
+    try:
+        if os.path.lexists(cfg / "app.pem"):
+            raise Refused(f"{cfg / 'app.pem'} already exists, and this never replaces a key.")
+        code = args.code or wait_for_code(kind, args.org, args.port, name)
+        app = convert(code, opener)
+        problem = permission_problem(app, kind)
+        if problem:
+            raise Refused(f"{problem}. Nothing was stored. Delete the App at "
+                          f"{app.get('html_url', 'its settings page')} and run this again.")
+        store(app, cfg)
+    except Refused as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 2
+    print(f"Created {app.get('slug') or app['id']}; its id and key are in {cfg}.")
+    print(f"Install it on the repositories Builder works in: "
+          f"{app.get('html_url', WEB)}/installations/new")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,123 @@
+name = "library"
+description = "Serves the Library, which is how every session reaches the Reference Room, the Chart House and the Archives. Without it a session has no knowledge base and no work queue."
+label = "com.convivy.library"
+command = ["/bin/sh", "{deploy}/library/serve.sh"]
+platforms = ["macos", "linux"]
+scope = "user"
+enabled-by-default = true
+working-directory = "{deploy}/library"
+
+# THE LIBRARY DRAINS FOR UP TO 50 SECONDS WHEN TOLD TO STOP, so a reload
+# does not cut off a write in flight. Its own launchd property list sets
+# ExitTimeOut to 60 for that margin, and its tests hold the value above the
+# drain deadline and at most 60, the most launchd honours. Without this line
+# an adopter's Library gets launchd's default, which `launchctl print` reads
+# as 5 seconds on a current Mac, or systemd's 90.
+stop-timeout-seconds = 60
+
+# THE DATABASE HAS TO EXIST, MIGRATED AND WITH ITS VECTOR TABLES AND ITS COLD
+# TIER, BEFORE THE LIBRARY FIRST STARTS. serve.sh opens them without creating
+# them, and on a fresh install nothing else does: the Library ran with no
+# schema, and search reported `no such table: library_vectors`. All three
+# commands are idempotent, so
+# every install and upgrade runs them. They read LIBRARY_DB from [environment]
+# below, which is the one place the path is named.
+#
+# ORIENT NEEDS TWO LIBRARY CREDENTIALS BEFORE IT WILL START, an agent token and
+# an approved-client token, and a fresh install had neither. THE WORK-QUEUE
+# TOOLS NEED A THIRD, an agent token of their own, and without it every session
+# that files or reads a work item is refused with "no ops token". AGENTCTL
+# REVIEW-POST NEEDS A FOURTH, an agent token named `agent-platform`, to write
+# each reviewer's record; without it every reviewer posted its verdict, was
+# refused with `no Library token available`, and failed for a missing stamp.
+# `--grants` adds the one capability that needs, `review_record.create`, to the
+# agent role, because the system kind would also carry signal capabilities in a
+# file every agent run can read. THE BOSUN NEEDS A FIFTH, an approved client
+# named `bosun`: knowledge-ctx finds it by that name in the client store itself
+# and refuses every agent dispatch without it, which a containerised install
+# rehearsal hit. `--holds-reserved=` gives it
+# none of the human-reserved capabilities, because the Bosun acts for no person
+# and must not approve. Its token file sits beside the store, which already
+# holds the same secret, since nothing reads the file and it exists for
+# `creates`. An install may
+# generate a new local credential and never copy or overwrite one, so each mint
+# runs only while its token file is absent (`creates`), and mint_credential.py
+# itself refuses a name the store already holds. Run with this job's
+# environment, each entry lands in the store the running Library reads.
+#
+# THE BLOB STORE'S ROOT IS CREATED HERE because the Library refuses to start
+# without it and will not create it, so a missing mount cannot pass for an empty
+# store. A containerised rehearsal's Library stopped at start-up on exactly that.
+directories = ["{state}/library", "{state}/library/blobs", "{home}/.orient-control"]
+prepare = [
+    ["{deploy}/library/.venv/bin/python", "-m", "alembic", "upgrade", "head"],
+    ["{deploy}/library/.venv/bin/python", "init_vectors.py"],
+    ["{deploy}/library/.venv/bin/python", "init_cold.py"],
+    { run = ["{deploy}/library/.venv/bin/python", "mint_credential.py", "--file", "agents", "--name", "orient", "--out", "{home}/.orient-control/library-token"], creates = "{home}/.orient-control/library-token" },
+    { run = ["{deploy}/library/.venv/bin/python", "mint_credential.py", "--file", "clients", "--name", "orient", "--out", "{home}/.orient-control/library-client-token"], creates = "{home}/.orient-control/library-client-token" },
+    { run = ["{deploy}/library/.venv/bin/python", "mint_credential.py", "--file", "agents", "--name", "ops-mcp", "--out", "{home}/.orient-control/ops-mcp-token"], creates = "{home}/.orient-control/ops-mcp-token" },
+    { run = ["{deploy}/library/.venv/bin/python", "mint_credential.py", "--file", "agents", "--name", "agent-platform", "--grants", "review_record.create", "--out", "{home}/.orient-control/agent-platform-token"], creates = "{home}/.orient-control/agent-platform-token" },
+    { run = ["{deploy}/library/.venv/bin/python", "mint_credential.py", "--file", "clients", "--name", "bosun", "--holds-reserved=", "--out", "{state}/library/bosun-client-token"], creates = "{state}/library/bosun-client-token" },
+    # THE ROSTER AND THE PROFILES HAVE TO BE IN THE DATABASE BEFORE ANY AGENT
+    # CAN BE DISPATCHED. knowledge-ctx asks the Library for an agent's bundle,
+    # and an empty roster answers `'reviewer' is not on the roster` for every
+    # one, which a containerised install rehearsal hit. The roster load runs
+    # once: after it the roster is edited over HTTP, and the loader refuses a
+    # table that already has rows, so the marker file records that it ran. Paths
+    # reach the shell as positional arguments, never parsed as shell text. The
+    # profile load upserts and removes rows whose file is gone, so it runs on
+    # every install against the knowledge repository the Library serves.
+    { run = ["/bin/sh", "-c", "\"$0\" load_crew_registry.py roster \"$1\" --actor 'builder install' && : > \"$2\"", "{deploy}/library/.venv/bin/python", "{deploy}/agent-platform/lib/knowledge/knowledge.py", "{state}/library/roster-loaded"], creates = "{state}/library/roster-loaded" },
+    ["{deploy}/library/.venv/bin/python", "load_crew_registry.py", "profiles", "{root}/knowledge", "--actor", "builder install"],
+]
+
+[log]
+stdout = "{state}/library.log"
+stderr = "{state}/library.log"
+
+# ONE DIRECTORY FOR EVERYTHING THE LIBRARY KEEPS. The Library reads each piece
+# of its state from its own variable and defaults every one of them to
+# `~/.library`, so setting `LIBRARY_DB` alone split its state across two
+# directories: the database here, and the tokens, blobs and TLS files
+# that its rows refer to in `~/.library`. A restore or a move of either
+# directory on its own then serves an empty database, or one whose rows name
+# files it cannot see, and nothing reports it. `tools/test_install_jobs.py`
+# pins this list and, where a Library checkout is present, compares it with
+# the defaults the Library's source actually declares.
+[environment]
+HOME = "{home}"
+LIBRARY_DB = "{state}/library/library.db"
+# The vector index's own file, which `init_vectors.py` above creates. The
+# Library has no default for it and refuses to import without it.
+LIBRARY_VECTORS_DB = "{state}/library/vectors.db"
+# The cold tier's own file, where aged signals move, which `init_cold.py` above
+# creates after the migration. The Library refuses to start without it.
+LIBRARY_COLD_DB = "{state}/library/cold.db"
+LIBRARY_API_TOKENS = "{state}/library/api-tokens.json"
+LIBRARY_CLIENT_TOKENS = "{state}/library/client-tokens.json"
+LIBRARY_BLOB_DIR = "{state}/library/blobs"
+LIBRARY_TLS_CERT = "{state}/library/tls/server.crt"
+LIBRARY_TLS_KEY = "{state}/library/tls/server.key"
+LIBRARY_TLS_CA = "{state}/library/tls/ca.crt"
+LIBRARY_STATE_DIR = "{state}/library"
+LIBRARY_WRITES_ENABLED = "1"
+# NOT STATE: the knowledge repository the Library reads. Reference admission
+# lists `projects/` there to admit the adopter's own projects, and without it
+# admits only its baseline list, refusing every project an adopter creates.
+LIBRARY_KNOWLEDGE_ROOT = "{root}/knowledge"
+# NOT STATE EITHER: the projects registry the Bosun deploys, which new-crew
+# registers a crew into. The Library validates a work item's product against it
+# and, without this, looked under a hardcoded home-directory path, found
+# nothing, and accepted every product string. `PROJECTS_JSON` is the name
+# agent-platform's own commands read first, so both sides name one file;
+# `AGENT_PLATFORM_PROJECTS` stays for a Library from before it read that name.
+PROJECTS_JSON = "{deploy}/agent-platform/config/projects.json"
+AGENT_PLATFORM_PROJECTS = "{deploy}/agent-platform/config/projects.json"
+PATH = "{bin}:/usr/bin:/bin"
+
+[schedule]
+at-load = true
+
+[restart]
+policy = "always"
+delay-seconds = 30

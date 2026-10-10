@@ -1,0 +1,26 @@
+name = "knowledge-watcher"
+description = "Reindexes the Reference Room when a document changes on disk, so a search returns what the repository currently says rather than what it said at the last full scan."
+label = "com.convivy.knowledge-watcher"
+command = [
+  "{deploy}/agent-platform/.venv/bin/python3",
+  "{deploy}/agent-platform/bin/knowledge-watcher",
+]
+platforms = ["macos", "linux"]
+scope = "user"
+enabled-by-default = true
+working-directory = "{deploy}/agent-platform"
+
+[log]
+stdout = "{state}/knowledge-watcher.log"
+stderr = "{state}/knowledge-watcher.log"
+
+[environment]
+HOME = "{home}"
+PATH = "{bin}:/usr/bin:/bin"
+
+[schedule]
+at-load = true
+
+[restart]
+policy = "always"
+delay-seconds = 10

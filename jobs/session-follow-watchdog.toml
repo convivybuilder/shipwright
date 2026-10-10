@@ -1,0 +1,23 @@
+name = "session-follow-watchdog"
+description = "Checks every fifteen minutes that sessions which should be following their work still are, and reports the ones that have stopped."
+label = "com.convivy.session-follow-watchdog"
+command = [
+  "{deploy}/agent-platform/.venv/bin/python3",
+  "{deploy}/agent-platform/bin/session-follow-watchdog",
+]
+platforms = ["macos", "linux"]
+scope = "user"
+enabled-by-default = false
+working-directory = "{deploy}/agent-platform"
+
+[log]
+stdout = "{state}/session-follow-watchdog.log"
+stderr = "{state}/session-follow-watchdog.err.log"
+
+[environment]
+HOME = "{home}"
+PATH = "{bin}:/usr/bin:/bin"
+
+[schedule]
+at-load = true
+every-seconds = 900

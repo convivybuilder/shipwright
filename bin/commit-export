@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""commit-export — add a built export to a public repository's main as one commit.
+
+`publish-payload` and `publish-engine` build a directory and stop. This takes
+one of those directories and a local clone of the public repository it belongs
+to, and adds the tree as ONE NEW COMMIT ON `main` WHOSE PARENT IS THE CLONE'S
+CURRENT `main`. A repository with no commits gets the root commit. So the
+public history is one commit per export, stacked, and a fork made from one
+export can take the next by an ordinary merge. A fresh repository per
+release would break every fork at each release.
+
+THE TREE BECOMES THE COMMIT EXACTLY. Every file in the built directory is
+committed and nothing else is, except the build marker, which only authorizes
+the builder's `--force` and means nothing in a published tree. A file the
+previous export had and this one does not is deleted by the commit.
+
+IT ALSO TAGS THE COMMIT AND MOVES `stable`. `release.json`'s version names an
+annotated tag, `v<version>`, written at the new commit, and a local `stable`
+branch is moved to the same commit, so a clone of the public repository can
+always ask for the latest release by one name instead of a moving `main`.
+
+WHAT IT REFUSES, before writing anything:
+  - a directory either builder did not make (no build marker, or no readable
+    `release.json` naming the version and the repository's source commit);
+  - a directory with a `.git` anywhere inside it, which git would record as a
+    submodule link in place of the files beneath it;
+  - a clone with uncommitted changes, since the working tree is reset to the
+    new commit afterwards and those changes would be lost;
+  - a clone whose `main` differs from its `origin/main`, since a commit on a
+    stale `main` cannot be pushed without overwriting what is already public;
+  - an export identical to `main`'s tree, which would be an empty commit;
+  - a tag `v<version>` that already exists at a commit other than the one
+    this export is about to write, since moving it would rewrite a release
+    that may already be public.
+
+WHAT IT DOES NOT DO: push. It writes a commit, a tag and the `stable` branch
+in a local clone and prints the push command. Publishing is a person's
+deliberate act, because content once fetched stays fetched. The commit's
+author is whoever the clone's git configuration names.
+
+Usage: commit-export --tree <built directory> --into <clone of the public repository>
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+PROG = "commit-export"
+BRANCH = "main"
+UPSTREAM = f"refs/remotes/origin/{BRANCH}"
+STABLE = "stable"
+
+# The marker each builder writes, and which repository's commit its
+# release.json names. publish-engine's names exactly one repository, the one
+# it exported; publish-payload's names shipwright's commit beside the
+# siblings it was released with.
+MARKERS = {
+    ".built-by-publish-payload": "shipwright",
+    ".built-by-publish-engine": None,
+}
+# A version, a commit and a repository name, as the builders write them. Each
+# goes into the commit message, so none may carry anything else.
+VERSION = re.compile(r"\d+\.\d+\.\d+(?:-(?:alpha|beta|rc)\d+)?")
+COMMIT = re.compile(r"[0-9a-f]{40}")
+NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+class Refused(Exception):
+    """The commit cannot be made as asked; nothing was written."""
+
+
+def git(clone: Path, *args: str, env: dict[str, str] | None = None,
+        options: tuple[str, ...] = ()) -> str:
+    """Run git subcommand `args` in `clone`, after git's own `options`; refuse on failure."""
+    result = subprocess.run(
+        ["git", "-C", str(clone), *options, *args], capture_output=True, text=True, check=False,
+        env=env,
+    )
+    if result.returncode != 0:
+        raise Refused(f"git {args[0]} failed in {clone}: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def ref(clone: Path, name: str) -> str | None:
+    """The commit `name` points at in `clone`, or None if it does not exist."""
+    result = subprocess.run(
+        ["git", "-C", str(clone), "rev-parse", "--verify", "--quiet", f"{name}^{{commit}}"],
+        capture_output=True, text=True, check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def provenance(tree: Path) -> tuple[str, str, str, str]:
+    """(marker, repository, version, source commit) of a built directory."""
+    found = [marker for marker in MARKERS if (tree / marker).is_file()]
+    if len(found) != 1:
+        raise Refused(
+            f"{tree} was not built by publish-payload or publish-engine: it has "
+            f"{'no build marker' if not found else 'both build markers'}")
+    marker = found[0]
+    try:
+        record = json.loads((tree / "release.json").read_text(encoding="utf-8"))
+        version = record["version"]
+        repositories = record["repositories"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise Refused(f"{tree} has no readable release.json ({exc.__class__.__name__})") from None
+    name = MARKERS[marker]
+    if name is None:
+        if not isinstance(repositories, dict) or len(repositories) != 1:
+            raise Refused(f"{tree}/release.json names {len(repositories or {})} repositories, not one")
+        name = next(iter(repositories))
+        if not NAME.fullmatch(name):
+            raise Refused(f"{tree}/release.json names no repository by a plain name")
+    commit = repositories.get(name) if isinstance(repositories, dict) else None
+    if not isinstance(version, str) or not VERSION.fullmatch(version):
+        raise Refused(f"{tree}/release.json carries no release version")
+    if not isinstance(commit, str) or not COMMIT.fullmatch(commit):
+        raise Refused(f"{tree}/release.json carries no source commit for {name}")
+    return marker, name, version, commit
+
+
+def nested_git(tree: Path) -> Path | None:
+    """The first `.git` entry inside `tree`, or None."""
+    for here, dirs, files in os.walk(tree):
+        if ".git" in dirs or ".git" in files:
+            return Path(here, ".git").relative_to(tree)
+    return None
+
+
+def commit_export(tree: Path, clone: Path) -> tuple[str, str | None, str]:
+    """Commit `tree` onto `clone`'s main; return (new commit, its parent or None, the tag it got)."""
+    marker, name, version, source = provenance(tree)
+    found = nested_git(tree)
+    if found is not None:
+        raise Refused(f"{tree} contains {found}, which git would commit as a submodule link "
+                      f"in place of the files beneath it")
+    if git(clone, "rev-parse", "--is-bare-repository") == "true":
+        raise Refused(f"{clone} is a bare repository; give a clone with a working tree")
+    if git(clone, "status", "--porcelain", "--untracked-files=all"):
+        raise Refused(f"{clone} has uncommitted changes, which resetting it to the new commit would lose")
+    head = git(clone, "symbolic-ref", "--quiet", "HEAD")
+    if head != f"refs/heads/{BRANCH}":
+        raise Refused(f"{clone} has {head} checked out, not {BRANCH}")
+    parent = ref(clone, f"refs/heads/{BRANCH}")
+    upstream = ref(clone, UPSTREAM)
+    if upstream != parent:
+        raise Refused(
+            f"{clone}'s {BRANCH} is not {UPSTREAM}; fetch and fast-forward it first, so the "
+            f"export stacks on what is already public")
+
+    # A throwaway index, so the clone's own index and working tree are not
+    # touched until the commit exists. `add --all` against the built directory
+    # as the working tree stages exactly its files; the marker is then removed.
+    # core.filemode is pinned because git sets it false in a clone on a
+    # filesystem without reliable mode bits, and every executable would then be
+    # staged as a plain file.
+    with tempfile.TemporaryDirectory() as scratch:
+        env = {**os.environ, "GIT_INDEX_FILE": str(Path(scratch) / "index")}
+        work = ("-c", "core.filemode=true", "--work-tree", str(tree))
+        git(clone, "add", "--all", "--force", ".", env=env, options=work)
+        git(clone, "rm", "--cached", "--quiet", "--ignore-unmatch", "--", marker, env=env)
+        written = git(clone, "write-tree", env=env)
+    if parent is not None and written == git(clone, "rev-parse", f"{parent}^{{tree}}"):
+        raise Refused(f"the export is identical to {BRANCH} at {parent[:12]}; there is nothing to commit")
+
+    message = (f"Builder {version}: export of {name} at {source}\n\n"
+               f"Built from the private {name} repository at commit {source} and\n"
+               f"added on top of the previous export by {PROG}.\n")
+    new = git(clone, "commit-tree", written, *(["-p", parent] if parent else []), "-m", message)
+
+    # Checked here, after the commit object exists but before any ref moves:
+    # nothing the clone's git configuration or a later fetch can see has
+    # changed yet, so a refusal here is still "before writing anything".
+    tag = f"v{version}"
+    existing_tag = ref(clone, f"refs/tags/{tag}")
+    if existing_tag is not None and existing_tag != new:
+        raise Refused(
+            f"{tag} already exists at {existing_tag[:12]}, not this export's {new[:12]}; "
+            f"refusing to move a tag that may already be public")
+
+    git(clone, "update-ref", "-m", f"{PROG}: {name} {version}",
+        f"refs/heads/{BRANCH}", new, parent or "0" * 40)
+    if existing_tag is None:
+        git(clone, "tag", "-a", tag, "-m", f"{PROG}: {name} {version}", new)
+    git(clone, "update-ref", "-m", f"{PROG}: {STABLE} -> {tag}", f"refs/heads/{STABLE}", new)
+    # The working tree was clean, so this only brings it to the new commit.
+    git(clone, "reset", "--quiet", "--hard", BRANCH)
+    return new, parent, tag
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG, description="Add a built export to a public repository's main as one commit.",
+    )
+    parser.add_argument("--tree", type=Path, required=True,
+                        help="a directory publish-payload or publish-engine built")
+    parser.add_argument("--into", type=Path, required=True,
+                        help="a clone of the public repository, with main checked out")
+    args = parser.parse_args(argv)
+    new, parent, tag = commit_export(args.tree.resolve(), args.into.resolve())
+    print(f"{PROG}: committed {new[:12]} on {BRANCH}"
+          + (f", on top of {parent[:12]}" if parent else ", the repository's first commit"))
+    print(f"{PROG}: tagged {tag}, and moved {STABLE} to it")
+    print(f"\n  Nothing was pushed. To publish it: "
+          f"git -C {args.into} push origin {BRANCH} {tag} {STABLE}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except Refused as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc

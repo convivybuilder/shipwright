@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Check a directory of job declarations, or convert launchd property lists.
+
+Whoever owns a set of jobs converts them against this format, so this is the
+command they run to see whether a conversion is complete.
+
+    tools/jobs-lint check <directory>      validate declarations
+    tools/jobs-lint import <plist> [...]   print declarations for existing jobs
+    tools/jobs-lint render <directory>     show what each job becomes on both platforms
+
+`check` reports two things separately, because they fail for different
+reasons: a declaration that will not parse, and one that parses but names one
+machine's filesystem instead of using a placeholder.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from jobs import accounts, declaration, import_launchd, placeholders, render_launchd, render_systemd
+
+
+def cmd_check(paths: list[str]) -> int:
+    if not paths:
+        print("usage: jobs-lint check <directory>", file=sys.stderr)
+        return 2
+    directory = Path(paths[0])
+    if not directory.is_dir():
+        print(f"not a directory: {directory}", file=sys.stderr)
+        return 2
+
+    files = sorted(directory.glob("*.toml"))
+    if not files:
+        # A clean report over an empty directory would read as "all jobs are
+        # fine" to anyone who ran this to confirm a conversion landed.
+        print(f"no declarations in {directory}", file=sys.stderr)
+        return 2
+
+    invalid = 0
+    unportable = 0
+    for path in files:
+        try:
+            job = declaration.load(path)
+        except declaration.DeclarationError as exc:
+            invalid += 1
+            print(f"INVALID  {path.name}\n         {exc.message}")
+            continue
+        offenders = placeholders.unresolved_absolute_paths(job)
+        unknown = placeholders.unknown_placeholders(job)
+        if unknown:
+            invalid += 1
+            print(
+                f"INVALID  {path.name}\n         unknown placeholder(s): "
+                + ", ".join("{" + name + "}" for name in sorted(unknown))
+            )
+            continue
+        if offenders:
+            unportable += 1
+            print(f"NOT PORTABLE  {path.name}")
+            for text in offenders:
+                print(f"              {text}")
+
+    checked = len(files)
+    print(
+        f"\n{checked} declaration(s): {checked - invalid - unportable} clean, "
+        f"{invalid} invalid, {unportable} naming one machine's paths"
+    )
+    return 1 if (invalid or unportable) else 0
+
+
+def cmd_import(paths: list[str]) -> int:
+    if not paths:
+        print("usage: jobs-lint import <plist> [...]", file=sys.stderr)
+        return 2
+    failures = 0
+    for raw in paths:
+        try:
+            job = import_launchd.from_file(raw)
+        except (import_launchd.ImportError_, OSError) as exc:
+            failures += 1
+            print(f"# FAILED {raw}: {exc}", file=sys.stderr)
+            continue
+        print(f"# from {raw}")
+        print(import_launchd.to_toml(job))
+    return 1 if failures else 0
+
+
+def cmd_render(paths: list[str]) -> int:
+    if not paths:
+        print("usage: jobs-lint render <directory>", file=sys.stderr)
+        return 2
+    try:
+        jobs = declaration.load_directory(paths[0])
+    except declaration.DeclarationError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    # Placeholders are left unresolved here on purpose: this command shows what
+    # a declaration BECOMES, and resolving them would need a machine's layout
+    # that this command has no business guessing. Saying so stops the output
+    # being pasted into LaunchAgents as if it were installable.
+    print("# Placeholders are shown unresolved. The installer resolves them.\n")
+    failed = 0
+    for job in jobs:
+        print(f"=== {job.name} ({', '.join(job.platforms)}) ===")
+        # A job that runs as an account renders only where the directory
+        # service has that account, so one missing here is reported, not raised.
+        try:
+            if job.runs_on("macos"):
+                print(f"--- {job.label}.plist")
+                print(render_launchd.render(job).decode())
+            if job.runs_on("linux"):
+                for filename, text in render_systemd.render(job).items():
+                    print(f"--- {filename}")
+                    print(text)
+        except (accounts.AccountMissing, declaration.DeclarationError) as exc:
+            failed += 1
+            print(f"NOT RENDERED  {exc}")
+    return 1 if failed else 0
+
+
+COMMANDS = {"check": cmd_check, "import": cmd_import, "render": cmd_render}
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2 or argv[1] not in COMMANDS:
+        print(__doc__, file=sys.stderr)
+        return 2
+    return COMMANDS[argv[1]](argv[2:])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

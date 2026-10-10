@@ -1,0 +1,25 @@
+name = "orient-dashboard"
+description = "Builds Orient's dashboard once each morning. A reporting job: the backend serves the same data without it, so a fresh install does not start it."
+label = "com.convivy.orient-dashboard"
+command = [
+  "{deploy}/convivy-orient/.venv/bin/python",
+  "{deploy}/convivy-orient/dashboard_build.py",
+]
+platforms = ["macos", "linux"]
+scope = "user"
+enabled-by-default = false
+working-directory = "{deploy}/convivy-orient"
+
+[log]
+stdout = "{state}/orient-dashboard.log"
+stderr = "{state}/orient-dashboard.err.log"
+
+[environment]
+HOME = "{home}"
+ORIENT_CONFIG_ROOT = "{state}/orient"
+ORIENT_STATE_ROOT = "{state}/orient"
+PATH = "{bin}:/usr/bin:/bin"
+
+[[schedule.calendar]]
+hour = 7
+minute = 40

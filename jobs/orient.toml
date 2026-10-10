@@ -1,0 +1,38 @@
+name = "orient"
+description = "Serves Orient, which holds the control database the work queue is read and written through. A session can reach the Chart House only while this is running."
+label = "com.convivy.orient"
+command = ["/bin/sh", "{deploy}/convivy-orient/serve.sh"]
+platforms = ["macos", "linux"]
+scope = "user"
+enabled-by-default = true
+working-directory = "{deploy}/convivy-orient"
+
+# THE CONTROL DATABASE IS CREATED HERE, before any job starts, because
+# builder-backup runs at load and fails without it; left to the service, the
+# first backup of a new install could run before Orient had made it. This is
+# the call serve.sh makes at every start, and it is safe to repeat.
+directories = ["{home}/.orient-control"]
+prepare = [
+    ["{deploy}/convivy-orient/.venv/bin/python", "-c", "import control_db; control_db.init_db()"],
+]
+
+[log]
+stdout = "{state}/orient.log"
+stderr = "{state}/orient.log"
+
+[environment]
+HOME = "{home}"
+ORIENT_CONFIG_ROOT = "{state}/orient"
+ORIENT_STATE_ROOT = "{state}/orient"
+# The projects registry the policy page and its write route list crews from.
+# Without it Orient falls back to a path under the home directory that an
+# install from Builder's repositories never creates.
+PROJECTS_JSON = "{deploy}/agent-platform/config/projects.json"
+PATH = "{bin}:/usr/bin:/bin"
+
+[schedule]
+at-load = true
+
+[restart]
+policy = "always"
+delay-seconds = 10

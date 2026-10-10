@@ -1,0 +1,28 @@
+name = "llm-gateway"
+description = "Serves the LLM gateway every agent calls a model through. Without it a session can reach its knowledge and its work queue and cannot run a single agent. It refuses to start until the operator has written its secrets file, so a fresh install does not start it."
+label = "com.convivy.llm-gateway"
+command = ["{home}/.local/lib/llm-gateway/llm-gateway-run.sh"]
+platforms = ["macos", "linux"]
+scope = "user"
+enabled-by-default = false
+working-directory = "{home}/.local/lib/llm-gateway"
+
+[log]
+stdout = "{state}/llm-gateway.log"
+stderr = "{state}/llm-gateway.err.log"
+
+[environment]
+HOME = "{home}"
+PATH = "{bin}:/usr/bin:/bin"
+# The placed directory is the gateway's ONLY import path, which is why
+# `install-backend` lands `builder_root.py` in it beside `spend_callback.py`.
+# litellm loads the callback by module name, so without this the proxy starts
+# and dies in its own lifespan on ModuleNotFoundError.
+PYTHONPATH = "{home}/.local/lib/llm-gateway"
+
+[schedule]
+at-load = true
+
+[restart]
+policy = "always"
+delay-seconds = 10

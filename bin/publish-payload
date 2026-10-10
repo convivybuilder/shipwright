@@ -1,0 +1,1212 @@
+#!/usr/bin/env python3
+"""publish-payload — build the public shipwright tree, with clean history.
+
+Builder is given away under Apache-2.0 from a public repository. The private
+repository this runs in is not that repository and must never become it:
+flipping its visibility would publish everything in it that was never meant to
+ship, all at once, because visibility is a single action outside any pull
+request and no check here watches it. The resolution, settled on 2026-09-16, is to export what
+ships into a FRESH repository.
+
+WHAT SHIPS, IN THE PRIVATE REPOSITORY'S OWN LAYOUT: `payload/`, the installers
+in `bin/`, Builder's backend job declarations in `jobs/`, and the tools the
+installers read at run time (SHIPPING below), with LICENSE
+and NOTICE at the root. The public repository is laid out like this one so a
+fork of it installs itself exactly as a checkout of this one does, and a change
+digest names each file where it sits in both. The root README is generated
+from `payload/README.md`, since this repository's own root README is written
+for its private readers. A root CONTRIBUTING.md, if this repository has one at
+the ref being built, ships alongside LICENSE and NOTICE; an older ref that
+shipped before CONTRIBUTING.md existed still builds.
+
+BUILDER IS SEVERAL REPOSITORIES, AND A RELEASE CAN SHIP MORE THAN ONE TREE.
+`--ships` naming anything besides `shipwright` builds one tree per named
+repository under `--out`, each at its own subdirectory. `shipwright/` is built
+by the single-tree code path above, unchanged: its own `release.json`,
+`CHANGES.md` and build marker, with `repositories` naming every sibling's
+commit too. Each sibling is a separate repository with no SHIPPING subset and
+no purity checker of its own, so `publish-engine` builds it instead, run as a
+subprocess against the published commit `sibling_commit()` already resolved
+for it — the tool that owns a whole-repository export and the detectors it
+needs, rather than a second copy of that logic here. A refusal from any one
+tree discards everything under `--out`, the same rule a single-tree build
+already follows: a release is every tree it names or none of them.
+
+THE PURITY CHECKER DOES NOT SHIP. It names the specifics it guards, so it stays
+the publisher's own tool: this runs it from its own checkout over the whole
+tree before anything leaves. A fork that publishes adds its own at
+`tools/check-payload-purity.py`, and without one this refuses.
+
+WHY THIS IS A BUILD RATHER THAN A MOVE, AND WHY THIS REPOSITORY STAYS THE
+AUTHOR. The three-layer model exists because two skills were authored in one
+place and copied into another, and both drifted within a day — each time the
+defect landed in the copy that would ship, because the copy people run is
+correct so nothing prompts anyone to look at the other. A second editable home
+would rebuild exactly that. So what ships has one author, and this command
+produces the public tree from it rather than handing it somewhere else to be
+edited.
+
+WHY `git archive` AND NEVER `cp -r`, the same reasoning as `install-payload`: a
+copy of the working tree ignores `.gitignore` and sweeps editor state, scratch
+files and build caches along with it. `git archive` reads tracked blobs at a
+ref and nothing else, so an untracked file cannot reach a public tree even when
+it is sitting right there.
+
+WHY THE HISTORY IS FRESH RATHER THAN FILTERED. A filtered history is a claim
+that every removed blob is gone, and that claim is hard to check and easy to
+get wrong — one missed path and the thing you were removing is still fetchable.
+A tree built from scratch carries no history to audit. The cost is that the
+public repository has no development history, which for a payload assembled
+from another repository's tree is no loss.
+
+WHAT THIS REFUSES TO DO. It does not push, create a repository, or change any
+repository's visibility. It writes a directory. Publishing is a separate,
+deliberate act by a person, because it is irreversible in the way that matters:
+content, once fetched, stays fetched.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import posixpath
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+from datetime import UTC, datetime
+from pathlib import Path
+
+PROG = "publish-payload"
+
+# Written into every tree this tool builds, and the only thing that makes a
+# directory eligible for --force to replace. See the refusal in main().
+BUILD_MARKER = ".built-by-publish-payload"
+REPO = Path(__file__).resolve().parent.parent
+
+# Every repository a release names a commit for. Builder stays several
+# repositories internally AND in public, so one release names a commit in each
+# through its manifest. Only
+# the ones a given release actually ships get an entry; the list is here so a
+# later release that ships more has somewhere to put them.
+KNOWN_REPOSITORIES = ("shipwright", "agent-platform", "library", "convivy-orient", "convivy-deck")
+
+# What `tools/check-shipping-licences.py` requires of every shipping repository.
+LICENCE_FILES = ("LICENSE", "NOTICE")
+
+# EVERYTHING THAT SHIPS BESIDE THE LICENCE FILES, each at its own path. Every
+# entry must exist at the ref, so a release cannot quietly leave the installers
+# out. `tools/check-payload-purity.py` is absent on purpose: see the docstring.
+SHIPPING = (
+    "payload",
+    "bin",
+    "jobs",
+    "tools/check-shipping-licences.py",
+    "tools/stale_holders.py",
+    "tools/jobs",
+    "tools/jobs-lint",
+)
+
+# `publish-engine` builds a sibling repository's tree, beside this file; it
+# owns what is excluded from each sibling's export, since it has no SHIPPING
+# list of its own to exclude from.
+PUBLISH_ENGINE = Path(__file__).resolve().parent / "publish-engine"
+
+# The one `git@` form the tree may carry: the GitHub remote shorthand the
+# installers document, colon included.
+GIT_REMOTE = "git@github.com:"
+
+# The public tree's root README, generated from this file with its relative
+# links pointed into `payload/`.
+README_SOURCE = "payload/README.md"
+
+# Strings that must never appear in a tree about to be published. This is a
+# SECOND fence, not the first: `check-payload-purity.py` is the promotion gate
+# and runs on every pull request. This one runs against the built tree, because
+# a requirement stated by a person — "no personal information carries" — is
+# worth checking at the last point before the content leaves, not only at the
+# point where it entered.
+PERSONAL = (
+    (r"/Users/[A-Za-z0-9._-]+", "a macOS home directory"),
+    (r"/home/[A-Za-z0-9._-]+", "a Linux home directory"),
+    (r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "an email address"),
+    (r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "an IP address"),
+    (r"ssh-(?:rsa|ed25519|dss)\s", "an SSH public key"),
+    (r"-----BEGIN [A-Z ]*PRIVATE KEY-----", "a private key"),
+    (r"gh[pousr]_[A-Za-z0-9]{16,}", "a GitHub token"),
+    (r"sk-[A-Za-z0-9]{20,}", "an API key"),
+)
+
+# Occurrences that are not personal information and would otherwise be reported
+# on every run. Each needs a reason, because an exemption without one becomes a
+# hole nobody remembers agreeing to.
+PERSONAL_EXEMPT = (
+    ("an email address", "http://www.apache.org/licenses/LICENSE-2.0", "the licence URL"),
+    ("an email address", "https://www.apache.org/licenses/LICENSE-2.0", "the licence URL"),
+    ("an IP address", "127.0.0.1", "the loopback address, which names no machine"),
+    ("an IP address", "0.0.0.0", "the unspecified address, which names no machine"),
+)
+
+# THE EXACT FIRST LINE THAT MARKS A PAGE AS HAND-WRITTEN FOR PUBLICATION. An
+# operator who writes a page themselves and signs it is making their own
+# disclosure, so that page is exempt from every purity scan that reads what
+# ships — this one, the rich checker's, and publish-engine's. One definition
+# here is what every shipped tool reads, since the mark has to mean the same
+# thing wherever it is checked. check-payload-purity.py does not ship and
+# imports this; it is never the other way around.
+AUTHORSHIP_MARK = "<!-- authorship: human -->"
+
+
+def is_hand_written(path: Path) -> bool:
+    """Whether `path` is a markdown page whose first line is exactly AUTHORSHIP_MARK."""
+    if path.suffix.lower() != ".md":
+        return False
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    first_line = text.splitlines()[0] if text else ""
+    return first_line == AUTHORSHIP_MARK
+
+
+# THE SHARED WORDING FOR A FINDING ON A HAND-WRITTEN PAGE. The operator's
+# amendment to the rule above: a marked page still has every purity scan run
+# against it; a match there is reported as a NOTICE rather than a refusal, as
+# a safeguard against an agent tagging its own text as human-written and
+# against an operator forgetting to cleanse something old. One definition
+# here is what check-payload-purity.py and publish-engine both build their
+# notice lines from, the same way they both read AUTHORSHIP_MARK from here
+# rather than each carrying their own copy.
+#
+# THE PLACE AND THE CATEGORY ARE NAMED; THE MATCH NEVER IS. That is the convention
+# this file's own PERSONAL fence already follows for every one of its categories,
+# and the one the rich checker's private-names and machine-names handling follow
+# for theirs — a notice is shown in the run's own output, so printing the match
+# there would be the second leak the private-names file exists to prevent.
+AUTHORSHIP_NOTICE_TAG = "hand-written page, not refused:"
+
+
+def authorship_notice(where: str, category: str) -> str:
+    """One finding on a hand-written page, reported as a notice rather than a refusal.
+
+    `where` is the place the finding sits — a file and a line, or a file and
+    "its own name" — and `category` is the finding's category, exactly as the
+    scan that found it names it. The matched text is never included.
+    """
+    return f"{where}: {AUTHORSHIP_NOTICE_TAG} would have flagged {category}"
+
+
+class Refused(Exception):
+    """Something a person has to decide about. Never a stack trace."""
+
+
+def run(*args: str, cwd: Path | None = None) -> str:
+    result = subprocess.run(
+        args, cwd=cwd, capture_output=True, text=True, check=False
+    )
+    if result.returncode != 0:
+        raise Refused(
+            f"{' '.join(args)} failed with status {result.returncode}: "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+    return result.stdout
+
+
+def commit_of(repo: Path, ref: str = "HEAD") -> str | None:
+    """The commit `ref` names in this repository, or None when it is not here.
+
+    **`ref` is a parameter because the manifest was recording the wrong
+    commit.** It resolved `HEAD` unconditionally, so a build of `--ref v0.5.0`
+    wrote a provenance record naming whatever was checked out instead of the
+    tree it had just exported and hashed. A manifest that names a different
+    commit from its own contents is worse than one with no commit at all: it
+    is a provenance record that will be believed.
+    """
+    if not (repo / ".git").exists():
+        return None
+    try:
+        return run("git", "-C", str(repo), "rev-parse", f"{ref}^{{commit}}").strip()
+    except Refused:
+        return None
+
+
+def siblings_dir() -> Path:
+    """The directory the other shipping repositories are checked out in.
+
+    **IT IS DERIVED FROM THE PRIMARY CHECKOUT, not from the tree this runs in.**
+    It was `REPO.parent`, which is right from the primary checkout and wrong
+    from any git worktree placed elsewhere: a five-repository release from a
+    worktree was told `library` had no licence files when `library` was fine,
+    because it had looked for `library` beside the worktree. `--git-common-dir`
+    names the primary repository's `.git` from inside any of its worktrees, and
+    its parent is the primary working tree. `REPO` itself stays the tree being
+    exported, since `--ref` addresses this repository.
+
+    Outside git there is no primary checkout to find, so it falls back to
+    `REPO.parent`, and the refusal in `sibling_roots()` names what it searched.
+    """
+    try:
+        common = run(
+            "git", "-C", str(REPO), "rev-parse", "--path-format=absolute", "--git-common-dir"
+        ).strip()
+    except Refused:
+        return REPO.parent
+    return Path(common).resolve().parent.parent
+
+
+def sibling_roots(ships: tuple[str, ...]) -> dict[str, Path]:
+    """Each shipping repository's root, with `shipwright` as the exported tree."""
+    base = siblings_dir()
+    roots = {}
+    for name in ships:
+        root = REPO if name == "shipwright" else base / name
+        if not root.is_dir():
+            raise Refused(
+                f"{name} is named as shipping in this release, but {root} does not "
+                f"exist. Sibling repositories are looked for in {base}, the "
+                f"directory holding this repository's primary checkout."
+            )
+        roots[name] = root
+    return roots
+
+
+# What a release ships from every repository but this one. See sibling_commit().
+# FULLY QUALIFIED because git resolves a local branch or tag named `origin/main`
+# ahead of the remote-tracking ref, so the short name let a local branch at HEAD
+# vouch for an unpublished commit (security review, round 1).
+PUBLISHED_REF = "refs/remotes/origin/main"
+
+
+def sibling_commit(name: str, root: Path) -> str:
+    """The published commit of a sibling repository, refusing when it cannot vouch.
+
+    **A SIBLING IS RECORDED AT `origin/main`, NEVER AT ITS LOCAL HEAD.** Local
+    HEAD was recorded until 2026-09-24, which is the defect already fixed for
+    shipwright's own entry reaching only one branch of the `if`: a branch or an
+    unpushed commit wrote a 40-character hex string into `release.json` that
+    looked exactly like a right one, and an adopter could not fetch it.
+
+    **AND IT REFUSES WHEN HEAD IS ELSEWHERE rather than recording `origin/main`
+    regardless.** The licence gate reads the sibling's working tree, so a
+    checkout sitting on another commit would have its licence files checked at
+    one commit and its provenance recorded at another. This compares against
+    the local tracking ref and does not fetch, so it vouches for what this
+    checkout last saw published.
+    """
+    head = commit_of(root)
+    if head is None:
+        raise Refused(
+            f"{name} is named as shipping in this release but {root} is not a git "
+            f"checkout, so its commit cannot be recorded"
+        )
+    published = commit_of(root, PUBLISHED_REF)
+    if published is None:
+        raise Refused(
+            f"{name} at {root} has no {PUBLISHED_REF}, so nothing says its commit "
+            f"is published; a release records only commits an adopter can fetch"
+        )
+    if head != published:
+        raise Refused(
+            f"{name} at {root} is checked out at {head}, but {PUBLISHED_REF} is "
+            f"{published}. A release records the published commit, and the licence "
+            f"check reads this checkout, so check out {PUBLISHED_REF} there first."
+        )
+    # MATCHING HEAD IS NOT ENOUGH ON ITS OWN, because the licence gate reads
+    # the working tree and HEAD says nothing about uncommitted files. An
+    # untracked or edited LICENSE or NOTICE passed the gate while the recorded
+    # commit had no such file (security review, round 1).
+    #
+    # SO THE BYTES THE GATE READS ARE HASHED AND COMPARED TO THE COMMITTED
+    # BLOB, rather than asking `git status` whether anything changed. Round 1
+    # asked `status`, and two things answer it "clean" over different bytes:
+    # a committed symlink, which the gate follows to a file an adopter never
+    # receives, and `--assume-unchanged`, which hides an edit (security review,
+    # round 2). A hash of what is on disk has no such blind spot.
+    blobs = licence_blobs(name, root, "HEAD")
+    for filename, blob in blobs.items():
+        try:
+            on_disk = run("git", "-C", str(root), "hash-object", "--", filename).strip()
+        except Refused:
+            on_disk = None
+        if on_disk != blob:
+            raise Refused(
+                f"{name} at {root} has a {filename} that differs from the one in "
+                f"its commit {published}, so the licence check would pass on a "
+                f"file an adopter does not receive. Commit or discard it there first."
+            )
+    return published
+
+
+def licence_blobs(name: str, root: Path, ref: str) -> dict[str, str]:
+    """The blob id of each licence file at `ref`, refusing unless each is a regular file.
+
+    **A SYMLINK IS REFUSED**, because what an adopter receives for a committed
+    link is the link, and a link to a path on the releaser's machine dangles
+    everywhere else while the file it points at passes every check here
+    (security review, round 2).
+    """
+    listing = run("git", "-C", str(root), "ls-tree", ref, "--", *LICENCE_FILES)
+    blobs = {}
+    for line in listing.splitlines():
+        meta, filename = line.split("\t", 1)
+        mode, _, blob = meta.split()
+        if mode not in ("100644", "100755"):
+            raise Refused(
+                f"{name}'s {filename} at {ref} is not a regular file (mode {mode}), "
+                f"so an adopter would not receive the text it points at"
+            )
+        blobs[filename] = blob
+    missing = [filename for filename in LICENCE_FILES if filename not in blobs]
+    if missing:
+        raise Refused(
+            f"{name} has no {' or '.join(missing)} committed at {ref}, so a "
+            f"release from it would carry licence files its commit does not"
+        )
+    return blobs
+
+
+def contributing_blob(root: Path, ref: str) -> str | None:
+    """CONTRIBUTING.md's blob id at `ref` in `root`, or None if it ships none.
+
+    Optional, unlike LICENCE_FILES: an older ref that ships no CONTRIBUTING.md
+    builds exactly as it always did, rather than being refused for a file that
+    did not exist yet.
+
+    **A SYMLINK IS STILL REFUSED**, for the reason `licence_blobs` refuses one:
+    what an adopter receives for a committed link is the link, and it dangles
+    everywhere but the releaser's own machine.
+    """
+    listing = run("git", "-C", str(root), "ls-tree", ref, "--", "CONTRIBUTING.md")
+    if not listing.strip():
+        return None
+    meta, filename = listing.splitlines()[0].split("\t", 1)
+    mode, _, blob = meta.split()
+    if mode not in ("100644", "100755"):
+        raise Refused(
+            f"{filename} at {ref} is not a regular file (mode {mode}), so an "
+            f"adopter would not receive the text it points at"
+        )
+    return blob
+
+
+def purity_gate(tree: Path) -> tuple[str, list[str]]:
+    """(summary, notices): the promotion gate, run against the tree that is actually leaving.
+
+    **IT TAKES THE EXPORTED TREE, and that is a security review's finding
+    rather than a refinement.** It used to run the checker with no argument,
+    which scans `payload/` in the working tree. That is the same content only
+    when `--ref` names what happens to be checked out: publish an older tag, or
+    any ref that is not the current tree, and the gate passed on one tree while
+    a different one was written to disk and destined for a public repository.
+    A check that reads the wrong tree is worse than no check, because the
+    output says "purity gate — passed".
+
+    Running it here rather than trusting an earlier pull request is still the
+    point: this is the last moment before content is staged for publication.
+    """
+    checker = REPO / "tools" / "check-payload-purity.py"
+    if not checker.is_file():
+        # A fork of the public tree has none, since the checker does not ship.
+        # Publishing without one is refused rather than done unchecked.
+        raise Refused(
+            f"there is no purity check at {checker}, so nothing was built. The checker "
+            f"is the publisher's own tool and does not ship; a fork that publishes adds "
+            f"one there, which is run over the whole tree"
+        )
+    # The release gate requires the operator's private-names file, which CI's
+    # run of the same checker does without (see PRIVATE_NAMES_VARIABLE there).
+    # `--release-tree` says this tree holds the payload under `payload/`, which
+    # is what lets a page its author signed carry the signature (SIGNATURES).
+    result = subprocess.run(
+        [sys.executable, str(checker), str(tree), "--require-private-names", "--release-tree"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise Refused(
+            f"the purity check failed, so nothing was built:\n"
+            f"{without_private_names(checker, result.stdout + result.stderr)}"
+        )
+    # NOTICES ARE PRINTED BEFORE THE PASS LINES in check-payload-purity.py's own
+    # output (see its main()), so the LAST line stays the "known occurrence(s)
+    # outstanding" summary whether or not a hand-written page produced any.
+    # Pulled out by the shared tag rather than re-run here, since the checker
+    # already decided which lines they are; this just carries them to the
+    # operator, who otherwise never sees this subprocess's stdout.
+    notices = [line for line in result.stdout.splitlines() if AUTHORSHIP_NOTICE_TAG in line]
+    summary = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else "passed"
+    return summary, notices
+
+
+def without_private_names(checker: Path, report: str) -> str:
+    """The checker's `report` with each private person's name withheld.
+
+    The checker quotes what it matched and the path it matched in, and a
+    refusal's text gets passed along, which is what the names file exists to
+    prevent (security review of the private names, round 1). The finding keeps
+    its path and category, so it still says where to look. Without a usable
+    names file the checker refused for that reason alone and quoted no name.
+    """
+    spec = importlib.util.spec_from_loader(
+        "check_payload_purity", importlib.machinery.SourceFileLoader("check_payload_purity", str(checker)))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        names = module.private_names(required=True)
+    except module.PrivateNamesUnavailable:
+        return report
+    return module.private_names_pattern(names).sub("<a person's name withheld>", report)
+
+
+def licence_gate(roots: dict[str, Path]) -> str:
+    """Every repository this release ships carries LICENSE and NOTICE.
+
+    **IT CHECKS EVERY SHIPPING REPOSITORY, not only this one.** The check here
+    used to read `REPO/LICENSE` and `REPO/NOTICE` alone, so a release naming
+    five repositories was refused when shipwright lacked its files and built
+    happily when the other four lacked theirs — which was the actual state of
+    all four on 2026-09-16. Apache-2.0 was chosen for its
+    NOTICE mechanism, and that mechanism is per repository, because a fork
+    takes one repository rather than the set.
+
+    **The defect's shape, which is the part worth carrying:** the four
+    repositories this never looked at reported nothing whether they were whole
+    or empty, so the check's passing and failing states produced the same
+    evidence. That is why the fix is a check per NAMED repository rather than a
+    longer list of things to look for in this one.
+
+    This runs before anything touches disk, with the rest of the checks that
+    need no filesystem, so a refusal leaves no partial tree.
+    """
+    checker = REPO / "tools" / "check-shipping-licences.py"
+    if not checker.is_file():
+        raise Refused(f"the licence check is missing at {checker}; nothing was built")
+    # THE LABELS ARE THE --ships NAMES. The checker labelled each root by its
+    # directory name, so a build from a worktree reported `shipwright-wt-...`
+    # as a repository it had verified, and nobody reading a release log could
+    # look that up.
+    result = subprocess.run(
+        [sys.executable, str(checker), "--names", ",".join(roots),
+         *(str(root) for root in roots.values())],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise Refused(
+            f"a shipping repository is missing its Apache-2.0 files, so nothing "
+            f"was built:\n{result.stdout}{result.stderr}"
+        )
+    return result.stdout.strip().splitlines()[-1] if result.stdout.strip() else "passed"
+
+
+def export_shipping(ref: str, into: Path) -> list[Path]:
+    """Everything in SHIPPING at `ref`, extracted into `into` at its own path."""
+    listing = run("git", "-C", str(REPO), "ls-tree", "--name-only", ref, "--", *SHIPPING)
+    missing = [path for path in SHIPPING if path not in listing.splitlines()]
+    if missing:
+        raise Refused(
+            f"{ref} has no {', '.join(missing)}, which every release ships; nothing was built"
+        )
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = Path(tmp) / "shipping.tar"
+        with open(archive, "wb") as handle:
+            result = subprocess.run(
+                ["git", "-C", str(REPO), "archive", ref, "--", *SHIPPING],
+                stdout=handle,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        if result.returncode != 0:
+            raise Refused(
+                f"could not read the shipping paths at {ref}: "
+                f"{result.stderr.decode(errors='replace').strip()}"
+            )
+        with tarfile.open(archive) as tar:
+            members = tar.getmembers()
+            for member in members:
+                # A tar member naming an absolute path or climbing out of the
+                # destination would write outside it. git archive does not
+                # produce those, which is exactly why it is not a reason to
+                # skip the check.
+                name = Path(member.name)
+                if name.is_absolute() or ".." in name.parts:
+                    raise Refused(f"refusing a tar entry that escapes the tree: {member.name}")
+            # THE DATA FILTER'S OWN REFUSALS ARE REFUSALS HERE. A symlink with
+            # an absolute target, or one aiming outside the tree, raises a
+            # tarfile error that used to end the run in a traceback with half a
+            # tree on disk (security review, round 2).
+            try:
+                tar.extractall(into, members=members, filter="data")
+            except tarfile.TarError as exc:
+                raise Refused(f"refusing what {ref} would put in the tree: {exc}") from exc
+    return sorted(p for p in into.rglob("*") if p.is_file())
+
+
+# A Markdown link or image target that is relative: not a URL, not an anchor,
+# and not rooted.
+RELATIVE_LINK = re.compile(r"(\]\()(?![a-z][a-z0-9+.-]*:|#|/)([^)\s]+)")
+
+
+def root_readme(tree: Path) -> None:
+    """The public tree's front door: README_SOURCE with its links resolved from the root.
+
+    Each relative link is resolved against README_SOURCE's directory, so
+    `docs/x.md` becomes `payload/docs/x.md` and `../LICENSE` becomes `LICENSE`.
+    """
+    source = tree / README_SOURCE
+    base = posixpath.dirname(README_SOURCE)
+    text = source.read_text(encoding="utf-8")
+    rewritten = RELATIVE_LINK.sub(
+        lambda match: match.group(1) + posixpath.normpath(posixpath.join(base, match.group(2))),
+        text,
+    )
+    (tree / "README.md").write_text(rewritten, encoding="utf-8")
+
+
+def personal_information(tree: Path) -> tuple[list[str], list[str]]:
+    """(findings, notices): every occurrence of something that identifies a
+    person or a machine, and every such occurrence on a hand-written page,
+    reported separately as a notice rather than a refusal.
+
+    **THE SCAN RUNS ON A HAND-WRITTEN PAGE TOO, rather than skipping it.** The
+    page is never refused for what it finds there; it is reported, as a
+    safeguard against an agent tagging its own text as human-written and
+    against an operator forgetting to cleanse something old.
+    """
+    findings: list[str] = []
+    notices: list[str] = []
+    for path in sorted(tree.rglob("*")):
+        if not path.is_file():
+            continue
+        hand_written = is_hand_written(path)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            findings.append(f"{path.relative_to(tree)}: not readable as text, so not checkable")
+            continue
+        for pattern, what in PERSONAL:
+            for match in re.finditer(pattern, text):
+                found = match.group(0)
+                # EQUALITY, NOT CONTAINMENT, and the direction was the bug.
+                # This asked whether a known-safe literal appeared anywhere
+                # inside the match, so the IP pattern matching a whole address
+                # whose first octet was 10, 50 or 100, followed by three zero
+                # octets, was exempted because its last seven characters spell
+                # the unspecified address. So was every other address ending
+                # that way — real, routable, ARIN-assigned
+                # ranges waved through as "the unspecified address". The rich
+                # checker has no generic IPv4 pattern at all, so this was the
+                # only thing standing between an identifying address and a
+                # public repository.
+                if any(
+                    what == exempt_what and found == exempt_text
+                    for exempt_what, exempt_text, _ in PERSONAL_EXEMPT
+                ):
+                    continue
+                # GIT'S SSH REMOTE SHORTHAND IS NOT AN EMAIL ADDRESS.
+                # `git@github.com:` followed by a path is how git names a GitHub
+                # remote, and the shipped installers explain that notation. Only
+                # that host is exempt. The purity checker accepts `git@` before
+                # any host, so this scan is the only fence left for a private
+                # forge's name or a `git` mailbox on a personal domain.
+                if (what == "an email address"
+                        and found + text[match.end():match.end() + 1] == GIT_REMOTE):
+                    continue
+                # The category and place, never the match: a refusal's text
+                # gets passed along, and quoting a token or an address there
+                # carries it out of the tree this fence is keeping it in
+                # (security review of the private names, round 2).
+                line = text[: match.start()].count("\n") + 1
+                rel = path.relative_to(tree)
+                if hand_written:
+                    notices.append(authorship_notice(f"{rel}:{line}", what))
+                else:
+                    findings.append(f"{rel}:{line}: {what}")
+    return findings, notices
+
+
+def manifest(
+    version: str, files: list[Path], tree: Path, ships: tuple[str, ...], ref: str,
+    siblings: dict[str, str],
+) -> dict:
+    """The release manifest: a commit per repository, and what was built.
+
+    Builder stays several repositories, so a release names the commit of
+    every repository it ships. A build is then reproducible from the
+    manifest alone, and a question about what an adopter is running has one
+    answer.
+    """
+    digests = {}
+    for path in sorted(files):
+        digests[str(path.relative_to(tree))] = hashlib.sha256(path.read_bytes()).hexdigest()
+    repositories = {}
+    for name in KNOWN_REPOSITORIES:
+        if name not in ships:
+            continue
+        # shipwright's entry is the ref that was EXPORTED, not whatever is
+        # checked out. Every other repository was resolved to its published
+        # commit by sibling_commit() before anything touched disk, because
+        # `--ref` addresses this repository only.
+        # shipwright is NOT held to sibling_commit()'s published-commit rule.
+        # The operator names its ref, and CI's own builds export pull-request
+        # commits that no published branch carries, so the entry records what
+        # was exported, and every file in the tree comes from that commit.
+        if name == "shipwright":
+            commit = commit_of(REPO, ref)
+            if commit is None:
+                raise Refused(f"{ref} names no commit in this repository")
+        else:
+            commit = siblings[name]
+        repositories[name] = commit
+    return {
+        "version": version,
+        "built_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "repositories": repositories,
+        "files": digests,
+    }
+
+
+# THE CHANGE DIGEST. A fork takes upstream changes by choice, and the digest is
+# what it chooses from: for each change since the previous release, what it
+# does, why, the files it touches, and what a fork that has diverged there must
+# check. It is written from the PUBLIC side (decided 2026-09-25): which files
+# changed comes from the two releases' manifests, and the prose is written by
+# the releasing agent for strangers. Internal commit messages and pull request
+# bodies carry references the purity gate exists to stop and name commits no
+# fork can fetch, so nothing is copied from them. `--draft-digest` prints the
+# internal commits as hints for the writer, on lines the check refuses.
+DIGEST_NAME = "CHANGES.md"
+# Files every build writes that are not part of what changed between releases.
+NOT_COMPARED = frozenset({"release.json", BUILD_MARKER, DIGEST_NAME})
+DIGEST_KINDS = ("added", "changed", "removed")
+DIGEST_HINT = "> internal:"
+DIGEST_FIELDS = ("What: ", "Why: ", "If your fork has diverged: ")
+DIGEST_FILE_LINE = re.compile(r"^- `([^`]+)` (added|changed|removed)$")
+
+
+def previous_release(path: Path) -> dict:
+    """The previous release's manifest, refusing anything that is not one."""
+    record_path = path / "release.json"
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise Refused(f"--previous {path} has no readable release.json: {exc}") from exc
+    # A MANIFEST THAT IS VALID JSON BUT NOT AN OBJECT is refused here rather
+    # than crashing on `.get` below, which left a traceback (review, round 1).
+    if not isinstance(record, dict):
+        raise Refused(f"{record_path} is not a release manifest: it is not a JSON object")
+    files = record.get("files")
+    if not (
+        isinstance(record.get("version"), str)
+        and isinstance(files, dict)
+        and all(isinstance(k, str) and isinstance(v, str) for k, v in files.items())
+    ):
+        raise Refused(f"{record_path} is not a release manifest: it needs a version and a files map")
+    # EACH RECORDED COMMIT MUST BE A FULL COMMIT ID, which is all a manifest
+    # ever records. draft_digest() passes shipwright's to `git log`, and a
+    # value like `--output=<path>` was read as an option there and created a
+    # file outside --out (security review, round 1).
+    repositories = record.get("repositories", {})
+    if not (
+        isinstance(repositories, dict)
+        and all(
+            isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit)
+            for commit in repositories.values()
+        )
+    ):
+        raise Refused(
+            f"{record_path} is not a release manifest: its repositories map must "
+            f"name a 40-character commit id for each repository"
+        )
+    return record
+
+
+def tree_digests(tree: Path) -> dict[str, str]:
+    """sha256 per file, keyed as the manifest keys them, without per-build files."""
+    return {
+        str(p.relative_to(tree)): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in sorted(tree.rglob("*"))
+        if p.is_file() and str(p.relative_to(tree)) not in NOT_COMPARED
+    }
+
+
+def changes_between(before: dict[str, str], after: dict[str, str]) -> dict[str, str]:
+    """Every path that differs between two manifests' file maps, with its kind."""
+    changes = {}
+    for path in sorted(set(before) | set(after)):
+        if path in NOT_COMPARED:
+            continue
+        if path not in before:
+            changes[path] = "added"
+        elif path not in after:
+            changes[path] = "removed"
+        elif before[path] != after[path]:
+            changes[path] = "changed"
+    return changes
+
+
+def digest_errors(text: str, version: str, previous: str, changes: dict[str, str]) -> list[str]:
+    """Why a written digest cannot ship, or an empty list when it can."""
+    errors = []
+    lines = text.splitlines()
+    header = f"# Changes in {version} since {previous}"
+    if not lines or lines[0] != header:
+        errors.append(f"the first line must be exactly {header!r}")
+    if any(line.startswith(DIGEST_HINT) for line in lines):
+        errors.append(f"it still holds {DIGEST_HINT!r} lines, which are hints for the writer and never ship")
+    entries = re.split(r"^## ", text, flags=re.MULTILINE)[1:]
+    covered: dict[str, int] = {}
+    for entry in entries:
+        # THE TITLE IS NOT A BODY LINE. Scanning it with the body let a title
+        # like "- `c.md` added" or "What: ..." stand in for the line it looks
+        # like, so an entry passed coverage without carrying it (review, round 1).
+        title, _, body = entry.partition("\n")
+        title = title.strip()
+        entry_lines = body.splitlines()
+        if not title:
+            errors.append("an entry has no title")
+        for field in DIGEST_FIELDS:
+            values = [line[len(field):].strip() for line in entry_lines if line.startswith(field)]
+            if len(values) != 1 or not values[0]:
+                errors.append(f"entry {title!r} needs exactly one non-empty {field.strip()!r} line")
+        listed = [DIGEST_FILE_LINE.match(line) for line in entry_lines if line.startswith("- `")]
+        if not listed:
+            errors.append(f"entry {title!r} lists no files")
+        for match in listed:
+            if match is None:
+                errors.append(f"entry {title!r} has a file line that is not \"- `path` added|changed|removed\"")
+                continue
+            path, kind = match.groups()
+            covered[path] = covered.get(path, 0) + 1
+            if path not in changes:
+                errors.append(f"{path} is listed but did not change")
+            elif changes[path] != kind:
+                errors.append(f"{path} is listed as {kind} but was {changes[path]}")
+    for path, kind in changes.items():
+        if covered.get(path, 0) == 0:
+            errors.append(f"{path} ({kind}) is not covered by any entry")
+    for path, count in covered.items():
+        if count > 1:
+            errors.append(f"{path} is listed in {count} entries; each change belongs to exactly one")
+    return errors
+
+
+def draft_digest(version: str, previous: dict, changes: dict[str, str], ref: str) -> str:
+    """A skeleton for the releasing agent, grouping files by the commits that touched them."""
+    since = previous.get("repositories", {}).get("shipwright")
+    groups: dict[tuple[str, ...], list[str]] = {}
+    for path in changes:
+        # Every file sits at its own path, except the generated root README.
+        source = README_SOURCE if path == "README.md" else path
+        hints: tuple[str, ...] = ("no recorded previous commit to compare against",)
+        if since:
+            try:
+                log = run("git", "-C", str(REPO), "log", "--format=%h %s", f"{since}..{ref}", "--", source)
+                hints = tuple(log.splitlines()) or ("no commit found for this file",)
+            except Refused:
+                hints = ("the previous release's commit is not in this repository",)
+        groups.setdefault(hints, []).append(path)
+    parts = [f"# Changes in {version} since {previous['version']}", ""]
+    for hints, paths in groups.items():
+        parts.append("## <a short title for this change>")
+        parts += [f"{DIGEST_HINT} {hint}" for hint in hints]
+        parts += [field for field in DIGEST_FIELDS]
+        parts.append("Files:")
+        parts += [f"- `{path}` {changes[path]}" for path in paths]
+        parts.append("")
+    return "\n".join(parts)
+
+
+def build_tree(ref: str, out: Path) -> None:
+    """Everything that ships at `ref`, extracted into `out`, with the licence files."""
+    try:
+        export_shipping(ref, out)
+    except Refused:
+        shutil.rmtree(out, ignore_errors=True)
+        raise
+    if not (out / README_SOURCE).is_file():
+        # The front door is generated from it, and a public tree with no README
+        # at its root is one nobody can read.
+        shutil.rmtree(out, ignore_errors=True)
+        raise Refused(f"{README_SOURCE} is missing at {ref}; nothing was built")
+    root_readme(out)
+
+    # THE LICENCE FILES ARE COPIED BEFORE THE GATE so that the gate reads them.
+    # They used to land after it, which left them scanned by nothing but the
+    # narrow `personal_information()` list — a security review's finding that
+    # everything this tool adds after the gate escapes the rich checker.
+    #
+    # THEY ARE READ AT `--ref`, like `payload/`. They were copied from the
+    # working tree, so a build of an older ref shipped today's NOTICE, or an
+    # uncommitted one, under a manifest naming a commit that carries neither
+    # (security review, round 2).
+    try:
+        blobs = dict(licence_blobs("shipwright", REPO, ref))
+        contributing = contributing_blob(REPO, ref)
+        if contributing is not None:
+            blobs["CONTRIBUTING.md"] = contributing
+        for name, blob in blobs.items():
+            content = subprocess.run(
+                ["git", "-C", str(REPO), "cat-file", "blob", blob],
+                capture_output=True, check=True,
+            ).stdout
+            (out / name).write_bytes(content)
+    except Refused:
+        shutil.rmtree(out, ignore_errors=True)
+        raise
+    except subprocess.CalledProcessError as exc:
+        shutil.rmtree(out, ignore_errors=True)
+        raise Refused(
+            f"could not read a licence file at {ref}: "
+            f"{exc.stderr.decode(errors='replace').strip()}"
+        ) from exc
+
+
+def build_shipwright_tree(
+    version: str,
+    ref: str,
+    out: Path,
+    ships: tuple[str, ...],
+    siblings: dict[str, str],
+    previous: dict | None,
+    digest_text: str | None,
+    cleanup: Path,
+) -> None:
+    """shipwright's own tree at `out`: the single-tree build, byte-for-byte.
+
+    `out` is `--out` itself for a `--ships shipwright` release, and
+    `--out/shipwright` for a release naming siblings too — that is the one
+    difference a multi-repository release makes to how shipwright is built.
+    `cleanup` is what a refusal here removes: `out` for the first case, and
+    the whole `--out` directory for the second, so a refusal from shipwright
+    takes a sibling's tree with it exactly as a refusal from a sibling takes
+    shipwright's.
+    """
+    try:
+        build_tree(ref, out)
+    except Refused:
+        shutil.rmtree(cleanup, ignore_errors=True)
+        raise
+
+    # THE DIGEST IS CHECKED AGAINST THE TREE JUST BUILT and lands in it before
+    # the purity gate, so the gate reads the digest like every other file that
+    # ships. A digest that misses a changed file, or lists one twice, is refused
+    # and takes the tree with it.
+    if previous is not None:
+        changes = changes_between(previous["files"], tree_digests(out))
+        errors = digest_errors(digest_text or "", version, previous["version"], changes)
+        if errors:
+            shutil.rmtree(cleanup, ignore_errors=True)
+            raise Refused("the change digest cannot ship:\n  " + "\n  ".join(errors))
+        (out / DIGEST_NAME).write_text(digest_text, encoding="utf-8")
+
+    # THE GATE RUNS HERE, on the tree that was just exported, rather than
+    # before the export on whatever is checked out. That ordering is the fix:
+    # the check now reads the same bytes that are about to be published.
+    #
+    # And a refusal here TAKES THE TREE WITH IT. Moving the gate after the
+    # export bought correctness at the cost of leaving a half-built tree on
+    # disk when it refuses, which is what gets published by mistake — the
+    # existing test for that caught this within a minute of the reordering.
+    # Every other post-export refusal already does this; the gate is now the
+    # third.
+    #
+    # WHAT THE GATE STILL CANNOT COVER IS `release.json` AND THE BUILD MARKER,
+    # and re-running it on the finished tree is not the fix — measured, the
+    # rich checker refuses `release.json` on its own `shipwright` key, because
+    # naming Convivy's repositories is what a manifest is for. So the two files
+    # written after this point carry no free text instead: the marker names no
+    # ref, and `--version` is constrained below to the identifiers a release
+    # actually uses. Provenance lives in `release.json`, built from inputs that
+    # are validated before anything touches disk.
+    try:
+        gate_summary, gate_notices = purity_gate(out)
+    except Refused:
+        # NO ignore_errors: the gate catches credential-shaped content, and
+        # its refusal says nothing was built (security review, round 5).
+        shutil.rmtree(cleanup)
+        raise
+    print(f"{PROG}: purity gate — {gate_summary}")
+
+    tree_files = sorted(p for p in out.rglob("*") if p.is_file())
+    try:
+        record = manifest(version, tree_files, out, ships, ref, siblings)
+    except Refused:
+        # Anything that fails after the tree exists takes the tree with it, for
+        # the same reason as above: a partial tree is what gets published by
+        # mistake.
+        shutil.rmtree(cleanup, ignore_errors=True)
+        raise
+    (out / "release.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    # THE MARKER NAMES NO REF. It used to embed `args.ref` verbatim, and a ref
+    # is free text an operator supplies: `feature/alex-notes` would have shipped
+    # a person's name into a public tree inside this file, past a gate that had
+    # already run and past a narrow scan with no rule for names. The marker's
+    # whole job is to authorize `--force`, which needs no provenance; the
+    # exported commit is recorded in `release.json`.
+    (out / BUILD_MARKER).write_text(
+        f"Built by {PROG}. Its presence is what allows --force "
+        f"to replace this directory; delete it and the tool will refuse.\n",
+        encoding="utf-8",
+    )
+
+    findings, info_notices = personal_information(out)
+    if findings:
+        # NO ignore_errors HERE, unlike the refusals above: the message says the
+        # tree was DISCARDED, and a removal that failed silently would leave the
+        # personal information on disk under that claim (security review, round 3).
+        shutil.rmtree(cleanup)
+        raise Refused(
+            "personal information in the built tree, which was DISCARDED rather "
+            "than left on disk:\n  " + "\n  ".join(findings)
+        )
+
+    # EVERY NOTICE IS SHOWN BEFORE THE OPERATOR DECIDES TO PUBLISH, with a
+    # count, so a page wrongly marked or one that has drifted since it was
+    # signed is something the operator sees here rather than only in a log
+    # nobody reads.
+    notices = gate_notices + info_notices
+    if notices:
+        print(f"{PROG}: {len(notices)} notice(s) on a hand-written page, not refused:")
+        for notice in notices:
+            print(f"  {notice}")
+
+    built = sorted(path for path in out.rglob("*") if path.is_file())
+    print(f"{PROG}: built {len(built)} file(s) for v{version} at {out}")
+    print(f"  repositories: {', '.join(f'{k}@{v[:9]}' for k, v in record['repositories'].items())}")
+    print(f"  personal information: none found across {len(built)} file(s)")
+    print(
+        "\n  Nothing was pushed and no repository was created or made public. "
+        "Publishing is a person's deliberate act, because content once fetched "
+        "stays fetched."
+    )
+
+
+def build_multi_tree(
+    version: str,
+    ref: str,
+    out: Path,
+    ships: tuple[str, ...],
+    roots: dict[str, Path],
+    siblings: dict[str, str],
+    previous: dict | None,
+    digest_text: str | None,
+) -> None:
+    """Every tree a multi-repository release ships, each at its own path under `out`.
+
+    `shipwright/` is built by build_shipwright_tree(), the single-tree build
+    unchanged: its own release.json, CHANGES.md and build marker, with
+    `repositories` naming every sibling's commit too. Each sibling that
+    follows is a separate repository with no SHIPPING subset and no purity
+    checker of its own, so `publish-engine` builds it, run as a subprocess
+    against the commit `siblings` already resolved and vouched for — the tool
+    that owns a whole-repository export, rather than a second copy of it here.
+
+    A refusal from any tree discards everything written under `out`, the rule
+    the single-tree build already follows: a half-built release is what gets
+    published by mistake, whichever tree the half belongs to.
+    """
+    build_shipwright_tree(
+        version, ref, out / "shipwright", ships, siblings, previous, digest_text, cleanup=out
+    )
+
+    for name in ships:
+        if name == "shipwright":
+            continue
+        result = subprocess.run(
+            [sys.executable, str(PUBLISH_ENGINE), name,
+             "--version", version, "--out", str(out / name),
+             "--from", str(roots[name]), "--ref", siblings[name]],
+            capture_output=True, text=True, check=False,
+        )
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.returncode != 0:
+            # NO ignore_errors, for the reason given at the personal-information
+            # discard: publish-engine's refusal says the tree was DISCARDED
+            # (security review, round 4).
+            shutil.rmtree(out)
+            raise Refused(
+                f"{name} could not be exported by publish-engine, so nothing was "
+                f"built:\n{result.stderr.strip()}"
+            )
+
+    (out / BUILD_MARKER).write_text(
+        f"Built by {PROG}. Its presence is what allows --force "
+        f"to replace this directory; delete it and the tool will refuse.\n",
+        encoding="utf-8",
+    )
+
+    built = sorted(path for path in out.rglob("*") if path.is_file())
+    print(f"{PROG}: built {len(built)} file(s) across {len(ships)} tree(s) for v{version} at {out}")
+    print(
+        "\n  Nothing was pushed and no repository was created or made public. "
+        "Publishing is a person's deliberate act, because content once fetched "
+        "stays fetched."
+    )
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Build the public shipwright tree, with clean history.",
+    )
+    parser.add_argument("--version", required=True, help="release version, e.g. 0.6.0")
+    parser.add_argument("--out", type=Path, required=True, help="directory to build into")
+    parser.add_argument("--ref", default="HEAD", help="ref to read what ships from")
+    parser.add_argument(
+        "--ships",
+        default="shipwright",
+        help="comma-separated repositories this release ships, for the manifest",
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="replace a non-empty output directory"
+    )
+    parser.add_argument(
+        "--previous", type=Path, default=None,
+        help="the previous release's built tree, to write a change digest against",
+    )
+    parser.add_argument(
+        "--digest", type=Path, default=None,
+        help=f"the change digest written for this release, shipped as {DIGEST_NAME}",
+    )
+    parser.add_argument(
+        "--draft-digest", action="store_true",
+        help="print a digest skeleton for --previous and exit, building nothing",
+    )
+    args = parser.parse_args(argv)
+
+    # THE TAR `data` FILTER IS REQUIRED, NOT OPTIONAL. export_shipping() extracts
+    # with `filter="data"`, which refuses devices, absolute links and anything
+    # that would land or point outside the tree, on top of the name check there.
+    # It still extracts a relative link that stays inside the tree; the purity
+    # gate refuses every symlink in the built tree, and that is what keeps
+    # links out. The filter exists from Python 3.11.4 and 3.12, and Debian
+    # bookworm ships 3.11.2, where extractall() raised TypeError mid-run and
+    # left a traceback and a partial tree. Extracting without it would drop a
+    # safety check on content about to be published, so this refuses before
+    # anything touches disk.
+    if not hasattr(tarfile, "data_filter"):
+        raise Refused(
+            f"this Python ({sys.version.split()[0]}) has no tarfile data filter, "
+            f"which extraction relies on; run {PROG} with Python 3.11.4 or later"
+        )
+
+    # EVERYTHING CHECKABLE WITHOUT TOUCHING DISK IS CHECKED FIRST. An earlier
+    # version validated --ships after exporting the payload and copying the
+    # licence files, so a refused run left a partial tree behind — and a
+    # half-built tree that looks finished is exactly what someone publishes by
+    # mistake. Caught by the suite asserting that a refusal leaves nothing.
+    # THE PRERELEASE PART IS AN ALLOWLIST rather than free text. It was
+    # `[0-9A-Za-z.-]+`, and this string is written into `release.json` after
+    # the purity gate has run, so `0.6.0-someonesname` would have shipped a name
+    # into a public tree with nothing left to catch it.
+    if not re.fullmatch(r"\d+\.\d+\.\d+(?:-(?:alpha|beta|rc)(?:\.\d+)?)?", args.version):
+        raise Refused(
+            f"{args.version!r} is not a version of the form MAJOR.MINOR.PATCH, "
+            f"optionally followed by -alpha, -beta or -rc and a number. The "
+            f"prerelease part ships into release.json after the purity gate, so "
+            f"it takes these identifiers rather than arbitrary text."
+        )
+
+    ships = tuple(part.strip() for part in args.ships.split(",") if part.strip())
+    if not ships:
+        raise Refused("--ships named no repositories, so the manifest would name none")
+    unknown = [name for name in ships if name not in KNOWN_REPOSITORIES]
+    if unknown:
+        raise Refused(
+            f"unknown repository/repositories: {', '.join(unknown)}. "
+            f"Builder's are {', '.join(KNOWN_REPOSITORIES)}."
+        )
+    # EVERY RELEASE SHIPS shipwright, since its tree is built whatever --ships
+    # says, so a --ships leaving it out would build a tree it does not name. A
+    # name given twice would export the same repository twice into one path.
+    if "shipwright" not in ships:
+        raise Refused(
+            f"--ships must name shipwright, whose tree every release builds; "
+            f"it named {', '.join(ships)}"
+        )
+    repeated = sorted({name for name in ships if ships.count(name) > 1})
+    if repeated:
+        raise Refused(f"--ships names {', '.join(repeated)} more than once")
+    previous = None
+    digest_text = None
+    if args.digest and not args.previous:
+        raise Refused("--digest needs --previous, the release it describes changes since")
+    if args.draft_digest and not args.previous:
+        raise Refused("--draft-digest needs --previous, the release to draft changes since")
+    if args.draft_digest and args.digest:
+        raise Refused("--draft-digest prints a skeleton and builds nothing, so it takes no --digest")
+    if args.previous:
+        if not (args.digest or args.draft_digest):
+            raise Refused("--previous needs --digest, or --draft-digest to print a skeleton to write one from")
+        previous = previous_release(args.previous)
+        if previous["version"] == args.version:
+            raise Refused(f"--previous is already version {args.version}")
+    if args.digest:
+        try:
+            digest_text = args.digest.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise Refused(f"cannot read --digest {args.digest}: {exc}") from exc
+
+    roots = sibling_roots(ships)
+    print(f"{PROG}: licences — {licence_gate(roots)}")
+    siblings = {
+        name: sibling_commit(name, root) for name, root in roots.items() if name != "shipwright"
+    }
+
+    if args.draft_digest:
+        with tempfile.TemporaryDirectory() as scratch:
+            tree = Path(scratch) / "tree"
+            tree.mkdir()
+            build_tree(args.ref, tree)
+            changes = changes_between(previous["files"], tree_digests(tree))
+        print(draft_digest(args.version, previous, changes, args.ref))
+        return 0
+
+    out = args.out.resolve()
+    if out.exists() and any(out.iterdir()):
+        if not args.force:
+            raise Refused(f"{out} is not empty; pass --force to replace it")
+        # --force DELETES A DIRECTORY, and `--out` is an operator-supplied
+        # path. It used to rmtree anything non-empty on --force, so one
+        # mistyped argument took whatever was there. A directory this tool
+        # built carries a marker written on the way out; nothing else is
+        # deletable, whatever flags are passed.
+        if not (out / BUILD_MARKER).is_file():
+            raise Refused(
+                f"{out} is not empty and was not built by {PROG} — it has no "
+                f"{BUILD_MARKER}. Refusing to delete it. --force replaces a "
+                f"previous build of this tool, and nothing else; empty the "
+                f"directory yourself if that is really what you want."
+            )
+        shutil.rmtree(out)
+    out.mkdir(parents=True, exist_ok=True)
+
+    # A RELEASE NAMING MORE THAN `shipwright` BUILDS ONE TREE PER REPOSITORY
+    # under `out`, rather than `out` itself being the one tree. Keeping the
+    # `--ships shipwright` layout exactly as it was is what this branches on:
+    # that one case falls through to the single-tree build below, unchanged.
+    if ships != ("shipwright",):
+        build_multi_tree(args.version, args.ref, out, ships, roots, siblings, previous, digest_text)
+        return 0
+
+    build_shipwright_tree(
+        args.version, args.ref, out, ships, siblings, previous, digest_text, cleanup=out
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except Refused as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc

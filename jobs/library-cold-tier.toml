@@ -1,0 +1,35 @@
+name = "library-cold-tier"
+description = "Moves the Library's signals past their hot window into the cold-tier database every six hours, where every read path still sees them. Without it the hot database only grows."
+label = "com.convivy.library.cold-tier"
+command = [
+  "{deploy}/library/.venv/bin/python3",
+  "{deploy}/library/cold_tier.py",
+]
+platforms = ["macos", "linux"]
+scope = "user"
+enabled-by-default = true
+working-directory = "{deploy}/library"
+
+[log]
+stdout = "{state}/cold-tier.log"
+stderr = "{state}/cold-tier.log"
+
+# THE MOVER OPENS THE DATABASES DIRECTLY, so it needs the same paths
+# `library.toml` gives the server. A divergence would move a signal cold in one
+# database while the running Library reads another. `LIBRARY_VECTORS_DB` is
+# here because the Library resolves it at import, though the mover never opens
+# that file. `tools/test_install_jobs.py` pins all three to `library.toml`'s.
+[environment]
+HOME = "{home}"
+LIBRARY_DB = "{state}/library/library.db"
+LIBRARY_COLD_DB = "{state}/library/cold.db"
+LIBRARY_VECTORS_DB = "{state}/library/vectors.db"
+LIBRARY_WRITES_ENABLED = "1"
+PATH = "{bin}:/usr/bin:/bin"
+
+# A sweep rather than a server: it runs at load to catch up on whatever the
+# last run missed, then every six hours. The retention windows it moves against
+# are measured in days.
+[schedule]
+at-load = true
+every-seconds = 21600

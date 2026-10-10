@@ -1,0 +1,1028 @@
+#!/usr/bin/env python3
+"""The merge gate GitHub holds: the approver App, its key, and the ruleset.
+
+    bin/github-gate --print-app --org <name>
+    sudo bin/github-gate --place-key <file> --app-id <id>
+    sudo bin/github-gate --ruleset --org <name> [--exclude <repo>]...
+    sudo bin/github-gate --check --org <name> [--exclude <repo>]...
+
+    bin/github-gate --ruleset --shape single [--mode instruction] --require-check <check>... [--org <name>]
+    bin/github-gate --ruleset --shape single --mode enforced --operator <login> --require-check <check>... [--org <name>]
+    GH_TOKEN=... bin/github-gate --check --shape single --mode instruction --repo <owner/name>... --require-check <check>...
+    GH_TOKEN=... bin/github-gate --check --shape single --mode enforced --operator <login> --repo <owner/name>... --require-check <check>...
+
+**A pull request merges to `main` only when the approver App has posted both
+review checks on its head.** The App's key is readable by root alone, so an
+agent cannot post a check under the App's name, and an organisation ruleset
+requires both checks from that App on every repository except the ones
+excluded. The operator creates the App and the ruleset in the browser; this
+command says exactly what to create, and confirms afterwards by reading.
+
+**It never writes to GitHub.** The only thing it changes is the key slot under
+`/opt/builder/etc`, and only when the operator hands it a key: the install
+never generates or fetches one.
+
+**A key is placed only after GitHub vouches for it.** `--place-key` signs a
+JWT with the offered key and reads the App back through `GET /app`. A key
+whose App id does not match, or whose App lacks a permission the gate needs,
+is refused and nothing is placed. A slot that already holds a key is refused
+too: replacing a credential is the operator's act, never the install's.
+
+**`--check` reads everything with the App's own key**, so it needs no
+operator token and no organisation endpoint: the App's permissions from
+`GET /app`, its installation from `GET /app/installations`, the repositories
+from an installation token that can only read metadata, and each repository's
+rulesets. Any field it cannot read fails its row, so a check that saw nothing
+never reads as a gate that holds.
+
+`--print-app` needs nothing. The other three read the key, so they need root.
+
+**`--shape single` is the single-account install's**, which has no approver
+App, no key and no root. Its agents reach GitHub as an App the operator
+creates, so the operator is not the author of their pull requests, and the
+operator chooses one of two merge modes:
+
+- **`--mode instruction`** (the default): the ruleset requires a pull request
+  and the passing checks the operator names, with no approving review. No
+  agent merging is held by the agents' instructions.
+- **`--mode enforced`**: the same, plus one approving review of the latest
+  push from a code owner, with stale approvals dismissed, and a `CODEOWNERS`
+  file on `main` naming the operator alone as owner of every path. The App
+  can approve any pull request it did not author, so a plain approving review
+  would admit the App's own; an App cannot be a code owner, so a code-owner
+  review is the operator's.
+
+Neither ruleset has a bypass actor. Its `--check` reads with the token in
+`GH_TOKEN`, which on such an install comes from `github-app-token`, and
+confirms each repository's ruleset matches the mode named with `--mode`,
+which `--check` requires rather than defaulting. In enforced mode it also
+reads `CODEOWNERS` on `main` and the errors GitHub found in it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import re
+import secrets
+import stat
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+
+PROG = "github-gate"
+
+PREFIX = "/opt/builder"
+KEY_SLOT = "etc/approver-app.pem"
+ID_SLOT = "etc/approver-app-id"
+# A slot the privileged install created empty carries this beside it.
+NEEDED_SUFFIX = ".needed"
+
+API = "https://api.github.com"
+OPENSSL = "/usr/bin/openssl"
+
+# The two checks the launcher posts, one per review role.
+CONTEXTS = ("builder/review/reviewer", "builder/review/security-reviewer")
+# What the approver App needs: read a pull request and its code, post a check,
+# and comment the review stamp.
+PERMISSIONS = {
+    "checks": "write",
+    "contents": "read",
+    "metadata": "read",
+    "pull_requests": "write",
+}
+LEVELS = {"read": 1, "write": 2, "admin": 3}
+
+MAIN = "refs/heads/main"
+DEFAULT_BRANCH = "~DEFAULT_BRANCH"
+BYPASS = [{"actor_type": "OrganizationAdmin", "bypass_mode": "exempt"}]
+
+# A PEM key is a few kilobytes. Anything larger was not one.
+MAX_KEY_BYTES = 16 * 1024
+
+# Owner of everything under the prefix. Tests, which do not run as root, set
+# these to their own ids.
+ROOT_UID = 0
+ROOT_GID = 0
+
+
+class Refused(Exception):
+    """Something the operator has to decide about. Never a stack trace."""
+
+
+@dataclass
+class Row:
+    what: str
+    ok: bool
+    fix: str = ""
+
+
+@dataclass
+class Report:
+    rows: list[Row] = field(default_factory=list)
+
+    def add(self, what: str, ok: bool, fix: str = "") -> None:
+        self.rows.append(Row(what, ok, fix))
+
+    @property
+    def failing(self) -> list[Row]:
+        return [r for r in self.rows if not r.ok]
+
+
+# GitHub.
+
+def github(method: str, url: str, bearer: str, body: dict | None = None,
+           user_agent: str = PROG) -> tuple[int, object]:
+    """One API request. Returns the status and the decoded body."""
+    req = urllib.request.Request(
+        url, method=method,
+        data=None if body is None else json.dumps(body).encode(),
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {bearer}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+            "User-Agent": user_agent,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+            try:
+                return resp.status, json.loads(raw or b"{}")
+            except ValueError:
+                raise Refused(f"GitHub answered {resp.status} with a body that is not JSON. "
+                              "Nothing was changed.")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read() or b"{}")
+        except ValueError:
+            return e.code, {}
+    except urllib.error.URLError as e:
+        raise Refused(f"GitHub could not be reached ({e.reason}). Nothing was changed.")
+
+
+class GitHub:
+    """The reads this command makes, through one request function tests replace."""
+
+    def __init__(self, request=github, api: str = API):
+        self.request = request
+        self.api = api
+
+    def get(self, path: str, bearer: str) -> tuple[int, object]:
+        return self.request("GET", self.api + path, bearer, None)
+
+    def pages(self, path: str, bearer: str, key: str | None = None) -> list:
+        """Every item of a listing, 100 to a page. `key` names the list inside
+        an object answer, as `GET /installation/repositories` gives one."""
+        items: list = []
+        sep = "&" if "?" in path else "?"
+        for page in range(1, 101):
+            code, payload = self.get(f"{path}{sep}per_page=100&page={page}", bearer)
+            if code != 200:
+                raise Refused(f"`GET {path}` answered {code}: {message(payload)}")
+            batch = payload.get(key) if key and isinstance(payload, dict) else payload
+            if not isinstance(batch, list):
+                raise Refused(f"`GET {path}` did not answer with a list.")
+            items.extend(batch)
+            if len(batch) < 100:
+                return items
+        raise Refused(f"`GET {path}` ran past 100 pages.")
+
+    def installation_token(self, jwt: str, installation_id: int) -> str:
+        # Metadata alone: enough to list the repositories and read their
+        # rulesets, and nothing a bug here could write with.
+        code, payload = self.request(
+            "POST", f"{self.api}/app/installations/{installation_id}/access_tokens",
+            jwt, {"permissions": {"metadata": "read"}},
+        )
+        token = payload.get("token") if code == 201 and isinstance(payload, dict) else None
+        if not token:
+            raise Refused(f"GitHub refused an installation token ({code}): {message(payload)}")
+        return token
+
+    def revoke(self, token: str) -> None:
+        # Best effort: the token is in this process alone and expires within
+        # the hour, and it can only read metadata.
+        try:
+            self.request("DELETE", f"{self.api}/installation/token", token, None)
+        except Refused:
+            pass
+
+
+def message(payload: object) -> str:
+    if isinstance(payload, dict) and payload.get("message"):
+        return str(payload["message"])
+    return "no message"
+
+
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def app_jwt(key_path: str, app_id: str, now: int | None = None) -> str:
+    """A GitHub App JWT (RS256), signed by the system's openssl. Valid for nine
+    minutes and backdated one, GitHub's allowance for clock drift."""
+    now = int(time.time()) if now is None else now
+    header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
+    claims = b64url(json.dumps({"iat": now - 60, "exp": now + 540, "iss": app_id},
+                               separators=(",", ":")).encode())
+    signing_input = f"{header}.{claims}".encode("ascii")
+    done = subprocess.run([OPENSSL, "dgst", "-sha256", "-sign", key_path],
+                          input=signing_input, capture_output=True, check=False)
+    if done.returncode != 0 or not done.stdout:
+        raise Refused("openssl could not sign with that key, so it is not an RSA private "
+                      "key. GitHub's App settings page generates one as a .pem file.")
+    return f"{header}.{claims}.{b64url(done.stdout)}"
+
+
+# The App.
+
+def read_app(gh: GitHub, jwt: str, app_id: str) -> dict:
+    """The App this key signs for, refused unless it is the App named."""
+    code, app = gh.get("/app", jwt)
+    if code != 200 or not isinstance(app, dict):
+        raise Refused(
+            f"GitHub did not accept a JWT signed with this key for App {app_id} "
+            f"({code}: {message(app)}). Check the App id on the App's settings page, "
+            f"and that the key was generated there."
+        )
+    if str(app.get("id")) != str(app_id):
+        raise Refused(f"the key signs for App {app.get('id')}, not App {app_id}.")
+    return app
+
+
+def permission_rows(app: dict) -> Report:
+    report = Report()
+    held = app.get("permissions") or {}
+    for name, needed in PERMISSIONS.items():
+        level = held.get(name)
+        report.add(
+            f"the App holds {name}: {needed} (it holds {level or 'nothing'})",
+            LEVELS.get(level, 0) >= LEVELS[needed],
+            f"in the App's settings, Permissions, set {name} to {needed}",
+        )
+    # Only those four. A permission beyond them is held by a key the gate trusts:
+    # `administration: write` alone can edit or delete the ruleset that is the gate.
+    extra = sorted(name for name in held if name not in PERMISSIONS)
+    report.add(
+        f"the App holds no other permission (it also holds "
+        f"{', '.join(f'{n}: {held[n]}' for n in extra) or 'nothing'})",
+        not extra,
+        f"in the App's settings, Permissions, set {', '.join(extra)} to No access",
+    )
+    return report
+
+
+def installation_for(gh: GitHub, jwt: str, org: str) -> dict:
+    for inst in gh.pages("/app/installations", jwt):
+        login = ((inst.get("account") or {}).get("login") or "")
+        if login.lower() == org.lower():
+            return inst
+    raise Refused(
+        f"the App is not installed on {org}. On the App's settings page, Install "
+        f"App, install it on {org} with \"All repositories\"."
+    )
+
+
+# The key slot.
+
+def slot_paths(prefix: str) -> tuple[str, str, str]:
+    etc = os.path.join(prefix, "etc")
+    return etc, os.path.join(prefix, KEY_SLOT), os.path.join(prefix, ID_SLOT)
+
+
+def require_root_dir(path: str) -> None:
+    """A directory only root can write, or a refusal. The key goes nowhere
+    another account could swap it out."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        raise Refused(f"{path} does not exist.")
+    if not stat.S_ISDIR(st.st_mode):
+        raise Refused(f"{path} is not a plain directory (a symlink or a file is there). "
+                      f"Nothing was changed.")
+    if st.st_uid != ROOT_UID or st.st_mode & 0o022:
+        raise Refused(f"{path} is writable by an account other than root "
+                      f"(owner uid {st.st_uid}, mode {stat.filemode(st.st_mode)}). "
+                      f"Nothing was changed.")
+
+
+def make_root_dir(path: str, mode: int) -> None:
+    if not os.path.lexists(path):
+        os.mkdir(path, mode)
+        os.chown(path, ROOT_UID, ROOT_GID)
+        os.chmod(path, mode)
+    require_root_dir(path)
+
+
+def read_slot(path: str) -> bytes | None:
+    """The slot's contents, None when it does not exist, b"" when it is empty.
+
+    Refuses a slot root does not alone own, so a key another account could
+    have written is never used.
+    """
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        raise Refused(f"{path} is not a regular file. Nothing was changed.")
+    if st.st_uid != ROOT_UID or st.st_mode & 0o077:
+        raise Refused(f"{path} must be owned by root with mode 600 (it is uid "
+                      f"{st.st_uid}, {stat.filemode(st.st_mode)}). Nothing was changed.")
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def write_root_file(path: str, data: bytes) -> None:
+    """Write `data` to `path` as root, mode 600, by write-then-rename."""
+    tmp = f"{path}.tmp-{secrets.token_hex(8)}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        os.fchown(fd, ROOT_UID, ROOT_GID)
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+
+
+def placed_key(prefix: str) -> tuple[str, str]:
+    """The key slot's path and the App id, refused while either is empty."""
+    _, key_path, id_path = slot_paths(prefix)
+    key = read_slot(key_path)
+    app_id = read_slot(id_path)
+    if not key or not app_id:
+        raise Refused(
+            f"no approver key is placed at {key_path}. Create the App "
+            f"({PROG} --print-app), then run: sudo {PROG} --place-key <file> --app-id <id>"
+        )
+    app_id_text = app_id.decode("ascii", "replace").strip()
+    if not app_id_text.isdigit():
+        raise Refused(f"{id_path} does not hold an App id.")
+    return key_path, app_id_text
+
+
+def place_key(gh: GitHub, prefix: str, source: str, app_id: str) -> list[str]:
+    """Move the operator's key into the slot once GitHub has vouched for it."""
+    if not app_id.isdigit():
+        raise Refused(f"--app-id takes the App's numeric id, shown on its settings "
+                      f"page as \"App ID\" (got {app_id!r}).")
+    etc, key_path, id_path = slot_paths(prefix)
+    if read_slot(key_path):
+        raise Refused(
+            f"{key_path} already holds a key, and the install never replaces a "
+            f"credential. To rotate it, revoke the old key on the App's settings "
+            f"page, empty the slot yourself (sudo truncate -s 0 {key_path}), and run "
+            f"this again. Nothing was changed."
+        )
+
+    try:
+        src_stat = os.lstat(source)
+    except FileNotFoundError:
+        raise Refused(f"there is no file at {source}.")
+    if not stat.S_ISREG(src_stat.st_mode):
+        raise Refused(f"{source} is not a regular file.")
+    if src_stat.st_size > MAX_KEY_BYTES:
+        raise Refused(f"{source} is {src_stat.st_size} bytes, too large to be an App key.")
+    with open(source, "rb") as f:
+        key = f.read()
+    if b"-----BEGIN" not in key or b"PRIVATE KEY-----" not in key:
+        raise Refused(f"{source} is not a PEM private key.")
+
+    make_root_dir(prefix, 0o755)
+    make_root_dir(etc, 0o700)
+
+    # Checked from a root-only copy beside the slot, so the key is never in a
+    # second place an account other than root can read, and a refusal leaves
+    # nothing behind.
+    trial = f"{key_path}.trial-{secrets.token_hex(8)}"
+    write_root_file(trial, key)
+    try:
+        jwt = app_jwt(trial, app_id)
+        app = read_app(gh, jwt, app_id)
+        perms = permission_rows(app)
+        if perms.failing:
+            lines = "\n".join(f"  {r.what}\n    fix: {r.fix}" for r in perms.failing)
+            raise Refused(f"the App lacks what the gate needs:\n{lines}\nNothing was placed.")
+        os.replace(trial, key_path)
+    finally:
+        if os.path.lexists(trial):
+            os.unlink(trial)
+    write_root_file(id_path, f"{app_id}\n".encode())
+
+    changed = [f"placed the key for App {app_id} ({app.get('slug', '?')}) at {key_path}"]
+    for path in (key_path, id_path):
+        marker = path + NEEDED_SUFFIX
+        if os.path.lexists(marker):
+            os.unlink(marker)
+    # A move, so no second copy of the key outlives this command.
+    os.unlink(source)
+    changed.append(f"removed {source}")
+    return changed
+
+
+# The ruleset.
+
+def ruleset(app_id: int, excludes: list[str]) -> dict:
+    """The organisation ruleset the operator imports."""
+    return {
+        "name": "builder review gate",
+        "target": "branch",
+        "enforcement": "active",
+        "conditions": {
+            "ref_name": {"include": [MAIN], "exclude": []},
+            "repository_name": {"include": ["~ALL"], "exclude": sorted(excludes),
+                                "protected": False},
+        },
+        "rules": [{
+            "type": "required_status_checks",
+            "parameters": {
+                "required_status_checks": [
+                    {"context": c, "integration_id": app_id} for c in CONTEXTS
+                ],
+                "strict_required_status_checks_policy": False,
+            },
+        }],
+        "bypass_actors": [
+            {"actor_id": None, "actor_type": "OrganizationAdmin", "bypass_mode": "exempt"}
+        ],
+    }
+
+
+SINGLE_NAME = "builder single-account gate"
+MODES = ("instruction", "enforced")
+SINGLE_PULL_REQUEST = {
+    "instruction": {
+        "required_approving_review_count": 0,
+        "dismiss_stale_reviews_on_push": False,
+        "require_code_owner_review": False,
+        "require_last_push_approval": False,
+        "required_review_thread_resolution": False,
+    },
+    "enforced": {
+        "required_approving_review_count": 1,
+        "dismiss_stale_reviews_on_push": True,
+        "require_code_owner_review": True,
+        "require_last_push_approval": True,
+        "required_review_thread_resolution": False,
+    },
+}
+# The pull_request fields each mode's check compares, against the value above.
+SINGLE_REVIEW_FIELDS = ("required_approving_review_count", "dismiss_stale_reviews_on_push",
+                        "require_code_owner_review", "require_last_push_approval")
+# Where GitHub looks for CODEOWNERS, in its order; the first one found is used.
+CODEOWNERS_PATHS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
+LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
+
+
+def single_ruleset(checks: list[str], org: str | None, mode: str = "instruction") -> dict:
+    """The ruleset for a single-account install, where no approver App exists.
+
+    **A PULL REQUEST AND PASSING CHECKS**, and in `enforced` mode one
+    code-owner approval of the latest push. **NO BYPASS ACTOR**, so a direct push
+    to `main` is refused for everyone, an administrator included. The App the
+    agents use holds no `administration` permission, so it cannot change the
+    ruleset; an operator credential left on the machine could, so `enforced`
+    holds only while no such credential is on the machine.
+
+    With `org`, an organisation ruleset over every repository; without, a
+    repository ruleset, for an operator whose projects live under their own
+    account."""
+    conditions: dict = {"ref_name": {"include": [MAIN], "exclude": []}}
+    if org:
+        conditions["repository_name"] = {"include": ["~ALL"], "exclude": [],
+                                         "protected": False}
+    return {
+        "name": SINGLE_NAME,
+        "target": "branch",
+        "enforcement": "active",
+        "conditions": conditions,
+        "rules": [
+            {"type": "deletion"},
+            {"type": "non_fast_forward"},
+            {"type": "pull_request", "parameters": dict(SINGLE_PULL_REQUEST[mode])},
+            {"type": "required_status_checks", "parameters": {
+                "required_status_checks": [{"context": c} for c in checks],
+                "strict_required_status_checks_policy": False,
+            }},
+        ],
+        "bypass_actors": [],
+    }
+
+
+def pull_request_parameters(rs: dict) -> dict:
+    for rule in rs.get("rules") or []:
+        if isinstance(rule, dict) and rule.get("type") == "pull_request":
+            return rule.get("parameters") or {}
+    return {}
+
+
+def single_problem(rs: dict, checks: list[str], mode: str = "instruction") -> str | None:
+    """Why this ruleset is not the single-account gate in `mode`, naming the
+    field, or None."""
+    if rs.get("enforcement") != "active":
+        return f"enforcement is {rs.get('enforcement')!r}, not 'active'"
+    # The literal ref, as `gate_problem` requires. `~DEFAULT_BRANCH` means main
+    # only on a repository whose default branch is main, and this check never
+    # reads the default branch, so accepting it would pass a ruleset that
+    # protects some other branch. `single_ruleset` prints the literal ref.
+    if MAIN not in ref_includes(rs):
+        return f"conditions.ref_name.include is {ref_includes(rs)}, which does not name {MAIN}"
+    if MAIN in ref_excludes(rs):
+        return f"conditions.ref_name.exclude names {MAIN}"
+    missing = {"pull_request", "deletion", "non_fast_forward"} - rule_types(rs)
+    if missing:
+        return f"the rules do not include {', '.join(sorted(missing))}"
+    present = {c.get("context") for c in required_checks(rs)}
+    absent = [c for c in checks if c not in present]
+    if absent:
+        return f"the required checks do not include {', '.join(absent)}"
+    params = pull_request_parameters(rs)
+    for name in SINGLE_REVIEW_FIELDS:
+        want = SINGLE_PULL_REQUEST[mode][name]
+        if params.get(name) != want:
+            return (f"pull_request.{name} is {params.get(name)!r}, and {mode} mode "
+                    f"needs {want!r}")
+    # GitHub returns bypass_actors only to a token that can administer the
+    # repository, and the agents' App deliberately cannot, so read with the
+    # App's token, as the check is run, the field is absent (rehearsal of the
+    # single-account install). current_user_can_bypass is returned to every
+    # token, and "never" shows the App, which every agent acts as, cannot
+    # bypass the rule. An administrator's token gets the whole list.
+    if "bypass_actors" in rs:
+        if rs["bypass_actors"]:
+            return (f"bypass_actors is {rs['bypass_actors']}, so a direct push to {MAIN} "
+                    f"is allowed for them")
+    elif rs.get("current_user_can_bypass") != "never":
+        return (f"GitHub returned no bypass_actors, and current_user_can_bypass is "
+                f"{rs.get('current_user_can_bypass')!r}, so whether the token reading it can "
+                f"bypass it is unknown")
+    return None
+
+
+def bypass_said(rs: dict) -> str:
+    """What the check could see about who bypasses `rs`."""
+    if "bypass_actors" in rs:
+        return "and nobody bypasses it"
+    return "and the token reading it cannot bypass it (GitHub shows the full list only to an administrator)"
+
+
+def codeowners_line(operator: str) -> str:
+    return f"* @{operator}"
+
+
+def codeowners_problem(text: str, operator: str) -> str | None:
+    """Why this CODEOWNERS does not name `operator` alone as owner of every
+    path, or None.
+
+    The last line matching a path decides its owners, so the `*` line names
+    every path only until a later line names a narrower pattern; from the last
+    `*` line on, every line must name the operator alone."""
+    rules = []
+    for raw in text.splitlines():
+        words = raw.split()
+        cut = next((i for i, w in enumerate(words) if w.startswith("#")), len(words))
+        if cut:
+            rules.append(words[:cut])
+    stars = [i for i, words in enumerate(rules) if words[0] == "*"]
+    if not stars:
+        return (f"no `*` line names @{operator}, so a path no other line names has no code "
+                f"owner and any approval counts")
+    for words in rules[stars[-1]:]:
+        if [w.lower() for w in words[1:]] != [f"@{operator}".lower()]:
+            return (f"`{' '.join(words)}` comes after the last `*` line and does not name "
+                    f"@{operator} alone, so another approver counts for the paths it matches")
+    return None
+
+
+def codeowners_rows(gh: GitHub, token: str, full: str, operator: str) -> Report:
+    """Whether CODEOWNERS on main names `operator` alone for every path, and
+    GitHub found no error in it."""
+    report = Report()
+    what = f"{full}: CODEOWNERS on main names @{operator} alone as owner of every path"
+    fix = (f"commit the line `{codeowners_line(operator)}` as the whole of "
+           f".github/CODEOWNERS on main")
+    for path in CODEOWNERS_PATHS:
+        code, payload = gh.get(f"/repos/{full}/contents/{path}?ref=main", token)
+        if code == 404:
+            continue
+        if code != 200 or not isinstance(payload, dict) or payload.get("encoding") != "base64":
+            report.add(f"{full}: {path} on main can be read", False,
+                       f"GitHub answered {code}: {message(payload)}")
+            return report
+        try:
+            text = base64.b64decode(payload.get("content") or "").decode()
+        except (ValueError, UnicodeDecodeError):
+            report.add(f"{full}: {path} on main can be read", False,
+                       "GitHub returned content that is not base64 UTF-8 text")
+            return report
+        problem = codeowners_problem(text, operator)
+        report.add(what, problem is None, f"{path}: {problem}. Instead, {fix}")
+        if problem is None:
+            # GitHub skips a line it cannot use, such as one naming a login
+            # that does not exist. `--ruleset` prints the line from `--operator`,
+            # so a mistyped login reads correctly here while GitHub ignores the
+            # line, the paths have no code owner, and the App's approval counts.
+            code, payload = gh.get(f"/repos/{full}/codeowners/errors?ref=main", token)
+            errors = payload.get("errors") if isinstance(payload, dict) else None
+            if code != 200 or not isinstance(errors, list):
+                report.add(f"{full}: GitHub's errors for {path} can be read", False,
+                           f"GitHub answered {code}: {message(payload)}")
+            elif errors:
+                first = errors[0] if isinstance(errors[0], dict) else {}
+                report.add(f"{full}: GitHub found no error in {path}", False,
+                           f"line {first.get('line', '?')}: {first.get('message', first)}. "
+                           f"GitHub ignores that line; check the login is yours")
+            else:
+                report.add(f"{full}: GitHub found no error in {path}", True)
+        return report
+    report.add(what, False, f"no CODEOWNERS on main. {fix[0].upper()}{fix[1:]}")
+    return report
+
+
+def check_single(gh: GitHub, token: str, repos: list[str], checks: list[str],
+                 mode: str = "instruction", operator: str | None = None) -> Report:
+    """Read each repository's rulesets with the token given, and find one that
+    is the single-account gate in `mode`. In enforced mode, read CODEOWNERS
+    too, which must name `operator`."""
+    report = Report()
+    for full in repos:
+        rulesets = []
+        for summary in gh.pages(f"/repos/{full}/rulesets?includes_parents=true", token):
+            code, detail = gh.get(f"/repos/{full}/rulesets/{summary.get('id')}", token)
+            if code != 200 or not isinstance(detail, dict):
+                report.add(f"{full}: ruleset {summary.get('id')} can be read", False,
+                           f"GitHub answered {code}: {message(detail)}")
+                continue
+            rulesets.append(detail)
+        problems = [(rs, single_problem(rs, checks, mode)) for rs in rulesets]
+        good = [rs for rs, p in problems if p is None]
+        what = ("a pull request, passing checks and a code owner's approval of the latest push"
+                if mode == "enforced" else "a pull request and passing checks, with no approval")
+        if good:
+            report.add(f"{full}: ruleset {good[0].get('id')} on {MAIN} requires {what}, "
+                       f"{bypass_said(good[0])}", True)
+        else:
+            named = [(rs, p) for rs, p in problems if rs.get("name") == SINGLE_NAME]
+            report.add(
+                f"{full}: a ruleset on {MAIN} requires {what}",
+                False,
+                f"ruleset {named[0][0].get('id')} ({SINGLE_NAME}): {named[0][1]}" if named else
+                f"no ruleset does. Import the one `{PROG} --ruleset --shape single "
+                f"--mode {mode}` prints.")
+        if mode == "enforced":
+            report.rows.extend(codeowners_rows(gh, token, full, operator).rows)
+    return report
+
+
+def single_token() -> str:
+    """The token `--check --shape single` reads with, from the environment,
+    never from a file this command chooses."""
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not token:
+        raise Refused("--check --shape single reads with a GitHub token in GH_TOKEN. Run it "
+                      "as GH_TOKEN=$(github-app-token) " + PROG + " --check --shape single ...")
+    return token
+
+
+def ref_includes(rs: dict) -> list:
+    return (((rs.get("conditions") or {}).get("ref_name") or {}).get("include")) or []
+
+
+def ref_excludes(rs: dict) -> list:
+    return (((rs.get("conditions") or {}).get("ref_name") or {}).get("exclude")) or []
+
+
+def rule_types(rs: dict) -> set[str]:
+    return {r.get("type") for r in rs.get("rules") or [] if isinstance(r, dict)}
+
+
+def required_checks(rs: dict) -> list[dict]:
+    for rule in rs.get("rules") or []:
+        if isinstance(rule, dict) and rule.get("type") == "required_status_checks":
+            return (rule.get("parameters") or {}).get("required_status_checks") or []
+    return []
+
+
+def gate_problem(rs: dict, app_id: int) -> str | None:
+    """Why this ruleset is not the review gate, naming the field, or None."""
+    if rs.get("enforcement") != "active":
+        return f"enforcement is {rs.get('enforcement')!r}, not 'active'"
+    if MAIN not in ref_includes(rs):
+        return (f"conditions.ref_name.include is {ref_includes(rs)}, which does not "
+                f"name {MAIN}")
+    if MAIN in ref_excludes(rs):
+        return f"conditions.ref_name.exclude names {MAIN}"
+    checks = {c.get("context"): c.get("integration_id") for c in required_checks(rs)}
+    for context in CONTEXTS:
+        if context not in checks:
+            return f"the required checks do not include {context}"
+        if checks[context] != app_id:
+            return (f"{context} is pinned to integration {checks[context]}, not the "
+                    f"approver App {app_id}")
+    if "bypass_actors" not in rs:
+        return "GitHub returned no bypass_actors, so who can bypass it is unknown"
+    actors = [{"actor_type": a.get("actor_type"), "bypass_mode": a.get("bypass_mode")}
+              for a in rs.get("bypass_actors") or []]
+    if actors != BYPASS:
+        return f"bypass_actors is {actors}, not exactly {BYPASS}"
+    return None
+
+
+def protects_main(rs: dict, default_branch: str | None) -> bool:
+    """Whether this ruleset forbids deleting and force-pushing `main`."""
+    if rs.get("enforcement") != "active" or MAIN in ref_excludes(rs):
+        return False
+    if not {"deletion", "non_fast_forward"} <= rule_types(rs):
+        return False
+    includes = ref_includes(rs)
+    return MAIN in includes or (DEFAULT_BRANCH in includes and default_branch == "main")
+
+
+def repository_rows(gh: GitHub, token: str, org: str, repo: dict, app_id: int) -> Report:
+    report = Report()
+    name = repo.get("name", "?")
+    rulesets = []
+    for summary in gh.pages(f"/repos/{org}/{name}/rulesets?includes_parents=true", token):
+        code, detail = gh.get(f"/repos/{org}/{name}/rulesets/{summary.get('id')}", token)
+        if code != 200 or not isinstance(detail, dict):
+            report.add(f"{name}: ruleset {summary.get('id')} can be read", False,
+                       f"GitHub answered {code}: {message(detail)}")
+            continue
+        rulesets.append(detail)
+
+    gates = [rs for rs in rulesets
+             if any(c.get("context") in CONTEXTS for c in required_checks(rs))]
+    problems = [(rs, gate_problem(rs, app_id)) for rs in gates]
+    good = [rs for rs, p in problems if p is None]
+    if good:
+        report.add(f"{name}: ruleset {good[0].get('id')} requires both review checks "
+                   f"from the approver App on {MAIN}", True)
+    elif problems:
+        rs, problem = problems[0]
+        report.add(f"{name}: ruleset {rs.get('id')} ({rs.get('name')}) is the review "
+                   f"gate", False, problem)
+    else:
+        report.add(f"{name}: a ruleset requires the review checks on {MAIN}", False,
+                   f"no ruleset names {' or '.join(CONTEXTS)}. Import the one "
+                   f"`{PROG} --ruleset` prints.")
+
+    protecting = [rs for rs in rulesets if protects_main(rs, repo.get("default_branch"))]
+    report.add(
+        f"{name}: a ruleset forbids deleting and force-pushing {MAIN}",
+        bool(protecting),
+        "add an active ruleset with the deletion and non_fast_forward rules on main",
+    )
+    return report
+
+
+def check(gh: GitHub, prefix: str, org: str, excludes: list[str]) -> Report:
+    key_path, app_id = placed_key(prefix)
+    jwt = app_jwt(key_path, app_id)
+    app = read_app(gh, jwt, app_id)
+    report = Report()
+    report.add(f"the key at {key_path} signs for App {app_id} ({app.get('slug', '?')})", True)
+    report.rows.extend(permission_rows(app).rows)
+
+    inst = installation_for(gh, jwt, org)
+    selection = inst.get("repository_selection")
+    report.add(
+        f"the App is installed on every repository of {org} (it is installed on "
+        f"{selection!r})",
+        selection == "all",
+        f"on the App's settings page, Install App, set {org} to \"All repositories\"",
+    )
+
+    token = gh.installation_token(jwt, inst["id"])
+    try:
+        repos = gh.pages("/installation/repositories", token, key="repositories")
+        if not repos:
+            report.add(f"the App can see a repository of {org}", False,
+                       "the installation lists no repositories")
+        for repo in sorted(repos, key=lambda r: r.get("name", "")):
+            if repo.get("name") in excludes:
+                continue
+            report.rows.extend(repository_rows(gh, token, org, repo, int(app_id)).rows)
+    finally:
+        gh.revoke(token)
+    return report
+
+
+# What the operator is told.
+
+def app_instructions(org: str) -> str:
+    perms = "\n".join(f"      {name}: {level}" for name, level in PERMISSIONS.items())
+    return f"""\
+Create the approver App, in a browser signed in as an owner of {org}:
+
+  1. https://github.com/organizations/{org}/settings/apps/new
+     - GitHub App name: any name, for example "{org} approver".
+     - Homepage URL: any URL; it is not used.
+     - Webhook: clear "Active". The App receives nothing.
+     - Repository permissions, and nothing else:
+{perms}
+     - Where can this GitHub App be installed: "Only on this account".
+  2. Create the App, and note its "App ID" on the settings page.
+  3. Under "Private keys", generate a private key. GitHub downloads a .pem file.
+  4. Under "Install App", install it on {org} with "All repositories".
+  5. Place the key. This moves the file, so no copy stays in Downloads:
+
+       sudo {PROG} --place-key <the .pem file> --app-id <App ID>
+
+The ruleset comes at the cutover, because it blocks every merge the moment it
+is on: `sudo {PROG} --ruleset --org {org} --exclude <repo>` prints it.
+"""
+
+
+def ruleset_instructions(org: str) -> str:
+    return f"""\
+Import the JSON above as an organisation ruleset (save it to a file first):
+https://github.com/organizations/{org}/settings/rules, New ruleset, Import a ruleset.
+
+Then confirm it by reading:  sudo {PROG} --check --org {org} [--exclude <repo>]...
+
+The live acceptance belongs on a scratch repository once the ruleset is on:
+  1. A check named {CONTEXTS[0]} posted by any App other than the approver
+     leaves a pull request unmergeable.
+  2. A pull request approved while based on another branch, then retargeted to
+     main, is unmergeable until both checks are posted again on its head.
+"""
+
+
+def print_table(title: str, report: Report) -> None:
+    print(title)
+    for row in report.rows:
+        print(f"  {'ok' if row.ok else 'WRONG':<6} {row.what}")
+        if not row.ok and row.fix:
+            print(f"         fix: {row.fix}")
+
+
+def single_instructions(org: str | None, mode: str = "instruction",
+                        operator: str | None = None) -> str:
+    where = (f"https://github.com/organizations/{org}/settings/rules, New ruleset, "
+             f"Import a ruleset" if org else
+             "each project repository's Settings, Rules, Rulesets, New ruleset, "
+             "Import a ruleset")
+    owners = operator_flag = ""
+    if mode == "enforced":
+        owners = f"""
+First, in each repository, push a .github/CODEOWNERS to main that holds
+exactly this line. Do it before you import the ruleset, which refuses a
+direct push to main:
+
+  {codeowners_line(operator)}
+"""
+        operator_flag = f" --operator {operator}"
+    return f"""\
+Import the JSON above (save it to a file first): {where}.
+{owners}
+{SINGLE_MODE_NOTE[mode]}
+
+Then confirm it by reading:
+  GH_TOKEN=$(github-app-token) {PROG} --check --shape single --mode {mode}{operator_flag} --repo <owner/name> --require-check <check>
+"""
+
+
+SINGLE_MODE_NOTE = {
+    "instruction": """It refuses a direct push to main, for everyone, and requires the checks named
+above. Nothing on GitHub requires your approval: that no agent merges is held
+by the agents' instructions.""",
+    "enforced": """It refuses a direct push to main, for everyone, and requires the checks named
+above and your approval of the latest push, as the code owner CODEOWNERS
+names. On a pull request an agent opened, approval from anyone else, the
+agents' App included, does not count. On one you opened and only you pushed
+to, GitHub asks for no code owner, so any approval counts, the App's included;
+the agents' instructions forbid them to approve. Once an agent pushes to a pull
+request you opened, the latest push needs approving by someone other than that
+agent, and you cannot approve your own pull request, so it cannot merge.
+It holds only while no GitHub
+credential of yours (a gh login, or an SSH key that can push) is on this
+machine. An agent can still press merge once you have approved; its
+instructions forbid that.""",
+}
+
+
+def main_single(args: argparse.Namespace, gh: GitHub) -> int:
+    """`--shape single`: no approver App, no key, no root."""
+    checked_mode = args.mode
+    args.mode = args.mode or "instruction"
+    if args.mode == "enforced":
+        if not args.operator:
+            raise Refused("--mode enforced needs --operator, your GitHub login, which "
+                          "CODEOWNERS names as the one approver who counts.")
+        args.operator = args.operator.removeprefix("@")
+        if not LOGIN.fullmatch(args.operator):
+            raise Refused(f"--operator takes a GitHub login, and {args.operator!r} is not one.")
+    elif args.operator:
+        raise Refused("--operator belongs to --mode enforced.")
+    if args.print_app or args.place_key is not None or args.app_id:
+        raise Refused("the single-account shape has no approver App, so there is no "
+                      "App to print and no key to place.")
+    if args.exclude:
+        raise Refused("--exclude belongs to the two-account organisation ruleset.")
+    if not args.require_check:
+        raise Refused("name the status checks main requires with --require-check, once "
+                      "for each: the names of your project's CI jobs as GitHub shows them.")
+    if args.ruleset:
+        if args.repo:
+            raise Refused("--repo belongs to --check.")
+        print(json.dumps(single_ruleset(args.require_check, args.org, args.mode), indent=2))
+        print(single_instructions(args.org, args.mode, args.operator), end="", file=sys.stderr)
+        return 0
+    if args.org:
+        raise Refused("--org belongs to --ruleset; --check reads the repositories named "
+                      "with --repo.")
+    if not args.repo:
+        raise Refused("name each repository to read with --repo owner/name.")
+    for full in args.repo:
+        if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", full):
+            raise Refused(f"--repo takes owner/name, and {full!r} is not that.")
+    # --check compares against the mode the install recorded, so it never
+    # assumes one: a default would pass a ruleset downgraded from enforced.
+    if not checked_mode:
+        raise Refused("name the merge mode to check against with --mode enforced or "
+                      "--mode instruction, the one this install recorded.")
+    report = check_single(gh, single_token(), args.repo, args.require_check, args.mode,
+                          args.operator)
+    print_table(f"{PROG}: single-account gate", report)
+    return 1 if report.failing else 0
+
+
+def main(argv: list[str], gh: GitHub | None = None, prefix: str = PREFIX) -> int:
+    parser = argparse.ArgumentParser(prog=PROG, description="The merge gate GitHub holds.")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--print-app", action="store_true", help="say which App to create")
+    mode.add_argument("--place-key", metavar="FILE", help="move the App's key into the slot")
+    mode.add_argument("--ruleset", action="store_true", help="print the ruleset to import")
+    mode.add_argument("--check", action="store_true", help="verify the App and the ruleset by reading")
+    parser.add_argument("--org", help="the GitHub organisation")
+    parser.add_argument("--exclude", action="append", default=[], metavar="REPO",
+                        help="a repository the gate leaves out (repeatable)")
+    parser.add_argument("--app-id", help="with --place-key, the App's numeric id")
+    parser.add_argument("--shape", choices=("two", "single"), default="two",
+                        help="the install shape: two accounts and the approver App "
+                             "(the default), or a single account with no App")
+    parser.add_argument("--require-check", action="append", default=[], metavar="CONTEXT",
+                        help="with --shape single, a status check main requires (repeatable)")
+    parser.add_argument("--repo", action="append", default=[], metavar="OWNER/NAME",
+                        help="with --shape single --check, a repository to read (repeatable)")
+    parser.add_argument("--mode", choices=MODES,
+                        help="with --shape single, the merge mode: instruction (the default "
+                             "for --ruleset) or enforced, which requires your approval; "
+                             "--check needs it named")
+    parser.add_argument("--operator", metavar="LOGIN",
+                        help="with --mode enforced, your GitHub login, which CODEOWNERS "
+                             "names as owner of every path")
+    args = parser.parse_args(argv)
+    gh = gh or GitHub()
+
+    if args.shape == "single":
+        try:
+            return main_single(args, gh)
+        except Refused as exc:
+            print(f"{PROG}: {exc}", file=sys.stderr)
+            return 2
+
+    try:
+        if args.require_check or args.repo or args.mode or args.operator:
+            raise Refused("--require-check, --repo, --mode and --operator belong to "
+                          "--shape single.")
+        if args.place_key is None and args.app_id:
+            raise Refused("--app-id only means something with --place-key.")
+        if args.place_key is not None and not args.app_id:
+            raise Refused("--place-key needs --app-id, the number on the App's settings page.")
+        if (args.print_app or args.ruleset or args.check) and not args.org:
+            raise Refused("name the organisation with --org.")
+        if args.print_app:
+            print(app_instructions(args.org), end="")
+            return 0
+        if os.geteuid() != 0:
+            raise Refused(f"this reads or writes the approver key, which only root may. "
+                          f"Run: sudo {sys.argv[0]} {' '.join(argv)}".rstrip())
+        if args.place_key is not None:
+            print("\n".join(place_key(gh, prefix, args.place_key, args.app_id)))
+            return 0
+        if args.ruleset:
+            key_path, app_id = placed_key(prefix)
+            app = read_app(gh, app_jwt(key_path, app_id), app_id)
+            print(json.dumps(ruleset(int(app["id"]), args.exclude), indent=2))
+            print(ruleset_instructions(args.org), end="", file=sys.stderr)
+            return 0
+        report = check(gh, prefix, args.org, args.exclude)
+        print_table(f"{PROG}: {args.org}", report)
+        return 1 if report.failing else 0
+    except Refused as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

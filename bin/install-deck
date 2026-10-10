@@ -1,0 +1,902 @@
+#!/usr/bin/env python3
+"""Build Deck from a verified commit and place it in ~/Applications.
+
+    bin/install-deck                 build the shipped bundle and install it
+    bin/install-deck --status        what is installed, changing nothing
+    bin/install-deck --dry-run       say what would happen, change nothing
+    bin/install-deck --check         report only; 1 if work is left, 2 if refused
+
+A real run exits 0 when Deck is installed, 2 when it refused, and 3 when Deck
+is installed but another installed copy remains for the operator to remove: a
+Deck in /Applications, or an old `Deck.app` this could not delete. A superseded
+bundle under a dotted name that could not be deleted is not counted; the next
+run sweeps it, as it does any leftover.
+No outcome of a real run is reported as 1. When one exits 1, an uncaught error
+ended it, such as a failed `git clone` or a filesystem error during placement,
+and Python printed the traceback. `--check` keeps the convention its sibling
+installers share, where 1 means work is left.
+
+**THIS CALLS DECK'S BUILD AND REIMPLEMENTS NONE OF IT.** The invocation is
+Deck's, specified in Deck's own build contract:
+`APP="$(./Scripts/make-app.sh)"` prints one line on stdout, the absolute path
+of the assembled bundle, and everything else on stderr. What this installer owns is
+which commit gets built, checking what came back before trusting it, and where
+the bundle lands.
+
+**Read that contract rather than `Scripts/make-app.sh`.** The contract says in
+terms that the script's header comment is not the contract, and a change to
+stdout's shape goes through Deck's review cycle with this installer's
+maintainers told before it lands.
+
+## WHY ~/Applications AND NOT /Applications
+
+An employer-managed laptop under MDM grants no admin rights, and `/Applications`
+needs them. That laptop is the case this exists for, so this is not a preference
+that can be flipped later without breaking it. A terminal copy also sets no
+quarantine attribute, so Gatekeeper never runs and the unsigned bundle opens.
+Shipping unsigned is deliberate for that reason: on this path signing buys
+nothing. Adding signing is a change to that choice, so raise it before
+building it.
+
+## THE FOUR TRAPS THIS FILE IS SHAPED AROUND
+
+Each came out of Deck's own review rounds rather than its first draft, which is
+why none of them is obvious from reading the script.
+
+**The flavor is read from the ambient environment and nothing reports it.**
+`DECK_BUNDLE_FLAVOR` defaults to `shipped`, but neither stdout nor the exit
+status says which flavor was built. A shell where it is inherited as
+`developer` yields a launcher-carrying, self-updating bundle with exit 0 — the
+one thing that must never reach another machine. So it is passed explicitly,
+**and that is not enough on its own**: the four checks below are what catch it
+when it happens anyway, and they are the same four Deck's own CI makes.
+
+**`OUTPUT_DIR` IS A DESTRUCTIVE ARGUMENT.** `make-app.sh` runs `rm -rf` on
+the bundle under it before assembling, so pointing it at the install location
+silently deletes the Deck already installed there. It is therefore never the
+install directory, and a `--build-dir` that resolves inside the applications
+directory is refused rather than honoured.
+
+**A full clone is a precondition and is not sufficient.** The call executes
+whatever `make-app.sh`, `write-bundle-metadata.sh`, `Package.swift` and the
+resolved dependencies contain, running as the caller. So the commit is resolved
+and printed, a tag is reported with the commit it resolves to because a tag can
+be moved and re-pushed, and a dirty working tree is refused: the bundle would
+not be the commit this says it built.
+
+**A shallow clone builds, and builds wrong.** `write-bundle-metadata.sh`
+refuses one outright, because `git rev-list --count HEAD` returns 1 there and
+exits 0, which would give every build `CFBundleVersion 1` and stop an updater
+ever ordering two builds. This checks first so the refusal names the cause.
+
+## WHY THERE IS NO DEADLOCK HERE, UNLIKE THE ORCHESTRATOR
+
+`bin/stand-up-backend` drains a step's stdout and had to move stderr to a file,
+because draining one pipe to exhaustion while a second fills deadlocks. Here
+the shapes are reversed: stdout is one short line and stderr is the whole
+`swift build` log, minutes of it. So stderr is INHERITED rather than piped —
+the operator watches the build as it happens, there is only ever one pipe, and
+the deadlock cannot arise. Nothing here parses stderr, which the contract
+forbids.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import plistlib
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+PROG = "install-deck"
+REPO = Path(__file__).resolve().parent.parent
+BUNDLE = "Convivy Builder.app"
+# THE NAME DECK'S BUNDLE HAD BEFORE THE RENAME. Dock and Finder labels follow
+# the bundle's file name rather than CFBundleDisplayName, which is why Deck's
+# build renamed it. An upgrade leaves the old bundle beside the new one, and two
+# bundles sharing a bundle identifier leave Launch Services picking either, so a
+# real run removes it once the new one is in place, and only when it is Deck's.
+LEGACY_BUNDLE = "Deck.app"
+BUNDLE_ID = "com.convivy.deck"
+
+# THE SHARED APPLICATIONS DIRECTORY, checked for a Deck someone copied there by
+# hand, as on one operator's laptop where /Applications/Deck.app was the only
+# copy. Installing beside it would leave two bundles sharing BUNDLE_ID. It is
+# REPORTED, NOT REMOVED: every account on the Mac uses /Applications, and
+# another account may still be running that Deck. The one exception is an
+# install given `--applications /Applications`: the operator has then chosen
+# that directory as their own, the new bundle replaces the one there, and
+# `remove_legacy` treats the old Deck there as theirs. Replaced by
+# `--system-applications`, a hidden option, only so the tests can plant one.
+SYSTEM_APPLICATIONS = Path("/Applications")
+
+# THE FOUR FLAVOR CHECKS, the same ones Deck's CI shipped-bundle step makes. A
+# `developer` bundle fails all four, which is what makes this the check that
+# catches an inherited DECK_BUNDLE_FLAVOR rather than a second way of saying
+# the same thing.
+#
+# Written as (relative path, must_exist) so the report can name which one failed
+# rather than saying the bundle is wrong.
+FLAVOR_CHECKS = (
+    ("Contents/MacOS/Deck", True),
+    ("Contents/MacOS/deck-bin", False),
+    ("Contents/Resources/repo-path", False),
+    ("Contents/Resources/auto-update-opt-in", False),
+)
+
+# Mach-O and universal-binary magic, little and big endian. Read from the file
+# rather than shelled out to `file`, which is a parse of prose in a locale this
+# does not control.
+MACH_O_MAGIC = (
+    b"\xcf\xfa\xed\xfe",  # 64-bit, little endian
+    b"\xce\xfa\xed\xfe",  # 32-bit, little endian
+    b"\xfe\xed\xfa\xcf",  # 64-bit, big endian
+    b"\xfe\xed\xfa\xce",  # 32-bit, big endian
+    b"\xca\xfe\xba\xbe",  # universal
+    b"\xbe\xba\xfe\xca",  # universal, byte-swapped
+)
+
+
+class Refused(Exception):
+    """Something the operator has to decide about. Never a stack trace."""
+
+
+def git(args: list[str], cwd: Path) -> str:
+    result = subprocess.run(
+        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False
+    )
+    if result.returncode != 0:
+        raise Refused(
+            f"git {' '.join(args)} failed in {cwd}:\n"
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+    return result.stdout.strip()
+
+
+def require_macos() -> None:
+    if sys.platform != "darwin":
+        raise Refused(
+            f"Deck is a macOS application and this is {sys.platform}. "
+            f"Deck stays on macOS while the backend "
+            f"runs on both, so there is nothing to install here. The backend's "
+            f"installer is `bin/stand-up-backend`."
+        )
+
+
+def require_toolchain() -> None:
+    if shutil.which("swift") is None:
+        raise Refused(
+            "no `swift` on PATH, and the build needs a Swift toolchain. "
+            "Install Xcode or the Command Line Tools:\n"
+            "    xcode-select --install"
+        )
+
+
+def resolve_source(args) -> Path:
+    """The checkout to build from, cloned if asked and absent.
+
+    CLONING IS OPT-IN because it needs a URL this command should not assume:
+    an operator may want a fork rather than convivybuilder's own checkout.
+    """
+    source = (args.source or REPO.parent / "convivy-deck").expanduser()
+    if source.is_dir():
+        return source.resolve()
+    if args.clone_from is None:
+        raise Refused(
+            f"no checkout at {source}, and no --clone-from was given. Either "
+            f"point --source at a `convivy-deck` checkout, or name where to "
+            f"clone it from, such as convivybuilder's own checkout:\n"
+            f"    {PROG} --clone-from https://github.com/convivybuilder/convivy-deck\n"
+            f"A shallow clone will be refused, so --depth must not be used."
+        )
+    print(f"{PROG}: cloning {args.clone_from} into {source}", file=sys.stderr)
+    subprocess.run(
+        ["git", "clone", args.clone_from, str(source)], check=True
+    )
+    return source.resolve()
+
+
+def check_full_clone(source: Path) -> None:
+    if (source / ".git" / "shallow").exists() or git(
+        ["rev-parse", "--is-shallow-repository"], source
+    ) == "true":
+        raise Refused(
+            f"{source} is a SHALLOW clone, and `Scripts/write-bundle-metadata.sh` "
+            f"refuses one. `git rev-list --count HEAD` returns 1 in a shallow "
+            f"clone and exits 0, so every build would carry CFBundleVersion 1 "
+            f"and an updater could never order two of them. Deepen it:\n"
+            f"    git -C {shlex.quote(str(source))} fetch --unshallow"
+        )
+
+
+def resolve_commit(source: Path, ref: str | None) -> tuple[str, str]:
+    """The commit to build, and how it was named.
+
+    A TAG IS REPORTED WITH WHAT IT RESOLVES TO, because a tag can be moved and
+    re-pushed, so naming one is not the same as naming a commit. The contract
+    asks the caller to verify a tag's target rather than trust the name.
+    """
+    wanted = ref or "HEAD"
+    sha = git(["rev-parse", f"{wanted}^{{commit}}"], source)
+    if ref is None:
+        return sha, f"the checkout's current HEAD ({sha[:12]})"
+    if ref == sha:
+        return sha, f"commit {sha[:12]}"
+    return sha, f"{ref}, which resolves to commit {sha[:12]}"
+
+
+def check_clean(source: Path) -> None:
+    """A dirty tree means the bundle is not the commit this reports building."""
+    dirty = git(["status", "--porcelain"], source)
+    if dirty:
+        first = dirty.splitlines()[:3]
+        raise Refused(
+            f"{source} has uncommitted changes, so the bundle would not be the "
+            f"commit this says it built:\n"
+            + "\n".join(f"    {line}" for line in first)
+            + (f"\n    ... and {len(dirty.splitlines()) - 3} more"
+               if len(dirty.splitlines()) > 3 else "")
+            + f"\nCommit or stash them, or build a clean checkout elsewhere."
+        )
+
+
+def checkout(source: Path, sha: str, dry_run: bool) -> None:
+    if git(["rev-parse", "HEAD"], source) == sha:
+        return
+    if dry_run:
+        print(f"{PROG}: would check out {sha[:12]} in {source}")
+        return
+    git(["checkout", "--quiet", sha], source)
+
+
+def build(source: Path, build_dir: Path) -> Path:
+    """Call Deck's invocation and return the bundle it named.
+
+    stdout is captured because it carries the path. **stderr is inherited**, so
+    the `swift build` log reaches the operator live — a first build fetches
+    SwiftTerm over HTTPS and takes minutes, and a captured log arrives after the
+    wait it was meant to cover. With only one pipe there is no second buffer to
+    fill, so the deadlock `bin/stand-up-backend` had to solve cannot occur here.
+    """
+    env = {
+        **os.environ,
+        # EXPLICIT, THOUGH IT IS THE DEFAULT. The variable is read from the
+        # ambient environment, and neither stdout nor the exit status reports
+        # which flavor was built, so a shell carrying `developer` would produce
+        # a self-updating bundle with exit 0.
+        "DECK_BUNDLE_FLAVOR": "shipped",
+        "OUTPUT_DIR": str(build_dir),
+    }
+    result = subprocess.run(
+        ["./Scripts/make-app.sh"],
+        cwd=str(source), env=env, stdout=subprocess.PIPE, text=True, check=False,
+    )
+    if result.returncode != 0:
+        raise Refused(
+            f"Deck's build failed (exit {result.returncode}). Its log is above, "
+            f"on stderr; nothing was installed."
+        )
+    return bundle_from_stdout(result.stdout)
+
+
+def bundle_from_stdout(text: str) -> Path:
+    """The contract's promise about stdout, checked rather than assumed.
+
+    Every clause here is one the contract makes, and a caller that skipped them
+    would get a path that is wrong rather than an error — which is the failure
+    mode the contract's own change protocol is written against.
+    """
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise Refused(
+            f"Deck's build printed {len(lines)} lines on stdout and the contract "
+            f"promises exactly one, the bundle path:\n"
+            + "\n".join(f"    {line}" for line in lines[:5])
+            + "\nNothing was installed. This is a change to the build "
+              "invocation's contract; take it to Deck's maintainers."
+        )
+    app = Path(lines[0])
+    if app.is_absolute() and app.name == LEGACY_BUNDLE:
+        raise Refused(
+            f"Deck's build named `{app}`, the bundle's name before Deck renamed "
+            f"it to {BUNDLE}. This installer installs {BUNDLE}, so build a "
+            f"convivy-deck commit that includes the rename. Nothing was "
+            f"installed."
+        )
+    if not app.is_absolute() or app.name != BUNDLE:
+        raise Refused(
+            f"Deck's build named `{app}` on stdout, and the contract promises an "
+            f"absolute path ending in /{BUNDLE}. Nothing was installed."
+        )
+    if not app.is_dir():
+        raise Refused(
+            f"Deck's build named `{app}`, which is not a directory. A bundle is "
+            f"a directory. Nothing was installed."
+        )
+    return app
+
+
+def flavor_failures(app: Path) -> list[str]:
+    """Which of the four shipped-bundle checks this bundle fails.
+
+    A `developer` bundle fails all four. Returning the list rather than a
+    boolean is what lets the refusal say which, since "the bundle is wrong"
+    sends an operator to read a script.
+    """
+    failures = []
+    for relative, must_exist in FLAVOR_CHECKS:
+        present = (app / relative).exists()
+        if must_exist and not present:
+            failures.append(f"{relative} is missing, and a shipped bundle has it")
+        elif not must_exist and present:
+            failures.append(
+                f"{relative} is present, and only a `developer` bundle has it"
+            )
+    executable = app / "Contents/MacOS/Deck"
+    if executable.is_file():
+        try:
+            magic = executable.open("rb").read(4)
+        except OSError as exc:
+            failures.append(f"Contents/MacOS/Deck cannot be read ({exc})")
+        else:
+            if magic not in MACH_O_MAGIC:
+                failures.append(
+                    f"Contents/MacOS/Deck is not a Mach-O binary (magic "
+                    f"{magic.hex()}); a `developer` bundle puts a launcher "
+                    f"script there and the real executable at deck-bin"
+                )
+    return failures
+
+
+INCOMING_PREFIX = f".{BUNDLE}.incoming-"
+PREVIOUS_PREFIX = f".{BUNDLE}.previous-"
+
+
+def orphans(applications: Path) -> tuple[list[Path], list[Path]]:
+    """Staging and set-aside directories a previous run left behind.
+
+    PURE INSPECTION, so `--status` and `--check` can report them without
+    changing anything.
+    """
+    if not applications.is_dir():
+        return [], []
+    entries = sorted(applications.iterdir())
+    return (
+        [p for p in entries if p.name.startswith(INCOMING_PREFIX)],
+        [p for p in entries if p.name.startswith(PREVIOUS_PREFIX)],
+    )
+
+
+def recover(applications: Path) -> list[str]:
+    """Put right what an INTERRUPTED placement left, before building anything.
+
+    **`install()` BELOW ROLLS BACK ONLY WHAT IT CAN CATCH.** A `SIGKILL`, and a
+    `SIGTERM` or `Ctrl-C` arriving during the `copytree` of a whole app bundle —
+    which is the long part, and so the ordinary way this gets interrupted — do
+    not reach its handler at all. Nothing then swept what was left, and the two
+    leftovers are not the same kind of thing:
+
+    - **A staging directory alone is litter.** The real bundle was never
+      touched, so this is a partial copy to delete. Left alone it accumulated in
+      the applications directory for ever, one per interrupted run.
+    - **A set-aside directory with NO bundle beside it is the working Deck.**
+      The run was interrupted between moving the old one aside and moving the
+      new one in, so the operator's Deck is sitting under a dotted name and
+      `installed_version()` reported NOT INSTALLED over the top of it. That is
+      recoverable by hand and nobody would know to.
+
+    Restoring happens BEFORE the build, so an operator whose build then fails
+    still has their Deck back.
+    """
+    notes: list[str] = []
+    incoming, previous = orphans(applications)
+    target = applications / BUNDLE
+
+    def remove(stale: Path, what: str) -> None:
+        """Remove it, and REPORT WHAT HAPPENED RATHER THAN WHAT WAS ATTEMPTED.
+
+        `ignore_errors=True` is kept, because a leftover this cannot delete
+        must not stop an install — but an earlier version then said "removed"
+        unconditionally, so a removal that silently failed and one that
+        succeeded produced identical output, and the directory it claimed to
+        have deleted was still there on the next run saying the same thing.
+        """
+        shutil.rmtree(stale, ignore_errors=True)
+        if stale.exists():
+            notes.append(
+                f"could NOT remove {what} ({stale.name}); it is still there and "
+                f"this will say so again next run. Remove it by hand if it "
+                f"should not be there."
+            )
+        else:
+            notes.append(f"removed {what}: {stale.name}")
+
+    for stale in incoming:
+        remove(stale, "a partial copy left by an interrupted run")
+    if not target.exists() and previous:
+        # The newest is the one that was moved aside last. Unix timestamps are
+        # ten digits until 2286, so a lexical sort and a numeric one agree.
+        rescue = previous[-1]
+        os.rename(rescue, target)
+        notes.append(
+            f"RESTORED the Deck an interrupted run had moved aside "
+            f"({rescue.name}); it was installed all along and reported missing"
+        )
+        previous = previous[:-1]
+    for stale in previous:
+        remove(stale, "a superseded bundle")
+    return notes
+
+
+def would_recover(applications: Path) -> list[str]:
+    """What `recover()` would do, for a mode that must not do it.
+
+    `--dry-run` PROMISES TO CHANGE NOTHING and this file's own docstring says
+    so, but `recover()` was called before the dry-run branch returned — so a
+    dry run on an interrupted machine renamed the set-aside bundle back and
+    deleted directories. Saying it is the whole job here.
+    """
+    incoming, previous = orphans(applications)
+    lines = []
+    if not (applications / BUNDLE).exists() and previous:
+        lines.append(f"would RESTORE the Deck under {previous[-1].name}")
+        previous = previous[:-1]
+    for stale in [*incoming, *previous]:
+        lines.append(f"would remove {stale.name}")
+    return lines
+
+
+def install(app: Path, applications: Path) -> str:
+    """Place the bundle, keeping the previous one until the new one is in.
+
+    NOT `rm -rf` THEN COPY. That leaves a window with no Deck at all, and if the
+    copy then fails the operator has lost the version that worked. The new
+    bundle is staged beside the target, the old one is moved aside, and the
+    stage is renamed in; the old one is removed only once the new one is there.
+
+    **THE HANDLER CATCHES `BaseException`, NOT `OSError`.** `Ctrl-C` raises
+    `KeyboardInterrupt` and a `SIGTERM` handler raises `SystemExit`, neither of
+    which is an `OSError` — so an earlier version rolled back a filesystem error
+    and not the interruption an operator is far likelier to cause. What no
+    handler can catch is `SIGKILL` or a power loss, which is what `recover()`
+    above is for.
+    """
+    applications.mkdir(parents=True, exist_ok=True)
+    target = applications / BUNDLE
+    stage = applications / f"{INCOMING_PREFIX}{os.getpid()}"
+    aside = applications / f"{PREVIOUS_PREFIX}{int(time.time())}"
+    if stage.exists():
+        shutil.rmtree(stage)
+    try:
+        shutil.copytree(app, stage, symlinks=True)
+    except BaseException:
+        # The target has not been touched yet, so there is nothing to roll
+        # back; this only stops the partial copy becoming litter.
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+    replaced = target.exists()
+    try:
+        if replaced:
+            os.rename(target, aside)
+        os.rename(stage, target)
+    except BaseException:
+        if replaced and aside.exists() and not target.exists():
+            os.rename(aside, target)
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+    if replaced:
+        shutil.rmtree(aside, ignore_errors=True)
+    return "replaced" if replaced else "installed"
+
+
+def bundle_identifier(bundle: Path) -> str | None:
+    """The bundle's CFBundleIdentifier, or None when it cannot be read.
+
+    **A REGULAR FILE ONLY, AND ANY PARSE FAILURE IS "UNREADABLE".** A truncated
+    Info.plist raises `xml.parsers.expat.ExpatError`, which is neither an
+    `OSError` nor a `ValueError`, and stopped every mode with a traceback; a
+    FIFO in its place made `--status` block for ever on the read. Both were
+    reproduced in review. Unreadable means "not Deck", so the bundle is left
+    alone.
+    """
+    plist = bundle / "Contents" / "Info.plist"
+    if not plist.is_file():
+        return None
+    try:
+        data = plistlib.loads(plist.read_bytes())
+    except Exception:  # noqa: BLE001 - any malformed plist is "unreadable"
+        return None
+    value = data.get("CFBundleIdentifier") if isinstance(data, dict) else None
+    return value if isinstance(value, str) else None
+
+
+def legacy_state(applications: Path) -> tuple[Path, bool] | None:
+    """The pre-rename bundle beside this one, and whether it is Deck's.
+
+    PURE INSPECTION, so `--status`, `--check` and `--dry-run` can say what a
+    real run would do with it.
+    """
+    legacy = applications / LEGACY_BUNDLE
+    if not legacy.is_dir():
+        return None
+    return legacy, bundle_identifier(legacy) == BUNDLE_ID
+
+
+def remove_legacy(applications: Path) -> str | None:
+    """Remove the pre-rename Deck, once the renamed one is in place.
+
+    **ONLY WHEN ITS BUNDLE IDENTIFIER IS DECK'S.** A `Deck.app` carrying any
+    other identifier, or none that can be read, is some other application that
+    happens to share the name, and it is left alone and named. Removing Deck's
+    old copy is what stops two bundles sharing `com.convivy.deck`, which leaves
+    Launch Services picking either.
+    """
+    state = legacy_state(applications)
+    if state is None:
+        return None
+    legacy, is_deck = state
+    if not is_deck:
+        found = bundle_identifier(legacy)
+        return (
+            f"left {legacy} alone: its bundle identifier is "
+            f"{found or 'unreadable'}, not {BUNDLE_ID}, so it is not Deck"
+        )
+    shutil.rmtree(legacy, ignore_errors=True)
+    if legacy.exists():
+        return (
+            f"could NOT remove the old Deck at {legacy}; remove it by hand, "
+            f"since two copies of Deck leave macOS opening either"
+        )
+    return (
+        f"removed the old Deck at {legacy}, which the rename to {BUNDLE} "
+        f"replaces. A Dock tile that pointed at it needs adding again from "
+        f"{applications / BUNDLE}"
+    )
+
+
+def shared_deck(applications: Path) -> Path | None:
+    """A Deck in the shared applications directory, beside this install.
+
+    None when the install directory IS the shared one, since `remove_legacy`
+    then handles it as the operator's own.
+    """
+    if SYSTEM_APPLICATIONS.resolve() == applications:
+        return None
+    # BOTH NAMES. A copy already called BUNDLE is there when an earlier run was
+    # given `--applications /Applications`, which this installer accepts.
+    for name in (LEGACY_BUNDLE, BUNDLE):
+        shared = SYSTEM_APPLICATIONS / name
+        if shared.is_dir() and bundle_identifier(shared) == BUNDLE_ID:
+            return shared
+    return None
+
+
+def shared_deck_lines(shared: Path) -> list[str]:
+    return [
+        f"ANOTHER COPY OF DECK is at {shared}, with the same bundle identifier "
+        f"as {BUNDLE}, so macOS may open either. It is in the shared "
+        f"applications directory, which every account on this Mac uses, so "
+        f"this installer does not remove it. Once no account needs it, remove "
+        f"it (prefix sudo if it is refused):",
+        f"    rm -rf {shlex.quote(str(shared))}",
+    ]
+
+
+def would_remove_legacy(applications: Path) -> str | None:
+    state = legacy_state(applications)
+    if state is None:
+        return None
+    legacy, is_deck = state
+    if is_deck:
+        return f"would remove the old Deck at {legacy} once {BUNDLE} is in place"
+    return (f"would leave {legacy} alone: its bundle identifier is not "
+            f"{BUNDLE_ID}, or cannot be read")
+
+
+def installed_version(applications: Path) -> str | None:
+    target = applications / BUNDLE
+    if not target.is_dir():
+        return None
+    plist = target / "Contents" / "Info.plist"
+    if not plist.is_file():
+        return "installed, with no Info.plist"
+    try:
+        data = plistlib.loads(plist.read_bytes())
+    except Exception as exc:  # noqa: BLE001 - ExpatError is neither OSError nor ValueError
+        return f"installed, and its Info.plist cannot be read ({exc})"
+    if not isinstance(data, dict):
+        return "installed, and its Info.plist has no dictionary at its root"
+    short = data.get("CFBundleShortVersionString", "?")
+    build_number = data.get("CFBundleVersion", "?")
+    return f"{short} (build {build_number})"
+
+
+def outstanding(applications: Path) -> list[str]:
+    """What this cannot do, named with the exact command or file."""
+    return [
+        (
+            "THE BUNDLE IS UNSIGNED. A terminal install sets no quarantine "
+            "attribute, so Gatekeeper never runs: this copies the bundle with "
+            "the filesystem and downloads nothing, so nothing is quarantined."
+        ),
+        "",
+        (
+            "IF YOU MOVE THE BUNDLE BY DOWNLOADING IT instead, from a browser, "
+            "AirDrop, or an email attachment, macOS WILL quarantine it and "
+            "Gatekeeper will refuse the first launch, saying Apple could not "
+            "verify Deck is free of malware. Get past that ONLY for a Deck you "
+            "built yourself with this installer; any other download named Deck "
+            "may not be Deck. For that copy, try to open it once, then go to "
+            "System Settings > Privacy & Security, click Open Anyway beside the "
+            "message about Deck, and confirm. Since macOS 15, Control-click > "
+            "Open no longer gets past it. Or, again ONLY for a Deck you built "
+            "yourself with this installer, remove the attribute; this is the "
+            "command for a copy at the path this "
+            "installer uses, so give the copy's own path if it sits elsewhere:"
+        ),
+        f"    xattr -dr com.apple.quarantine "
+        f"{shlex.quote(str(applications / BUNDLE))}",
+        "",
+        (
+            "To avoid the refusal altogether, build Deck on each Mac with this "
+            "installer, or copy a Deck you built yourself with this installer "
+            "between your own machines with scp: a copy made that way is not "
+            "quarantined. Do not use scp, a shared drive or a USB "
+            "stick to take in a Deck bundle someone else built; that skips "
+            "Gatekeeper for a bundle you cannot vouch for."
+        ),
+        "",
+        (
+            "DECK NEEDS A BACKEND TO POINT AT, over a tailnet. It does not "
+            "install one and does not configure the connection; add the host in "
+            "Deck's own settings once the backend is up:"
+        ),
+        "    bin/stand-up-backend --shape single|two    # on the machine serving the backend",
+        "",
+    ]
+
+
+def report_orphans(applications: Path) -> None:
+    """What an interrupted run left, in a reporting mode that changes nothing.
+
+    SAID RATHER THAN SILENTLY FIXED HERE, because `--status` and `--check`
+    promise to change nothing. The set-aside case is called out separately: a
+    bundle under a dotted name with no bundle beside it is a Deck that is
+    installed and reporting as missing, which an operator would otherwise have
+    no way to know.
+    """
+    incoming, previous = orphans(applications)
+    target_missing = not (applications / BUNDLE).exists()
+    if previous and target_missing:
+        print(f"  {'INTERRUPTED':<14} a previous run was interrupted mid-swap; "
+              f"your Deck is under {previous[-1].name}")
+        print(f"  {'':<14} a real run restores it before building anything")
+    elif previous:
+        print(f"  {'leftover':<14} {len(previous)} superseded bundle(s) a real "
+              f"run will remove")
+    if incoming:
+        print(f"  {'leftover':<14} {len(incoming)} partial copy(ies) from an "
+              f"interrupted run, which a real run will remove")
+    shared = shared_deck(applications)
+    if shared is not None:
+        print(f"  {'shared copy':<14} Deck is also at {shared}; a real run "
+              f"leaves it and says how to remove it")
+    state = legacy_state(applications)
+    if state is not None:
+        legacy, is_deck = state
+        if is_deck:
+            print(f"  {'old name':<14} the pre-rename Deck is at {legacy}; a "
+                  f"real run removes it once {BUNDLE} is in place")
+        else:
+            print(f"  {'not Deck':<14} {legacy} has another bundle identifier, or "
+                  f"none that can be read, "
+                  f"and is left alone")
+
+
+def report(applications: Path, source: Path, named: str, mode: str | None) -> None:
+    print(f"{PROG}: {applications}")
+    current = installed_version(applications)
+    print(f"  {'installed' if current else 'NOT INSTALLED':<14} "
+          f"{current or f'no {BUNDLE} in this directory'}")
+    report_orphans(applications)
+    print(f"  {'building':<14} {named}")
+    print(f"  {'from':<14} {source}")
+    print()
+
+
+def main(argv: list[str]) -> int:
+    global SYSTEM_APPLICATIONS
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Build Deck from a verified commit and install it in "
+                    "~/Applications.",
+    )
+    parser.add_argument("--source", type=Path, default=None,
+                        help="a convivy-deck checkout (default: beside this "
+                             "repository)")
+    parser.add_argument("--clone-from", default=None,
+                        help="clone the checkout from this URL if --source is "
+                             "absent; never shallow")
+    parser.add_argument("--ref", default=None,
+                        help="the commit or tag to build (default: the "
+                             "checkout's HEAD). A tag is reported with the "
+                             "commit it resolves to")
+    parser.add_argument("--applications", type=Path, default=None,
+                        help="where the bundle is installed (default: "
+                             "~/Applications)")
+    parser.add_argument("--system-applications", type=Path,
+                        default=SYSTEM_APPLICATIONS, help=argparse.SUPPRESS)
+    parser.add_argument("--build-dir", type=Path, default=None,
+                        help="where the bundle is assembled (default: a "
+                             "temporary directory). NEVER the install "
+                             "directory: the build removes the bundle under it")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--status", action="store_true",
+                      help="what is installed, changing nothing")
+    mode.add_argument("--dry-run", action="store_true",
+                      help="say what would happen, change nothing")
+    mode.add_argument("--check", action="store_true",
+                      help="report only; 1 if work is left, 2 if refused")
+    args = parser.parse_args(argv)
+    SYSTEM_APPLICATIONS = args.system_applications.expanduser()
+
+    chosen = "status" if args.status else "dry-run" if args.dry_run else \
+             "check" if args.check else None
+    # RESOLVED, NOT MERELY EXPANDED. The build-directory refusal below compares
+    # paths, and on macOS a temporary directory reaches this as `/var/...` while
+    # a resolved path reads `/private/var/...` — so an unresolved comparison
+    # never matched and the refusal that protects the installed Deck did not
+    # fire. `resolve()` is non-strict, so a directory that does not exist yet is
+    # fine.
+    applications = (
+        args.applications or Path.home() / "Applications"
+    ).expanduser().resolve()
+
+    try:
+        require_macos()
+
+        if chosen == "status":
+            current = installed_version(applications)
+            print(f"{PROG}: {applications}")
+            print(f"  {'installed' if current else 'NOT INSTALLED':<14} "
+                  f"{current or f'no {BUNDLE} in this directory'}")
+            report_orphans(applications)
+            return 0
+
+        source = resolve_source(args)
+        if not (source / ".git").exists():
+            raise Refused(
+                f"{source} is not a git checkout, and the commit being built is "
+                f"the only thing that makes this install reproducible."
+            )
+        check_full_clone(source)
+        sha, named = resolve_commit(source, args.ref)
+        report(applications, source, named, chosen)
+
+        if chosen == "check":
+            # A CHECK ANSWERS "IS THE INSTALLED BUNDLE THIS COMMIT?", which is
+            # the question --status cannot: --status reports a version string,
+            # and a version string does not say which commit it came from.
+            current = installed_version(applications)
+            for line in outstanding(applications):
+                print(line)
+            if current is None:
+                print(f"{PROG}: Deck is not installed in {applications}")
+                return 1
+            print(f"{PROG}: Deck {current} is installed; this does not build, so "
+                  f"whether it is {sha[:12]} is not established here")
+            return 1
+
+        require_toolchain()
+        check_clean(source)
+
+        # ONLY ON A REAL RUN, and BEFORE the build so an operator whose build
+        # then fails still has the Deck an earlier interrupted run left under a
+        # dotted name. Called above the dry-run branch it made `--dry-run`
+        # rename and delete, which is the one thing that mode promises not to
+        # do.
+        recovery_notes: list[str] = []
+        if chosen is None:
+            recovery_notes = recover(applications)
+            for note in recovery_notes:
+                print(f"{PROG}: {note}")
+
+        build_dir = args.build_dir
+        if build_dir is not None:
+            build_dir = build_dir.expanduser().resolve()
+            # REFUSED RATHER THAN HONOURED. `make-app.sh` runs `rm -rf` on
+            # the bundle under OUTPUT_DIR before assembling, so a build directory
+            # inside the applications directory would delete the installed Deck
+            # before building its replacement — and would do it before any of
+            # the checks below could refuse the result.
+            if build_dir == applications or applications in build_dir.parents:
+                raise Refused(
+                    f"--build-dir {build_dir} is inside the install directory "
+                    f"{applications}. Deck's build removes {BUNDLE} under the "
+                    f"build directory before assembling, so this would delete "
+                    f"the installed Deck before building its replacement. "
+                    f"Nothing was built."
+                )
+
+        checkout(source, sha, dry_run=chosen == "dry-run")
+
+        if chosen == "dry-run":
+            for line in would_recover(applications):
+                print(f"{PROG}: {line}")
+            legacy_line = would_remove_legacy(applications)
+            if legacy_line:
+                print(f"{PROG}: {legacy_line}")
+            shared = shared_deck(applications)
+            if shared is not None:
+                print(f"{PROG}: would leave the Deck at {shared}, which is in "
+                      f"the shared applications directory; a real run would exit 3")
+            print(f"{PROG}: would build {BUNDLE} at {sha[:12]} with "
+                  f"DECK_BUNDLE_FLAVOR=shipped, check it, and install it into "
+                  f"{applications}")
+            print()
+            for line in outstanding(applications):
+                print(line)
+            return 0
+
+        with tempfile.TemporaryDirectory() as scratch:
+            app = build(source, build_dir or Path(scratch))
+            failures = flavor_failures(app)
+            if failures:
+                raise Refused(
+                    "the bundle Deck built is not a SHIPPED bundle, and a "
+                    "`developer` bundle carries a launcher and an auto-updater "
+                    "and must never be handed to another machine:\n"
+                    + "\n".join(f"    {line}" for line in failures)
+                    + "\nNothing was installed. `DECK_BUNDLE_FLAVOR` is read "
+                      "from the environment; this passes `shipped` explicitly, "
+                      "so a failure here means the build no longer honours it."
+                )
+            what = install(app, applications)
+
+        print(f"{PROG}: {what} {applications / BUNDLE} at {sha[:12]}")
+        # AFTER THE PLACEMENT, NEVER BEFORE. Until the renamed bundle is in, the
+        # old one is the operator's only working Deck.
+        legacy_note = remove_legacy(applications)
+        if legacy_note:
+            print(f"{PROG}: {legacy_note}")
+        # REPEATED AFTER THE BUILD, not only before it. A real run prints
+        # minutes of `swift build` stderr between the two, so a warning that
+        # something could not be cleaned up scrolls away from an operator who
+        # sees only the end. Only the failures are repeated; what was removed
+        # successfully needs saying once.
+        # ONLY THE RECOVERY NOTES, which printed before minutes of build log.
+        # The legacy note printed just above, so repeating it would print the
+        # same line twice in a row.
+        stuck = [note for note in recovery_notes if note.startswith("could NOT")]
+        for note in stuck:
+            print(f"{PROG}: {note}")
+        print()
+        for line in outstanding(applications):
+            print(line)
+        # LAST, AND EXIT 3. Deck is installed, but two bundles now share its
+        # identifier until someone removes the shared copy, so the run is not
+        # finished and its exit status says so. Not 1, which is also what
+        # Python exits with on an uncaught error.
+        shared = shared_deck(applications)
+        if shared is not None:
+            for line in shared_deck_lines(shared):
+                print(line)
+            return 3
+        # THE OLD COPY COULD NOT BE DELETED, so two bundles share Deck's
+        # identifier just as with a shared copy, and the status says so.
+        if legacy_note and legacy_note.startswith("could NOT"):
+            return 3
+        return 0
+
+    except Refused as exc:
+        print(f"{PROG}: refusing — {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

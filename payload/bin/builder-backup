@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+"""Write a verified copy of what this machine's Builder cannot rebuild.
+
+    builder-backup                     take a backup now
+    builder-backup --status            when the last backup succeeded; 1 if too long ago
+    builder-backup --session-hook      the same check, said only when it is STALE
+
+**WHAT IT COPIES.** Five things, into one backup directory on this machine,
+which the machine's own backups (a VM snapshot, a disk image) carry off it:
+
+- the Library's database, which holds the work queue, the Courses, the
+  signals and the Library's records of every document;
+- the Library's cold store, `cold.db`, where the cold-tier job moves signals
+  past their hot window;
+- Orient's database, `control.db`;
+- the Library's blobs, the files those records point at;
+- the knowledge repository, as a git bundle of every ref.
+
+**ALL THREE DATABASES MUST BE THERE.** The install creates `cold.db` with
+`init_cold.py` (jobs/library.toml), and the Library refuses to start without it,
+so a missing one is a failed run, as a missing `library.db` is. Only
+`control.db` is read from Orient's directory, which also holds every credential
+the install minted.
+
+**ORIENT'S WEB-PUSH SUBSCRIPTIONS ARE DROPPED FROM ITS COPY.** A restored
+install makes a new `vapid.json`, the key every subscription is bound to, so a
+restored subscription could never receive a push, and its endpoint and `auth`
+value (which RFC 8291 calls an authentication secret) would be kept for
+nothing. Orient's copy is built and verified in memory, the rows are deleted
+there, and only the result is written to disk with `VACUUM INTO`, so the rows
+never reach the backup directory, whatever the filesystem does with old blocks.
+
+**ONE RUN AT A TIME.** A run holds an exclusive lock on `.lock` in the backup
+directory for as long as it runs, so a second run waits for the first. Holding
+it, a run knows any `.staging-*` it finds was left by a run that was killed,
+and removes it: a SIGKILL or a power cut skips the failure handler.
+
+The search index is left out because the Library rebuilds it from the knowledge
+repository. The Library's credential files and TLS files are never read: a
+backup is a copy of a secret wherever it goes, and a restored install mints its
+own credentials.
+
+**EACH DATABASE IS COPIED WITH SQLITE'S ONLINE BACKUP, NEVER `cp`.** The Library
+and Orient run in WAL mode, where committed data sits in `library.db-wal` until a
+checkpoint, so a file copy of `library.db` can miss committed rows or catch a
+page half written. The backup runs inside one read transaction on the live
+database, which under WAL blocks no writer, and the row counts it checks the
+copy against are taken inside the same transaction, so they describe exactly
+the snapshot that was copied.
+
+**NOTHING COUNTS AS A BACKUP UNTIL IT IS VERIFIED.** A run writes into a
+staging directory and checks it there: `PRAGMA integrity_check` on each copied
+database, each ordinary table's row count against its live snapshot, and
+`git bundle verify` on the bundle. Only then does it become `latest/`, the run
+before it becomes `previous/`, and `last-success` records the time. A run that
+fails leaves `latest/` as it was and writes `last-failure` saying why.
+
+**BLOBS ARE ADDED AND NEVER DELETED.** They are copied after the database, so
+every blob a copied row names is already on disk when the copy is taken, into
+one `blobs/` directory shared by every run. A blob the Library later deletes
+stays in the backup, which is what a backup of blobs is for.
+
+**A BACKUP NOBODY HEARS ABOUT FAILING IS NOT A BACKUP.** `--status` exits 1
+when the last success is older than `--max-age-hours` or there has been none.
+`--session-hook` is what a Claude Code session runs as it starts, placed by
+`bin/link-commands`, because a session is where the operator is. It says
+nothing while the backup is fresh, so it costs no session any attention until
+there is something to hear, and when the backup is STALE it tells both the
+operator, on screen, and the session, which can then say what to do about it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+PROG = "builder-backup"
+
+DEFAULT_LIBRARY_STATE = Path.home() / ".local" / "state" / "library"
+DEFAULT_DEST = Path.home() / ".local" / "state" / "builder-backup"
+# Orient's own default (`ORIENT_CONTROL_DB` in convivy-orient's control_db.py),
+# which jobs/orient.toml does not override.
+DEFAULT_ORIENT_DB = Path.home() / ".orient-control" / "control.db"
+# The schedule runs every six hours, so a day without a success is four missed
+# runs rather than one late one.
+DEFAULT_MAX_AGE_HOURS = 24
+
+DB_NAME = "library.db"
+# Tables whose rows are removed from Orient's copy; see the docstring.
+ORIENT_DROPPED = ("push_subscriptions",)
+COLD_NAME = "cold.db"
+ORIENT_NAME = "orient-control.db"
+BUNDLE_NAME = "knowledge.bundle"
+MANIFEST_NAME = "manifest.json"
+
+
+class Failed(Exception):
+    """A run that did not produce a verified backup, with the reason in words."""
+
+
+def now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def stamp(when: datetime) -> str:
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def private_file(path: Path, text: str) -> None:
+    """Write `text` to `path` at 0600, replacing it only once the write is whole."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def default_knowledge() -> Path:
+    """The knowledge repository under the Builder root that `builder-root` prints."""
+    try:
+        out = subprocess.run(["builder-root"], capture_output=True, text=True, check=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise Failed(f"cannot find the Builder root: `builder-root` did not answer ({exc}); "
+                     f"pass --knowledge") from exc
+    root = out.stdout.strip()
+    if not root:
+        raise Failed("`builder-root` printed nothing; pass --knowledge")
+    return Path(root) / "knowledge"
+
+
+def ordinary_tables(conn: sqlite3.Connection) -> list[str]:
+    """Every table whose rows this interpreter can count.
+
+    A virtual table (the Library's vector index) needs its extension loaded to
+    be read. Its rows live in ordinary shadow tables, which are counted here
+    like any other, so leaving the virtual table itself out loses no data from
+    the check."""
+    return [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' "
+        "AND sql NOT LIKE 'CREATE VIRTUAL TABLE%' ORDER BY name")]
+
+
+def quoted(name: str) -> str:
+    """An SQL identifier, quoted so any name SQLite accepts reads as itself."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def count_rows(conn: sqlite3.Connection, tables: list[str]) -> dict[str, int]:
+    return {t: conn.execute(f"SELECT count(*) FROM {quoted(t)}").fetchone()[0] for t in tables}
+
+
+def copy_database(src: Path, dst: Path, what: str = "Library database",
+                  drop: tuple[str, ...] = ()) -> dict:
+    """Copy the live database into `dst` and verify the copy against the snapshot.
+
+    A copy with tables to `drop` is built and checked in memory, the rows are
+    deleted there, and only then is it written to `dst` with `VACUUM INTO`, so
+    those rows never reach the disk under the backup directory."""
+    if not src.is_file():
+        raise Failed(f"no {what} at {src}")
+    copy = sqlite3.connect(":memory:" if drop else dst, isolation_level=None)
+    try:
+        live = sqlite3.connect(f"file:{src}?mode=ro", uri=True, isolation_level=None, timeout=30)
+        try:
+            live.execute("BEGIN")
+            tables = ordinary_tables(live)
+            expected = count_rows(live, tables)
+            live.backup(copy)
+            live.execute("COMMIT")
+        finally:
+            live.close()
+
+        if not drop:
+            # One self-contained file: the copy inherits WAL, which would leave
+            # it needing a -wal beside it the moment anything opened it for writing.
+            copy.execute("PRAGMA journal_mode = DELETE")
+        integrity = [r[0] for r in copy.execute("PRAGMA integrity_check")]
+        if integrity != ["ok"]:
+            raise Failed(f"the copied {what} fails integrity_check: {integrity[:3]}")
+        got = count_rows(copy, tables)
+        wrong = {t: (expected[t], got[t]) for t in tables if expected[t] != got[t]}
+        if wrong:
+            raise Failed(f"the {what} copy's row counts differ from the live snapshot: {wrong}")
+        missing = [t for t in drop if t not in tables]
+        if missing:
+            # Orient's migrations create the table, so its absence means this is
+            # not the database the drop was written for.
+            raise Failed(f"the {what} has no {missing} table to drop rows from")
+        dropped = {t: expected[t] for t in drop}
+        if drop:
+            for t in drop:
+                copy.execute(f"DELETE FROM {quoted(t)}")
+            left = {t: copy.execute(f"SELECT count(*) FROM {quoted(t)}").fetchone()[0]
+                    for t in drop}
+            if any(left.values()):
+                raise Failed(f"the {what} copy still holds rows it should have dropped: {left}")
+            copy.execute("VACUUM INTO ?", (str(dst),))
+    finally:
+        copy.close()
+
+    if drop:
+        written = sqlite3.connect(dst, isolation_level=None)
+        try:
+            integrity = [r[0] for r in written.execute("PRAGMA integrity_check")]
+            got = count_rows(written, tables)
+        finally:
+            written.close()
+        if integrity != ["ok"]:
+            raise Failed(f"the written {what} copy fails integrity_check: {integrity[:3]}")
+        want = {t: (0 if t in dropped else expected[t]) for t in tables}
+        if got != want:
+            raise Failed(f"the written {what} copy's row counts are wrong: {got} != {want}")
+    os.chmod(dst, 0o600)
+    # `rows` is what the copy holds; the dropped rows were counted and verified
+    # in it first, and are reported beside it.
+    return {"source": str(src), "tables": len(tables),
+            "rows": sum(expected.values()) - sum(dropped.values()),
+            "integrity_check": "ok", "dropped": dropped}
+
+
+def copy_blobs(src: Path, dst: Path) -> dict:
+    """Add every blob missing from `dst`, or whose size differs; delete nothing."""
+    if not src.is_dir():
+        return {"source": "absent", "copied": 0, "held": 0}
+    dst.mkdir(mode=0o700, exist_ok=True)
+    copied = 0
+    for path in sorted(src.rglob("*")):
+        if not path.is_file() or path.is_symlink():
+            continue
+        target = dst / path.relative_to(src)
+        if target.is_file() and target.stat().st_size == path.stat().st_size:
+            continue
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp = target.with_name(f".{target.name}.{os.getpid()}")
+        shutil.copyfile(path, tmp)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+        copied += 1
+    held = sum(1 for p in dst.rglob("*") if p.is_file())
+    return {"source": str(src), "copied": copied, "held": held}
+
+
+def bundle_knowledge(repo: Path, dst: Path) -> dict:
+    """A bundle of every ref in the knowledge repository, verified."""
+    if not (repo / ".git").exists():
+        raise Failed(f"no knowledge repository at {repo}")
+    git = ["git", "-C", str(repo)]
+    made = subprocess.run([*git, "bundle", "create", str(dst), "--all"],
+                          capture_output=True, text=True)
+    if made.returncode != 0:
+        raise Failed(f"git bundle create failed: {made.stderr.strip()}")
+    checked = subprocess.run([*git, "bundle", "verify", str(dst)],
+                             capture_output=True, text=True)
+    if checked.returncode != 0:
+        raise Failed(f"git bundle verify failed: {checked.stderr.strip()}")
+    os.chmod(dst, 0o600)
+    head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True)
+    return {"source": str(repo), "head": head.stdout.strip(), "verified": True}
+
+
+def clear_staging(dest: Path) -> None:
+    """Remove every `.staging-*`, which only a killed run can have left; the caller holds the lock.
+
+    `rmtree` refuses a symlink, so an entry that is one is left where it is."""
+    for old in dest.glob(".staging-*"):
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def lock_and_clear(dest: Path) -> int:
+    """Take the run lock, then remove a killed run's staging; returns the lock's fd.
+
+    Done before anything else a run does, so a later step that fails (finding
+    the knowledge repository, say) cannot leave that staging in place."""
+    dest.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(dest, 0o700)
+    lock = os.open(dest / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        clear_staging(dest)
+    except BaseException:
+        os.close(lock)
+        raise
+    return lock
+
+
+def take(library_state: Path, knowledge: Path, dest: Path, orient_db: Path) -> dict:
+    """One backup; the caller holds the lock `lock_and_clear` took."""
+    started = now()
+    staging = dest / f".staging-{os.getpid()}"
+    staging.mkdir(mode=0o700)
+    try:
+        manifest = {
+            "started": stamp(started),
+            "database": copy_database(library_state / DB_NAME, staging / DB_NAME),
+            "cold_store": copy_database(library_state / COLD_NAME, staging / COLD_NAME,
+                                        "Library cold store"),
+            "orient": copy_database(orient_db, staging / ORIENT_NAME, "Orient database",
+                                    drop=ORIENT_DROPPED),
+            # After the database, so each blob a copied row names already exists.
+            "blobs": copy_blobs(library_state / "blobs", dest / "blobs"),
+            "knowledge": bundle_knowledge(knowledge, staging / BUNDLE_NAME),
+        }
+        manifest["finished"] = stamp(now())
+        private_file(staging / MANIFEST_NAME, json.dumps(manifest, indent=2) + "\n")
+
+        latest, previous = dest / "latest", dest / "previous"
+        if latest.exists():
+            if previous.exists():
+                shutil.rmtree(previous)
+            os.replace(latest, previous)
+        os.replace(staging, latest)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    private_file(dest / "last-success", manifest["finished"] + "\n")
+    return manifest
+
+
+def last_success(dest: Path) -> datetime | None:
+    try:
+        raw = (dest / "last-success").read_text().strip()
+        return datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (OSError, ValueError):
+        return None
+
+
+def check(dest: Path, max_age_hours: int) -> tuple[int, list[str]]:
+    """The exit code `--status` returns, and the lines it prints."""
+    when = last_success(dest)
+    failure = dest / "last-failure"
+    if when is None:
+        lines = [f"{PROG}: STALE — no successful backup in {dest}"]
+        code = 1
+    else:
+        age = now() - when
+        hours = age.total_seconds() / 3600
+        if age > timedelta(hours=max_age_hours):
+            lines = [(f"{PROG}: STALE — the last successful backup was {stamp(when)}, "
+                      f"{hours:.1f} hours ago, more than {max_age_hours}")]
+            code = 1
+        else:
+            lines = [(f"{PROG}: ok — the last successful backup was {stamp(when)}, "
+                      f"{hours:.1f} hours ago, in {dest / 'latest'}")]
+            code = 0
+    # A failure is news only if nothing has succeeded since. After a success,
+    # repeating an older failure reads as a live problem that is not one.
+    if failure.is_file() and (when is None or failure.stat().st_mtime > when.timestamp()):
+        lines.append(f"{PROG}: the last failed run said: {failure.read_text().strip()}")
+    return code, lines
+
+
+def status(dest: Path, max_age_hours: int) -> int:
+    code, lines = check(dest, max_age_hours)
+    for line in lines:
+        print(line)
+    return code
+
+
+def session_hook(dest: Path, max_age_hours: int) -> int:
+    """Claude Code's SessionStart output: nothing when fresh, both fields when STALE.
+
+    **ALWAYS EXIT 0.** Claude Code shows a failing SessionStart hook as a
+    `hook error`, which would read as the hook being broken when the backup is
+    what is late. The staleness travels in the JSON instead: `systemMessage` is
+    shown to the operator, and `additionalContext` reaches the session.
+    """
+    code, lines = check(dest, max_age_hours)
+    if code == 0:
+        return 0
+    said = "\n".join(lines)
+    print(json.dumps({
+        "systemMessage": said,
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": (
+                f"{said}\n"
+                f"Tell the operator this before anything else. A backup runs "
+                f"every six hours on its own; `{PROG}` takes one now, and its "
+                f"log is `builder-backup.log` beside the backup directory."
+            ),
+        },
+    }))
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog=PROG, description=__doc__.splitlines()[0])
+    parser.add_argument("--library-state", type=Path, default=DEFAULT_LIBRARY_STATE,
+                        help=f"the Library's state directory (default {DEFAULT_LIBRARY_STATE})")
+    parser.add_argument("--knowledge", type=Path, default=None,
+                        help="the knowledge repository (default: `builder-root`/knowledge)")
+    parser.add_argument("--orient-db", type=Path, default=DEFAULT_ORIENT_DB,
+                        help=f"Orient's database (default {DEFAULT_ORIENT_DB})")
+    parser.add_argument("--dest", type=Path, default=DEFAULT_DEST,
+                        help=f"where backups are written (default {DEFAULT_DEST})")
+    parser.add_argument("--status", action="store_true",
+                        help="report the last success; exit 1 if it is too old or absent")
+    parser.add_argument("--session-hook", action="store_true",
+                        help="the --status check as a Claude Code SessionStart hook: "
+                             "silent when fresh, JSON when STALE, always exit 0")
+    parser.add_argument("--max-age-hours", type=int, default=DEFAULT_MAX_AGE_HOURS,
+                        help=f"how old the last success may be under --status "
+                             f"(default {DEFAULT_MAX_AGE_HOURS})")
+    args = parser.parse_args(argv)
+
+    if args.status:
+        return status(args.dest, args.max_age_hours)
+    if args.session_hook:
+        return session_hook(args.dest, args.max_age_hours)
+
+    os.umask(0o077)
+    lock = None
+    try:
+        lock = lock_and_clear(args.dest)
+        knowledge = args.knowledge or default_knowledge()
+        manifest = take(args.library_state, knowledge, args.dest, args.orient_db)
+    # A database or disk error is a failed run like any check that fails, and it
+    # is recorded the same way: a traceback left no last-failure behind, so
+    # --status could not say why the backup had stopped.
+    except (Failed, sqlite3.Error, OSError) as exc:
+        reason = str(exc) if isinstance(exc, Failed) else f"{type(exc).__name__}: {exc}"
+        print(f"{PROG}: FAILED — {reason}", file=sys.stderr)
+        # Said first, so a backup directory that cannot be written to still
+        # leaves the reason on stderr, which the job's log keeps.
+        try:
+            args.dest.mkdir(mode=0o700, parents=True, exist_ok=True)
+            private_file(args.dest / "last-failure", f"{stamp(now())} {reason}\n")
+        except OSError as unwritten:
+            print(f"{PROG}: and last-failure could not be written: {unwritten}", file=sys.stderr)
+        return 1
+    finally:
+        if lock is not None:
+            os.close(lock)
+    db, blobs = manifest["database"], manifest["blobs"]
+    cold, orient = manifest["cold_store"], manifest["orient"]
+    print(f"{PROG}: backed up to {args.dest / 'latest'} at {manifest['finished']}: "
+          f"{db['tables']} tables and {db['rows']} rows, integrity_check ok; "
+          f"cold store {cold['rows']} rows and Orient {orient['rows']} rows, both integrity_check ok"
+          f"{''.join(f', {n} {t} row(s) dropped' for t, n in orient['dropped'].items())}; "
+          f"{blobs['copied']} blob(s) added, {blobs['held']} held; "
+          f"knowledge at {manifest['knowledge']['head'][:12]}, bundle verified")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

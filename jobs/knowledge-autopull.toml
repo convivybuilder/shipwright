@@ -1,0 +1,20 @@
+name = "knowledge-autopull"
+description = "Pulls the knowledge repository every ten minutes so a merged document reaches this machine without anyone running git. It refuses to fast-forward a checkout that has been moved off its main branch."
+label = "com.convivy.knowledge-autopull"
+command = ["{deploy}/agent-platform/bin/knowledge-autopull"]
+platforms = ["macos", "linux"]
+scope = "user"
+enabled-by-default = true
+working-directory = "{deploy}/agent-platform"
+
+[log]
+stdout = "{state}/knowledge-autopull.log"
+stderr = "{state}/knowledge-autopull.err.log"
+
+[environment]
+HOME = "{home}"
+PATH = "{bin}:/usr/bin:/bin"
+
+[schedule]
+at-load = true
+every-seconds = 600

@@ -1,0 +1,29 @@
+name = "builder-backup"
+description = "Backs up the Library's database and cold store, Orient's database, the Library's blobs and the knowledge repository every six hours, verifies each copy, and records when it last succeeded. The machine's own backups carry the copy off it."
+label = "com.convivy.builder-backup"
+command = [
+  "{python}",
+  "{deploy}/builder-payload/bin/builder-backup",
+  "--library-state", "{state}/library",
+  "--dest", "{state}/builder-backup",
+]
+# NO `--knowledge`: the command asks `builder-root`, on the PATH below, the way
+# every other Builder tool finds the root. `{root}` resolved to a folder other
+# than the Builder root on an install whose root is `~/builder`, and the job
+# failed with `no knowledge repository at …` on its first run.
+platforms = ["macos", "linux"]
+scope = "user"
+enabled-by-default = true
+working-directory = "{deploy}/builder-payload"
+
+[log]
+stdout = "{state}/builder-backup.log"
+stderr = "{state}/builder-backup.log"
+
+[environment]
+HOME = "{home}"
+PATH = "{bin}:/usr/bin:/bin"
+
+[schedule]
+at-load = true
+every-seconds = 21600

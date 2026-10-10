@@ -1,0 +1,851 @@
+#!/usr/bin/env python3
+"""Stand Builder's backend up with one command, by calling the four that do it.
+
+    bin/stand-up-backend --shape single|two              provision, place, register, supervise
+    bin/stand-up-backend --shape single|two --activate   ...and start the jobs marked default-on
+    bin/stand-up-backend --shape single|two --status     what each step reports, changing nothing
+    bin/stand-up-backend --shape single|two --dry-run    say what would happen, change nothing
+    bin/stand-up-backend --shape single|two --check      report only; 1 work left, 2 something refused
+
+## THE OPERATOR NAMES THE SHAPE, AND THIS NEVER FALLS BACK FROM ONE TO THE OTHER
+
+`--shape single` installs Builder as the operator's own account, with no
+administrator. `provision-backend` runs with `--no-install`, so a missing
+program stops the run with the command that installs it, and nothing reaches
+for sudo. On Linux it enables lingering for the operator, so the jobs keep
+running after logout; where the machine refuses, it says so and carries on.
+
+`--shape two` installs the two-account shape, which needs the `agents` and
+`reviewers` accounts and the privileged half. **It checks for them before any
+step runs**, and where one is missing it stops, names what it lacked, and
+leaves the machine as it found it. Quietly installing the single-account
+pieces instead would hand the operator the shape they did not choose, and the
+one that gives up the boundary they chose the other for.
+
+**THIS EXISTS BECAUSE FIVE STEPS IN AN UNENFORCED ORDER IS NOT AN INSTALL.**
+Each of the four commands below is complete, refuses rather than half-doing its
+job, and names the next one on stdout. That is better than the prose in a shell
+comment it replaced, and it is still five things an early adopter on an Azure VM
+has to run in the right order, holding two facts nobody wrote down:
+
+- **Provision precedes placement**, because placement builds a venv per deploy
+  area and needs a working interpreter and `pip` to do it.
+- **Registration and supervision follow placement**, because both point into a
+  deploy area. `bin/register-mcp` refuses outright when the area is absent, and
+  a job pointed at a missing area undoes the rule that a service serves only from
+  its deploy area.
+
+**It calls them; it reimplements nothing.** They already refuse rather than
+half-installing, say what they did, and change nothing on a second run. This
+inherits those four properties by delegation, and must not become the fifth
+place any of them is invented.
+
+## THE INTERPRETER IS THE TRAP THIS CARRIES FOR THE OPERATOR
+
+Job declarations are TOML and `tomllib` arrived in 3.11. Ubuntu 22.04 ships
+3.10 as `python3`, and installing 3.11 alongside does **not** change what
+`/usr/bin/env python3` resolves to — so `bin/install-jobs` fails under the
+interpreter that will run it by default, and `bin/provision-backend`'s closing
+text tells the operator to type `python3.11 bin/install-jobs` by hand. That
+instruction is correct and it is exactly the kind of thing an installer should
+not leave to a person.
+
+**This picks an interpreter and PRINTS the one it picked**, for every step that
+does not simply inherit this process. `install-backend` is also given it as
+`--python`, because that flag defaults to whatever interpreter happened to
+invoke it and a deploy venv built with 22.04's stock 3.10 is a worse starting
+point than one built with the 3.11 `provision-backend` just installed.
+
+## EVERY MODE'S EXIT CODE MEANS THE SAME THING
+
+`0` nothing to do or everything done, `1` work is left, `2` something
+refused. **That holds for `--check` and for a real run.**
+
+**Under `--dry-run` it cannot hold at all**: no tool reports pending work
+through its exit code there, so a `0` says only that nothing crashed.
+
+**Under `--status` it holds for half of them, which is worse than neither.**
+`provision-backend` exits `1` for a missing package and `install-backend` for a
+deploy area that is missing or unreadable — staleness is a `--check` finding,
+not a `--status` one; `register-mcp` and `install-jobs` return `0` whatever
+they printed, including over `NOT INSTALLED`. So a `0` from those two
+is not a clean bill of health, and this reports what each one SAID rather than
+leaning on the code. **A `1` means different things in different modes from the
+SAME tool**, which is why `verdict_of` takes the mode and each step carries a
+`work_left_modes` tuple read off that tool's own returns.
+
+That divergence is also why the chain stops on **any** non-zero rather than on
+`2` alone: a step that dies of an uncaught exception exits `1` and one killed by
+a signal is negative, and continuing past either installs onto a machine that
+cannot run what comes next.
+
+**A skipped supervision step counts as work left**, because it is. A run that
+prints "SUPERVISION IS NOT INSTALLED" and exits `0` is a report contradicting
+itself, which is the defect this whole command exists one level up to refuse.
+
+## WHAT A GREEN RUN DOES NOT MEAN
+
+**A green supervise step means the declarations in `jobs/` were rendered and
+installed for this machine's supervisor**, and with `--activate` that the
+default-on jobs were started and checked once. A fork that ships no
+declarations has no `jobs/` directory, or none with a `.toml` in it; when no
+`--jobs` is given, this checks the default location first and reports that
+the step was skipped, rather than surfacing `no such directory`, which reads
+as a misconfiguration the operator caused. **When `--jobs` IS given, the step
+runs and `install-jobs` refuses in its own words**, because a path the
+operator named and got wrong is exactly the thing they should be told about.
+
+**Installed is not started.** `install-jobs` writes the units; it starts only
+the default-on ones, and only with `--activate`, which this passes through.
+Without it the jobs are on the machine and not running.
+
+## What it never does
+
+**It writes no credentials of its own.** The Library's job declaration mints
+Orient's two and the work-queue tools' one, once each, and no installer
+copies or overwrites a credential. It provisions no chat webhooks, Slack's
+included, although `agent-platform/install.sh` lists them as a manual step:
+an installer that sets up a surface nobody reads is worse than one that omits
+it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pwd
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+PROG = "stand-up-backend"
+REPO = Path(__file__).resolve().parent.parent
+
+# `work_left_modes` NAMES THE MODES IN WHICH THAT TOOL'S `1` MEANS PENDING WORK
+# RATHER THAN A CRASH, and it is per-tool because the four disagree. Read off
+# each tool's own returns rather than assumed from the flag name, because
+# `--status` is where they diverge most:
+#
+#   provision-backend  `return 1 if (missing and args.check)`      (line 317)
+#   install-backend    `--check` 1 when stale (988); `--status`
+#                      returns `1 if missing` from status()        (866)
+#   register-mcp       `--check` 1 when unready (646); `--status`
+#                      returns 0 whatever it printed               (616)
+#   install-jobs       `--check` 1 when it would write (main);
+#                      `--status` only ever returns 0 (report_status); a REAL
+#                      run is `activation(...) or (1 if skipped)`,
+#                      so it returns 1 when a live unit differs
+#                      from its declaration and was skipped — the
+#                      common case — when an activation command
+#                      failed, or when a job it activated is still
+#                      reported down afterwards                    (activation)
+#
+# Under `--dry-run` no tool reports pending work through its code at all, so a
+# `1` there is an uncaught exception in every case and the mode appears nowhere
+# below. `None` means a real run, and only `install-jobs` has a non-crash `1`
+# there.
+STEPS = (
+    {
+        "name": "provision",
+        "tool": "provision-backend",
+        "why": "install what the platform lacks, verified by running each program",
+        "modes": {"dry-run": "--dry-run", "check": "--check", "status": "--check"},
+        "work_left_modes": ("check", "status"),
+        "needs_311": False,
+    },
+    {
+        "name": "place",
+        "tool": "install-backend",
+        "why": "put the code where a service can serve it, from a published ref",
+        "modes": {"dry-run": "--dry-run", "check": "--check", "status": "--status"},
+        "work_left_modes": ("check", "status"),
+        "needs_311": False,
+    },
+    {
+        "name": "link",
+        "tool": "link-commands",
+        "why": "put the core commands where an operator can type their names",
+        # **AFTER `place` AND NOT BEFORE IT**, because this links into the area
+        # that step creates and refuses rather than writing a link to a file
+        # that is not there yet.
+        "modes": {"dry-run": "--dry-run", "check": "--check", "status": "--status"},
+        # Read off this tool's own returns, as the note above requires rather
+        # than assumed from the flag names: `--check` returns 1 when a command
+        # is unlinked OR when every link exists and the directory is not on
+        # PATH (both are work left), and `status()` returns `1 if missing`,
+        # where "missing" counts an occupied destination as well as an absent
+        # one. Neither returns a non-crash 1 in a real run.
+        "work_left_modes": ("check", "status"),
+        "needs_311": False,
+    },
+    {
+        "name": "register",
+        "tool": "register-mcp",
+        "why": "register the kb and ops MCP servers, so a session has a Library",
+        "modes": {"dry-run": "--dry-run", "check": "--check", "status": "--status"},
+        "work_left_modes": ("check",),
+        "needs_311": False,
+    },
+    {
+        "name": "supervise",
+        "tool": "install-jobs",
+        "why": "render and install the backend's jobs for this machine's supervisor",
+        # `--check` here is REAL, added to install-jobs in this change. Mapped
+        # to `--dry-run` it could not answer the question: that mode exits 0
+        # whether it would write ten units or none, so `--check` reported `ok`
+        # for supervise on a machine where nothing was installed.
+        "modes": {"dry-run": "--dry-run", "check": "--check", "status": "--status"},
+        "work_left_modes": ("check", None),
+        "needs_311": True,
+    },
+)
+
+
+class Refused(Exception):
+    """Something the operator has to decide about. Never a stack trace."""
+
+
+SHAPES = {
+    "single": "one account, the operator's own, with no administrator",
+    "two": "the agents and reviewers accounts and a root-owned privileged half",
+}
+
+# What the two-account shape needs before anything is installed for it.
+TWO_ACCOUNT_USERS = ("agents", "reviewers")
+PRIVILEGED_INSTALLER = Path("bin", "install-privileged")
+
+
+def _account_exists(name: str) -> bool:
+    try:
+        pwd.getpwnam(name)
+    except KeyError:
+        return False
+    return True
+
+
+def two_shape_lacks(repo: Path = REPO, exists=_account_exists) -> list[str]:
+    """What the two-account shape needs and this machine lacks, one line each.
+
+    **THE ACCOUNTS ARE ASKED OF THE DIRECTORY, NOT OF `provision-accounts
+    --check`**, because that command needs root for every mode and this runs
+    as the operator. Whether an account that exists has the right shape is
+    `provision-accounts`' question, which the refusal tells the operator to
+    ask. The privileged half's installer is looked for in this release, which
+    is where a release that cannot install it says so.
+    """
+    lacks = [
+        f"the `{name}` account, which `sudo bin/provision-accounts` creates"
+        for name in TWO_ACCOUNT_USERS if not exists(name)
+    ]
+    if not (repo / PRIVILEGED_INSTALLER).is_file():
+        lacks.append(
+            f"the privileged half: this release has no `{PRIVILEGED_INSTALLER}` "
+            f"to install it with")
+    return lacks
+
+
+def refuse_two_shape(lacks: list[str]) -> Refused:
+    listed = "\n".join(f"  - {line}" for line in lacks)
+    return Refused(
+        f"the two-account shape cannot be installed on this machine. It lacks:\n"
+        f"{listed}\n"
+        f"Nothing was installed or changed, and the single-account shape was not "
+        f"installed in its place. To install as one account instead, run with "
+        f"`--shape single`.")
+
+
+LINGER_REFUSED = (
+    "lingering could not be enabled for {user}, so Builder's jobs will stop when "
+    "{user} logs out and start again at the next login. Whoever administers this "
+    "machine can enable it with `loginctl enable-linger {user}`.")
+
+
+def lingers_before(step: dict, mode: str | None, shape: str,
+                   platform: str = sys.platform) -> bool:
+    """Whether to enable lingering before running `step`: just before the jobs
+    are installed, in a real single-account run, on Linux. Every reporting mode
+    changes nothing, and the two-account shape's jobs run as `agents`."""
+    return (step["name"] == "supervise" and mode is None and shape == "single"
+            and platform.startswith("linux"))
+
+
+def enable_linger(user: str, run=subprocess.run) -> str | None:
+    """Enable lingering for `user` on Linux, or the sentence saying it was refused.
+
+    **A REFUSAL IS REPORTED, NOT RAISED.** Without lingering the user's jobs
+    stop at logout, which is a weaker install rather than a broken one, and a
+    machine that refuses it is one the operator may not administer, which is
+    the case this shape exists for."""
+    try:
+        done = run(["loginctl", "enable-linger", user],
+                   capture_output=True, text=True, timeout=60, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return LINGER_REFUSED.format(user=user)
+    if done.returncode != 0:
+        return LINGER_REFUSED.format(user=user)
+    return None
+
+
+def _has_tomllib(interpreter: str) -> bool:
+    try:
+        return subprocess.run(
+            [interpreter, "-c", "import tomllib"],
+            capture_output=True, timeout=60, check=False,
+        ).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def best_interpreter() -> str | None:
+    """An interpreter with `tomllib`, or None — never a refusal from in here.
+
+    Returning None rather than raising is what lets a REPORTING mode say which
+    step cannot run and still print the other three. Raising from inside the
+    step loop threw the whole report away on the one machine the docstring is
+    about: a fresh 22.04 box, first `--dry-run`, before `python3.11` exists.
+    """
+    if _has_tomllib(sys.executable):
+        return sys.executable
+    for name in ("python3.11", "python3.12", "python3.13", "python3.14"):
+        found = shutil.which(name)
+        if found and _has_tomllib(found):
+            return found
+    return None
+
+
+def interpreter_for(step: dict, best: str | None) -> str:
+    if not step["needs_311"]:
+        return sys.executable
+    if best is None:
+        raise Refused(
+            "no interpreter with `tomllib` was found, and job declarations are "
+            "TOML. `tomllib` arrived in Python 3.11; Ubuntu 22.04 ships 3.10 as "
+            "`python3`, and installing 3.11 alongside does not change what "
+            "`/usr/bin/env python3` resolves to."
+        )
+    return best
+
+
+def declarations_dir(args) -> Path:
+    return args.jobs if args.jobs is not None else REPO / "jobs"
+
+
+def supervision_skipped(args) -> bool:
+    """Whether to skip `install-jobs` rather than let it refuse.
+
+    ONLY FOR THE DEFAULT DIRECTORY. `install-jobs` refuses with `no such
+    directory`, which is the wrong thing to show for a fork that ships no
+    declarations — that is the fork's choice, not the operator's mistake.
+    **But a `--jobs` the operator typed and got wrong IS their mistake**, and
+    skipping it would tell them the repository ships no declarations, which is
+    false about the path they named. So an explicit `--jobs` always runs the
+    step and lets the tool speak for itself.
+    """
+    if args.jobs is not None:
+        return False
+    directory = declarations_dir(args)
+    return not (directory.is_dir() and any(directory.glob("*.toml")))
+
+
+def argv_for(step: dict, args, mode: str | None, best: str | None) -> list[str]:
+    """The exact command line for one step, from what that tool accepts.
+
+    Each tool takes a different subset, so this is a table rather than a loop:
+    passing `--deploy` to `provision-backend`, which has no such flag, would
+    make argparse exit 2 and be reported as that step refusing.
+    `tools/test_stand_up_backend.py` reads each real tool's own
+    `add_argument` calls and asserts every flag named here is one it accepts.
+    """
+    argv = [interpreter_for(step, best), str(REPO / "bin" / step["tool"])]
+    if mode is not None:
+        argv.append(step["modes"][mode])
+    elif step["name"] == "provision" and args.shape == "single":
+        # The single-account shape has no administrator: name what is missing
+        # and how to install it, never sudo.
+        argv.append("--no-install")
+    if step["name"] in ("place", "register") and args.deploy is not None:
+        argv += ["--deploy", str(args.deploy)]
+    if step["name"] == "place" and best is not None:
+        # `--python` defaults to whatever invoked the tool. On 22.04 that is
+        # the stock 3.10, and a deploy venv built with it is a worse floor than
+        # one built with the interpreter provision just installed.
+        argv += ["--python", best]
+    if step["name"] == "place" and args.seed_registry:
+        argv += ["--seed-registry"]
+    if step["name"] == "supervise":
+        argv += ["--jobs", str(declarations_dir(args))]
+        if args.deploy is not None:
+            argv += ["--deploy", str(args.deploy)]
+        if args.activate:
+            argv += ["--activate"]
+    return argv
+
+
+def run_step(step: dict, args, mode: str | None, best: str | None) -> dict:
+    """Run one step, ECHOING its output as it arrives, and keep the exit code.
+
+    **Echoed rather than captured, because the waits are long and silent.**
+    `install-backend` prints "building the venv… can take a while — do not
+    start a second run" before it does exactly that; captured, that warning
+    reaches the operator only after the wait it was meant to cover, while apt
+    and pip run silent for minutes.
+
+    The exit code is kept rather than translated: the four tools share one
+    convention (0 did it, 1 work left, 2 refused) and a caller here needs to
+    tell a refusal from a report.
+    """
+    try:
+        argv = argv_for(step, args, mode, best)
+    except Refused as exc:
+        # NOT raised out of the loop. A reporting mode must still show the
+        # other steps; a real run stops on it like any other refusal.
+        return {"step": step, "argv": None, "code": 2, "stdout": "",
+                "stderr": str(exc), "unrunnable": True}
+
+    print(f"→ {step['name']}: {' '.join(argv[1:])}")
+    lines: list[str] = []
+    # STDERR GOES TO A FILE, NOT A SECOND PIPE. Draining stdout to exhaustion
+    # and only then reading a stderr PIPE deadlocks: a step that fills the
+    # stderr buffer blocks writing, so it never closes stdout, so the loop
+    # below never ends and the run hangs for ever. Measured, not reasoned —
+    # a step writing 400 KB to stderr hung this command until it was killed.
+    # A file has no such buffer, and needs no second thread to drain.
+    with tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace") as errors:
+        # `-u` OR THE ECHO IS NOT LIVE. Python block-buffers stdout when it is
+        # a pipe, so install-backend's "do not start a second run" warning
+        # arrives with everything else once the step ENDS — after the wait it
+        # exists to cover. Measured: print, sleep 3, print delivers both lines
+        # at 3.0s without it and the first at 0.0s with it.
+        child = subprocess.Popen(
+            [argv[0], "-u", *argv[1:]], stdout=subprocess.PIPE, stderr=errors,
+            text=True,
+        )
+        assert child.stdout is not None
+        for line in child.stdout:
+            sys.stdout.write(line)
+            # FLUSHED, OR THE ECHO IS STILL NOT LIVE. `-u` unbuffers the CHILD;
+            # this process block-buffers its own stdout whenever that is a pipe,
+            # which is how an operator sees it under `tee`, in CI, or through
+            # any wrapper. Measured: without this the early warning arrived at
+            # 3.2s of a 3s wait — after the thing it exists to cover.
+            sys.stdout.flush()
+            lines.append(line)
+        child.wait()
+        errors.seek(0)
+        stderr = errors.read()
+    print()
+    return {
+        "step": step,
+        "argv": argv,
+        "code": child.returncode,
+        "stdout": "".join(lines),
+        "stderr": stderr,
+        "unrunnable": False,
+    }
+
+
+def verdict_of(result: dict, mode: str | None) -> str:
+    """What one step's exit code means, WHICH DEPENDS ON THE MODE IT RAN IN.
+
+    A `1` is an uncaught exception in a real run and a report of pending work
+    under `--check`, and the same tool produces both. Labelled by the step's
+    name alone, every reporting-mode `1` read as `exit 1` — so on the fresh
+    machine this command exists for, `--check` printed `exit 1  provision` and
+    `exit 1  place` where the honest word is `work left`, with no stderr to
+    explain it, because those tools report missing packages and a stale deploy
+    area exactly that way. `STEPS[*]["work_left_modes"]` carries the per-tool
+    answer; it stays a crash in a real run.
+    """
+    code = result["code"]
+    if code == 0:
+        return "ok"
+    if code == 2:
+        return "REFUSED"
+    if code < 0:
+        return f"killed ({-code})"
+    if code == 1:
+        left = mode in result["step"]["work_left_modes"]
+        return "work left" if left else "exit 1"
+    return f"exit {code}"
+
+
+def blocks_from(results: list[dict]) -> list[tuple[str, str]]:
+    """Each step's own closing words, attributed, VERBATIM and not merged.
+
+    **These are four tools' text, not one list**, and the shape differs: only
+    `register-mcp` prints a clean outstanding list after its report.
+    `provision-backend` puts a summary line there first, `install-backend
+    --check` returns before printing its list at all, and `install-jobs` has no
+    such list, so its block is whatever followed its first blank line.
+
+    **They also overlap and can contradict the run.** `provision-backend` says
+    supervision is installed separately by `bin/install-jobs`, and
+    `install-backend` says the MCP servers are not registered by it — both true
+    of those tools alone and both describing steps this command has just run.
+    De-duplicating would mean parsing four formats that are free to change, so
+    the report says what these blocks are instead of pretending they are one
+    curated list.
+    """
+    out = []
+    for result in results:
+        text = result["stdout"]
+        if "\n\n" not in text:
+            continue
+        tail = text.split("\n\n", 1)[1].strip()
+        if tail:
+            out.append((result["step"]["name"], tail))
+    return out
+
+
+def report(results: list[dict], args, stopped: dict | None, best: str | None,
+           mode: str | None) -> None:
+    print(f"{PROG}: {'macos' if sys.platform == 'darwin' else 'linux'}")
+    if best is not None and best != sys.executable:
+        did = "would use" if mode is not None else "used"
+        print(f"  (supervise {did} {best}, and place was given it as --python)")
+    for result in results:
+        step = result["step"]
+        print(f"  {verdict_of(result, mode):<12} {step['name']:<10} {step['why']}")
+    if supervision_skipped(args):
+        print(f"  {'not built':<12} {'supervise':<10} "
+              f"this repository ships no job declarations — see below")
+    print()
+
+    # EVERY refusal's reason, not only the one that stopped the chain. In a
+    # reporting mode nothing stops, so `stopped` is None and these would
+    # otherwise print `REFUSED place` and never say why.
+    for result in results:
+        if result["code"] != 0 and (result["stderr"] or "").strip():
+            print(f"what `{result['step']['name']}` said:")
+            for line in result["stderr"].strip().splitlines():
+                print(f"    {line}")
+            print()
+
+    if stopped is not None:
+        print(f"stopped at the `{stopped['step']['name']}` step "
+              f"({verdict_of(stopped, mode)}). Nothing after it ran.")
+    elif all(r["code"] == 0 for r in results) and not supervision_skipped(args):
+        # ONLY --check EARNS THE WORD SUCCESS, because only there does every
+        # step's 0 mean nothing is pending. Under --dry-run no tool reports
+        # pending work by its code — register-mcp --dry-run exits 0 while
+        # printing that a real run would refuse. Under --status two of the four
+        # DO report it (provision and place exit 1), but register-mcp and
+        # install-jobs return 0 whatever they printed, install-jobs over NOT
+        # INSTALLED, so an all-zero --status still does not mean settled.
+        # Saying "reported success" in either mode contradicts the lines above.
+        if mode in ("dry-run", "status"):
+            print(f"every step ran ({len(results)} of {len(STEPS)}); these modes "
+                  f"exit 0 whatever is pending — read the report, not the code")
+        else:
+            print(f"every step reported success ({len(results)} of {len(STEPS)} ran)")
+    else:
+        left = [r["step"]["name"] for r in results if r["code"] != 0]
+        if supervision_skipped(args):
+            left.append("supervise")
+        print(f"work left in: {', '.join(left)}")
+
+
+def outstanding(args, blocks, mode: str | None, supervise_ok: bool) -> list[str]:
+    lines: list[str] = []
+    if supervision_skipped(args):
+        lines += [
+            (
+                "SUPERVISION IS NOT INSTALLED, AND A BACKEND WITHOUT IT DOES NOT "
+                "START. `bin/install-jobs` is complete, and this repository "
+                "ships no job declarations, so there is nothing for it to read. "
+                "This is not something you have misconfigured:"
+            ),
+            f"    expected declarations in: {declarations_dir(args)}",
+            "",
+        ]
+    elif not args.activate and mode is None and supervise_ok:
+        lines += [
+            (
+                "The jobs are INSTALLED AND NOT STARTED. `install-jobs` starts the "
+                "default-on ones only with `--activate`, which this did not pass:"
+            ),
+            f"    {PROG} --activate",
+            "",
+        ]
+    if mode == "dry-run":
+        lines += [
+            (
+                "EVERY PREDICTION AFTER THE FIRST STEP IS MADE AGAINST THIS "
+                "MACHINE AS IT IS NOW, not against what the earlier steps would "
+                "have done. On a fresh machine the `register` step will predict a "
+                "refusal, because nothing has been placed for it to point at; a "
+                "real run places first and it does not refuse."
+            ),
+            "",
+        ]
+    if blocks:
+        lines += [
+            (
+                "Each block below is that tool's OWN closing text, verbatim. They "
+                "are not one curated list: they overlap, and one may tell you to "
+                "do something this command has already done."
+            ),
+            "",
+        ]
+    for name, block in blocks:
+        lines.append(f"from the `{name}` step:")
+        lines += [f"    {line}" if line.strip() else "" for line in block.splitlines()]
+        lines.append("")
+    if not lines:
+        lines.append("nothing outstanding was reported by any step.")
+    return lines
+
+
+HOST_KEY = Path("/etc/ssh/ssh_host_ed25519_key.pub")
+SSH_ACCESS_GROUP = "com.apple.access_ssh"
+# BY ABSOLUTE PATH, NEVER FROM PATH: the fingerprint this prints is what a
+# person trusts a host on, and an earlier, writable PATH directory such as
+# ~/.local/bin could otherwise supply an `ssh-keygen` that prints an
+# attacker's. Both macOS and Debian's openssh-client install it here.
+SSH_KEYGEN = "/usr/bin/ssh-keygen"
+DSMEMBERUTIL = "/usr/bin/dsmemberutil"
+
+
+def _run_quiet(argv: list[str]) -> tuple[int, str]:
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return 1, ""
+    return done.returncode, done.stdout
+
+
+def ssh_allows(user: str, run=_run_quiet) -> bool | None:
+    """Whether macOS Remote Login lets `user` in: True, False, or None when
+    this cannot tell. Remote Login limited to some users keeps them in
+    `com.apple.access_ssh`, and an account outside it is refused before any
+    password is asked."""
+    if sys.platform != "darwin":
+        return None
+    # `dsmemberutil`, NOT `dscl ... GroupMembership`, because "Only these
+    # users: Administrators" is stored as a nested group that GroupMembership
+    # never lists: read that way, an administrator who logs in over ssh every
+    # day was reported as refused.
+    code, out = run([DSMEMBERUTIL, "checkmembership", "-U", user,
+                     "-G", SSH_ACCESS_GROUP])
+    if code != 0:
+        # No such group: Remote Login is open to every account, or is off,
+        # which the host key below tells apart.
+        return None
+    if "is not a member" in out:
+        return False
+    if "is a member" in out:
+        return True
+    return None
+
+
+# FROM PATH, UNLIKE SSH_KEYGEN: the fingerprint is what a person trusts the
+# machine on, and the name only says where to look for it, so a false name
+# fails at Trust. The Mac app's own command is the fallback, since the app
+# puts nothing on PATH until its CLI is installed from its settings.
+TAILSCALE_APP_CLI = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+
+
+def tailscale_candidates(which=shutil.which) -> list[str]:
+    found = which("tailscale")
+    return [p for p in (found, TAILSCALE_APP_CLI) if p]
+
+
+def tailnet_name(run=_run_quiet, candidates=tailscale_candidates) -> str | None:
+    """This machine's MagicDNS name on its Tailscale network, or None
+    when Tailscale is absent, stopped, or has MagicDNS off. **A NAME, NEVER A
+    100.x ADDRESS:** moving a Mac's Tailscale from the app to the system
+    service registers it as a new device with a new address, and a Deck host
+    entry holding the old one stops connecting, while the name
+    follows the machine."""
+    for path in candidates():
+        if not os.access(path, os.X_OK):
+            continue
+        code, out = run([path, "status", "--json"])
+        if code != 0:
+            continue
+        status = json.loads(out)
+        if status.get("BackendState") != "Running":
+            return None
+        # Self.DNSName is the node's name whether or not MagicDNS is on, and
+        # with it off the other computer cannot resolve that name.
+        if not (status.get("CurrentTailnet") or {}).get("MagicDNSEnabled"):
+            return None
+        name = ((status.get("Self") or {}).get("DNSName") or "").rstrip(".")
+        return name or None
+    return None
+
+
+def pairing_lines(user: str, host_key: Path = HOST_KEY, run=_run_quiet,
+                  allows=ssh_allows, name=tailnet_name) -> list[str]:
+    """What Deck's Add Host needs from this machine. **THE FINGERPRINT IS THE
+    ONE DECK SHOWS AT TRUST**, in the SHA256 form `ssh-keygen -l` prints, so
+    the person compares two strings rather than trusting the first answer a
+    network gives. Read from the public host key, which every account may
+    read, so this needs no administrator."""
+    if not host_key.is_file():
+        how = ("turn on Remote Login in System Settings › General › Sharing"
+               if sys.platform == "darwin" else
+               "install and start the ssh server, the openssh-server package")
+        return [
+            "THIS MACHINE HAS NO SSH HOST KEY, so it accepts no ssh connections and "
+            f"Deck on another computer cannot reach it. Ask whoever administers it to {how}.",
+        ]
+    code, out = run([SSH_KEYGEN, "-lf", str(host_key)])
+    fields = out.split()
+    fingerprint = fields[1] if code == 0 and len(fields) > 1 else None
+    if fingerprint is None:
+        return [f"could not read the host key fingerprint from {host_key}."]
+    address = name()
+    if address:
+        lines = [
+            "To work from Deck on another computer, add this machine in Deck › Settings › "
+            "Hosts by its Tailscale name and this account:",
+            f"    address: {address}",
+        ]
+    else:
+        lines = [
+            "To work from Deck on another computer, add this machine in Deck › Settings › "
+            "Hosts, with the name that computer reaches it by and this account. Use a "
+            "name rather than a numeric address, which can change when the machine joins "
+            "its network again:",
+            "    address: <the name that computer reaches it by>",
+        ]
+    lines += [
+        f"    user: {user}",
+        "When Deck asks you to trust the machine, check that it shows exactly:",
+        f"    {fingerprint} (ED25519)",
+    ]
+    if allows(user) is False:
+        lines += [
+            f"REMOTE LOGIN DOES NOT ALLOW {user} YET, so Deck will be refused. Ask "
+            "whoever administers this Mac to add the account under System Settings › "
+            "General › Sharing › Remote Login › Allow access for.",
+        ]
+    return lines
+
+
+def closing_pairing(euid: int, user: str, shape: str, lines=pairing_lines) -> list[str]:
+    """The pairing block, NEVER AS ROOT: the account named is the one Deck
+    logs in as, and under sudo it would be root, followed by advice to let
+    root in over ssh. Root gets one line saying where pairing comes from."""
+    if euid == 0:
+        return ["Pairing with Deck is not shown when this runs as root. Run "
+                f"`{PROG} --shape {shape} --status` as the account Deck will log in "
+                "as, to see the host key fingerprint it should trust."]
+    return lines(user)
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Stand Builder's backend up by running the four tools in order.",
+    )
+    parser.add_argument("--shape", choices=tuple(SHAPES),
+                        help="the install shape, which this never chooses for you: "
+                             + "; ".join(f"{k}, {v}" for k, v in SHAPES.items()))
+    parser.add_argument("--deploy", type=Path, default=None,
+                        help="deploy root, passed to the steps that place and "
+                             "read it (default: each tool's own)")
+    parser.add_argument("--jobs", type=Path, default=None,
+                        help="directory of job declarations (default: <repo>/jobs)")
+    parser.add_argument("--seed-registry", action="store_true",
+                        help="give the backend the projects registry the published "
+                             "release would, not the one a source checkout carries; "
+                             "for anyone installing from source but Convivy itself")
+    parser.add_argument("--activate", action="store_true",
+                        help="also start the jobs marked enabled-by-default")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--status", action="store_true",
+                      help="what each step reports, changing nothing")
+    mode.add_argument("--dry-run", action="store_true",
+                      help="say what would happen, change nothing")
+    mode.add_argument("--check", action="store_true",
+                      help="report only; 1 if work is left, 2 if a step refused")
+    args = parser.parse_args(argv)
+
+    chosen = "status" if args.status else "dry-run" if args.dry_run else \
+             "check" if args.check else None
+
+    if args.shape is None:
+        shapes = "\n".join(f"  --shape {k:<7} {v}" for k, v in SHAPES.items())
+        print(f"{PROG}: name the install shape; this never chooses one for you:\n"
+              f"{shapes}", file=sys.stderr)
+        return 2
+    if args.shape == "two":
+        # BEFORE ANY STEP, IN EVERY MODE. A reporting mode would otherwise
+        # describe installing pieces the two-account shape cannot use.
+        lacks = two_shape_lacks()
+        if lacks:
+            print(f"{PROG}: {refuse_two_shape(lacks)}", file=sys.stderr)
+            return 2
+
+    results: list[dict] = []
+    stopped = None
+    best = None
+    linger_note = None
+    for step in STEPS:
+        # RE-PROBED UNTIL ONE IS FOUND, because `provision` is what installs it.
+        # Resolved once before the loop, `best` was None on the very machine
+        # this command is written for — a fresh 22.04 box whose `python3` is
+        # 3.10 — so `supervise` refused and `place` built its venvs with the
+        # stock interpreter, both AFTER provision had just installed 3.11.
+        if best is None:
+            best = best_interpreter()
+        if step["name"] == "supervise" and supervision_skipped(args):
+            continue
+        if lingers_before(step, chosen, args.shape):
+            # The name the process runs as, from its UID. `getpass.getuser()`
+            # reads USER and LOGNAME first, which a `su` or `sudo -E` leaves
+            # naming someone else.
+            linger_note = enable_linger(pwd.getpwuid(os.getuid()).pw_name)
+            if linger_note:
+                print(f"{PROG}: {linger_note}\n")
+        result = run_step(step, args, chosen, best)
+        results.append(result)
+        # ANY non-zero stops a real run, not only a refusal. A crash exits 1
+        # and a signal death is negative, and continuing past either installs
+        # onto a machine that cannot run what comes next.
+        if result["code"] != 0 and chosen is None:
+            stopped = result
+            break
+
+    report(results, args, stopped, best, chosen)
+    print()
+    supervise_ok = any(
+        r["step"]["name"] == "supervise" and r["code"] == 0 for r in results
+    )
+    # Printed again here as well as when it happened, since the steps' output
+    # in between scrolls it away and this closing section is what is read.
+    if linger_note:
+        print(linger_note)
+        print()
+    for line in outstanding(args, blocks_from(results), chosen, supervise_ok):
+        print(line)
+    # LAST, since it is the step after this command: pairing Deck with this
+    # machine. Read-only, so every mode prints it once the steps have run.
+    if stopped is None:
+        print()
+        for line in closing_pairing(os.geteuid(), pwd.getpwuid(os.getuid()).pw_name, args.shape):
+            print(line)
+
+    if stopped is not None:
+        print(f"\n{PROG}: the `{stopped['step']['name']}` step said:",
+              file=sys.stderr)
+        print(stopped["stderr"].strip() or stopped["stdout"].strip(),
+              file=sys.stderr)
+        return 2 if stopped["code"] == 2 else 1
+    # ONE MEANING PER CODE, IN EVERY MODE: 2 refused, 1 work left, 0 done.
+    # Collapsed to `1 if anything is non-zero`, a refusal and a report of
+    # pending work were indistinguishable to a caller.
+    if any(r["code"] == 2 for r in results):
+        return 2
+    if any(r["code"] != 0 for r in results) or supervision_skipped(args):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

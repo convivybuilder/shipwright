@@ -1,0 +1,1866 @@
+#!/usr/bin/env python3
+"""Place Builder's backend where a service can serve it, and say what it serves.
+
+    bin/install-backend              install or refresh everything it places
+    bin/install-backend --status     what commit each area is serving
+    bin/install-backend --dry-run    say what would happen, change nothing
+    bin/install-backend --check      report only; 1 if stale, 2 if refused
+
+It places two kinds of thing. A REPOSITORY goes to `{deploy}/<name>` with its
+venv inside it, and `--deploy` says where. A COMPONENT is one directory of a
+repository, placed at a path its own launcher hardcodes — the LLM gateway is
+the first, and `Component` says why `--deploy` cannot move it and what would
+have to change for it to.
+
+**THE POINT IS THAT A SERVICE NEVER SERVES FROM A CHECKOUT ANYBODY DEVELOPS
+IN.** That rule was not a theory: a service once served code nineteen hours
+older than a fix that had merged, because its working directory was a crew's
+checkout and that checkout was still on the branch the pull request had been
+reviewed from. A restart would have restarted the same stale branch. The hazard
+is armed by ordinary work, invisible while armed, and fires on a restart nobody
+schedules.
+
+This is the placing half. It does not convert code that names one machine,
+which is each owning crew's work, and it does not install supervision, which
+`bin/install-jobs` owns; this refuses to be a second place either is invented.
+
+## What the deploy-area rule binds, and where each part lands in this file
+
+- **Rule 2, the deploy area holds copies rather than symlinks.** A symlink
+  reintroduces the tree-tracking the whole decision removes. `export_tree()`
+  writes real files, and **what it guarantees precisely is that no link in the
+  extracted tree leaves that tree.** A link between two files inside the tree is
+  accepted, because it is part of the content being deployed rather than a
+  pointer at a developer's checkout, and so is a link to an in-tree directory or
+  to an in-tree name that does not exist — whether or not it ever will.
+
+  **The venv is built AFTER extraction and this command never inspects its
+  links.** Every interpreter link `python -m venv` puts in `.venv/bin` resolves
+  to the base interpreter, so by `realpath` all of them leave the tree. **How
+  many there are, and which one carries the absolute target, varies by CPython
+  version and build.** Not every link under `.venv` leaves, either: on 64-bit
+  Linux `python -m venv` also makes `.venv/lib64 -> lib`, which stays inside.
+  **Never write the count down, and enumerate with `find .venv/bin -type l`
+  rather than a `python*` glob** — 3.14 adds `𝜋thon` under a UTF-8 filesystem
+  encoding, and a glob shaped like the assumption confirmed a wrong count here
+  once already.
+
+  So the test suite's symlink sweep excludes `.venv` because those links
+  necessarily leave and would be flagged on every install. The exclusion
+  suppresses that false positive, and everything else under `.venv` goes
+  unexamined with it — which is why the refusal below is what matters.
+
+  **`checked_members` refuses any archive member under `.venv`**, matched
+  case-insensitively, so nothing the archive carries can land where the sweep
+  does not look. What goes unaudited is only what `python -m venv` and `pip`
+  write there afterwards.
+- **Rule 3, an install never copies or overwrites a secret or configuration.**
+  It may generate a new local credential, as the Library's job declaration
+  does for Orient and the work-queue tools, but this command creates no credential file and copies
+  none. Where a component refuses without one, `outstanding()` names the file
+  and its mode and stops there. The gateway's refusal is deliberate: its file
+  holds provider keys issued to the operator, which no install can generate.
+- **Rule 4, the interpreter is pinned alongside the code.** Pinning code and
+  leaving the venv in the tree pins half of it: a `pip install -e .` on a
+  branch changes what the deployed process imports even when the deployed code
+  is fixed. So each area gets its own venv, built from that repository's
+  `requirements.txt` and never from `requirements-dev.txt`.
+- **Rule 6 and 7, the install is the only writer and it reads a git REF.**
+  Never a live checkout directory: `cp -r` and `rsync` do not respect
+  `.gitignore`, so they would sweep exactly the gitignored credential files
+  rule 3 exists to keep separate into the deploy area.
+- **"It must be possible to ask what commit a service is serving and get an
+  answer"**, which the deploy-area rule names as the whole of the failure it
+  addresses. That is
+  `--status`, and it reads a stamp this command writes rather than inferring
+  anything.
+
+## Two things it deliberately does not take from its siblings
+
+**It resolves the source checkouts from the PRIMARY worktree, not from its own
+location.** `bin/publish-payload` derives sibling repositories as
+`REPO.parent / name`, which is correct from the primary checkout and wrong from
+a git worktree, where it points at the worktree's parent instead. That mistake
+is not repeated here: `primary_worktree()` asks git.
+
+**It reads each repository's published ref rather than its local HEAD.** A
+checkout's HEAD is a local fact — it can be a branch, or a commit that was
+never pushed — and deploying from it would reintroduce, at the install, the
+staleness this decision exists to remove. `origin/main` is what a release
+serves.
+"""
+
+from __future__ import annotations
+
+import argparse
+import inspect
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+# `tools/stale_holders.py` answers "what is still running the version this
+# replaced". Put on the path the way `bin/install-jobs` reaches `tools/jobs`.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+import stale_holders
+
+PROG = "install-backend"
+
+# The backend. Deck is a macOS application rather than a served component and
+# is not placed by this.
+REPOSITORIES = ("library", "agent-platform", "convivy-orient", "write-better")
+
+
+@dataclass(frozen=True)
+class Component:
+    """A program placed from a SUBDIRECTORY of a repository, at paths its own
+    launcher names rather than under `--deploy`.
+
+    **THE LOCATION IS NOT THIS COMMAND'S TO CHOOSE, AND THAT IS THE WHOLE
+    REASON THIS TYPE EXISTS.** A repository area is wherever `--deploy` says,
+    because the job declaration naming it says `{deploy}` too and the two
+    resolve together. A component is launched by a script that hardcodes where
+    it will look: `gateway/llm-gateway-run.sh` runs
+    `$HOME/.local/venv-llm-gateway/bin/litellm` against
+    `$HOME/.local/lib/llm-gateway/config.yaml`, and only `ENV_FILE` is
+    overridable (`LLM_GATEWAY_ENV_FILE`). Placing the gateway anywhere else
+    produces an install that succeeds and a daemon that cannot start.
+
+    So these paths are `home`-relative rather than `--deploy`-relative, and
+    `--home` moves them for a test. **Moving `--home` away from the machine's
+    real home makes the shipped declaration wrong**, because `{home}` in
+    `jobs/llm-gateway.toml` resolves to the real one; that is a test affordance,
+    not a deployment layout.
+
+    **The fix that would let a component honour `--deploy` lives in somebody
+    else's repository**: `LITELLM` and `CONFIG` want the treatment `ENV_FILE`
+    already has, which is two more lines of the same shape in
+    `llm-gateway-run.sh`. Until that lands this is the only placement that
+    works, and writing it down here is cheaper than rediscovering it.
+    """
+
+    name: str
+    repository: str
+    subtree: str
+    # Both relative to `home`, as tuples so nothing here composes a path with a
+    # separator that differs by platform.
+    lib: tuple[str, ...]
+    venv: tuple[str, ...]
+    # Inside the venv: what the launcher actually execs. **Checked rather than
+    # the venv DIRECTORY**, because a `pip install` killed part-way leaves the
+    # directory standing, and a directory test then reports a complete install
+    # over a venv with no program in it. The gateway's install is minutes of
+    # network, so that window is wide rather than theoretical.
+    program: tuple[str, ...]
+
+    # **FILES FROM ELSEWHERE IN THE REPOSITORY, LANDED BESIDE THE SUBTREE BY
+    # BASENAME.** A component's directory is not always the whole of what it
+    # needs: `gateway/` holds no `builder_root.py`, and `spend_callback.py`
+    # imports one as a SIBLING, because the placed directory is the gateway's
+    # only `PYTHONPATH` entry and a path relative to the source file names
+    # nothing there.
+    #
+    # Exporting the subtree alone placed cleanly, reported 5 files and exited 0
+    # — and the gateway then died at startup on `ModuleNotFoundError: No module
+    # named 'builder_root'`. **No check on the INSTALL could have caught that**,
+    # because the install was faultless; it took starting the thing. So this is
+    # a field rather than a special case, and `test_install_backend.py` asserts
+    # the placed gateway carries every name its own code imports.
+    extra: tuple[str, ...] = ()
+
+    def lib_at(self, home: Path) -> Path:
+        return home.joinpath(*self.lib)
+
+    def venv_at(self, home: Path) -> Path:
+        return home.joinpath(*self.venv)
+
+    def program_at(self, home: Path) -> Path:
+        return self.venv_at(home).joinpath(*self.program)
+
+
+COMPONENTS = (
+    Component(
+        name="llm-gateway",
+        repository="agent-platform",
+        subtree="gateway",
+        lib=(".local", "lib", "llm-gateway"),
+        venv=(".local", "venv-llm-gateway"),
+        program=("bin", "litellm"),
+        extra=("lib/agent-platform/builder_root.py",),
+    ),
+)
+
+COMPONENTS_BY_NAME = {component.name: component for component in COMPONENTS}
+
+PLACEABLE = REPOSITORIES + tuple(component.name for component in COMPONENTS)
+
+# **ANOTHER REPOSITORY READS THIS NAME, AND `.venv` BESIDE IT.** agent-platform's
+# `lib/agent-platform/venv_bootstrap.py` finds the interpreter for its commands
+# by looking above `bin/` for this file with a `.venv` next to it. That is how
+# `knowledge-ctx` and both MCP servers start on a machine this command set up.
+# Rename either and those commands fail to find their packages, and `co` then
+# refuses in every new crew, so change agent-platform first.
+STAMP = ".installed-by-install-backend"
+
+# **OWNERSHIP, WHICH IS A DIFFERENT QUESTION FROM COMPLETENESS.** `--deploy` is
+# operator-supplied and this command renames and deletes directories under it. A
+# security review pointed `--deploy` at the directory holding the source
+# checkouts and watched `library/` — uncommitted notes and a gitignored `.env`
+# included — get moved aside and removed, with exit 0 and no refusal. That is
+# the case `bin/publish-payload` closed with its own marker after the same
+# finding: "one mistyped argument took whatever was there."
+#
+# It cannot be the STAMP. The stamp is written LAST, so it says "this area is
+# complete"; a run that died between the swap and the stamp would leave an area
+# with no stamp, and keying deletion on the stamp would then refuse to recover
+# it. The marker is written before the swap and answers only "this tool made
+# this directory".
+MARKER = ".built-by-install-backend"
+
+# Production dependencies only. `requirements-dev.txt` carries test and lint
+# tooling, and a deploy area is not where anything is tested.
+REQUIREMENTS = "requirements.txt"
+
+
+class Refused(Exception):
+    """Something a person has to decide about. Never a stack trace."""
+
+
+def run(*args: str, cwd: Path | None = None, check: bool = True) -> str:
+    try:
+        result = subprocess.run(
+            args, cwd=cwd, capture_output=True, text=True, check=False
+        )
+    except OSError as exc:
+        # A MISSING PROGRAM IS A REFUSAL, NOT A TRACEBACK. `subprocess.run`
+        # raises `FileNotFoundError` before any exit status exists, so an absent
+        # `git`, or a `--python` naming nothing, printed a stack trace straight
+        # past the "never a stack trace" this module's exception exists for.
+        raise Refused(f"cannot run {args[0]!r}: {exc.strerror or exc}") from None
+    if check and result.returncode != 0:
+        raise Refused(
+            f"{' '.join(args)} failed: {result.stderr.strip() or result.stdout.strip()}"
+        )
+    return result.stdout
+
+
+def primary_worktree() -> Path:
+    """The primary checkout of THIS repository, from any of its worktrees.
+
+    **A worktree's parent is not the repository's parent**, and taking it as
+    one is how a sibling lookup silently searches the wrong directory. Run from
+    `~/code/shipwright-feature`, `Path(__file__).parent.parent.parent` is
+    `~/code`, which is right by luck; run from `~/code/worktrees/x`, it is
+    `~/code/worktrees`, which is wrong and finds nothing. `--git-common-dir`
+    points at the primary repository's `.git` from inside any worktree, so its
+    parent is the primary checkout however this was invoked.
+    """
+    here = Path(__file__).resolve().parent.parent
+    common = run("git", "-C", str(here), "rev-parse", "--git-common-dir").strip()
+    return (Path(common) if Path(common).is_absolute() else here / common).resolve().parent
+
+
+def commit_of(repo: Path, ref: str) -> str:
+    """The commit `ref` names, or a refusal that says which repository failed."""
+    if not (repo / ".git").exists():
+        raise Refused(
+            f"{repo} is not a git checkout, so there is no ref to install from. "
+            f"This installs from a published ref rather than copying a directory."
+        )
+    try:
+        return run("git", "-C", str(repo), "rev-parse", f"{ref}^{{commit}}").strip()
+    except Refused as exc:
+        raise Refused(
+            f"{repo.name} has no {ref}: {exc}. Fetch it, or name another ref "
+            f"with --ref; this never falls back to the checkout's own HEAD, "
+            f"because a local HEAD is not what a release serves."
+        ) from exc
+
+
+def escapes(path: str) -> bool:
+    """Whether a normalised path leaves the tree.
+
+    `startswith("..")` IS WRONG AND REFUSES A LEGITIMATE NAME: a file called
+    `..foo` begins with two dots and goes nowhere. Only the component `..`
+    escapes, so the test is the component, not the prefix.
+    """
+    return path == ".." or path.startswith("../") or os.path.isabs(path)
+
+
+def checked_members(members: list[tarfile.TarInfo]) -> list[tarfile.TarInfo]:
+    """Every archive entry, or a refusal naming the first one that is wrong.
+
+    **This exists because `filter="data"` is unavailable on the platform this
+    installer targets** — Ubuntu 22.04's `python3.11` package is 3.11.0rc1 and
+    the filter landed in 3.11.4, so passing it raises `TypeError` there.
+
+    **IT IS NOT THE WHOLE OF WHAT `data` DOES, AND AN EARLIER VERSION CLAIMED IT
+    WAS.** A reviewer took that claim apart, and the useful part is that
+    a lexical check and `data` differ in kind: `data` resolves each name through
+    the tree it has already extracted, so it sees a path that goes through a
+    symlink; a `normpath` cannot, because `normpath` collapses `sub/l1/..` to
+    `sub` without knowing `l1` is a link. Rather than reimplement `realpath`
+    against a partially-extracted tree, this refuses the shapes that make the
+    difference exploitable:
+
+    - **Hard links are refused outright.** Their `linkname` is relative to the
+      ARCHIVE ROOT rather than to the member's directory, and the earlier code
+      resolved it the second way — so `a/b/h` linking to `../../x` normalised to
+      `x` and passed, while the real target was two levels above the tree.
+      `git archive` never emits one, so refusing them costs nothing.
+    - **Paths through a symlinked ancestor are NOT handled here**, and were,
+      by string bookkeeping that compared raw names and so missed `./s` versus
+      `s` and any case difference. `export_tree` asks the filesystem instead,
+      before each write, which is independent of how a name is spelled.
+    - **Modes are masked**, because `data` masks to 0o755 and forces owner
+      read and write while a bare `extractall` honours what the archive says.
+      Without this the same command produces a group-writable tree on one
+      interpreter and not on another.
+    """
+    checked: list[tarfile.TarInfo] = []
+    for member in members:
+        name = member.name
+        if name.startswith("/") or ".." in Path(name).parts:
+            raise Refused(f"refusing a tar entry that escapes the tree: {name}")
+        if member.islnk():
+            raise Refused(
+                f"refusing a hard link, whose target is resolved against the "
+                f"archive root rather than its own directory: {name}"
+            )
+        if not (member.isfile() or member.isdir() or member.issym()):
+            raise Refused(
+                f"refusing a tar entry that is not a file, directory or symlink: "
+                f"{name} (type {member.type!r})"
+            )
+        # **THE ARCHIVE MAY NOT CARRY THIS COMMAND'S OWN FILES.** The stamp is
+        # written after extraction and the venv is built into the area, so a
+        # tracked entry at either name would be followed rather than replaced —
+        # a tracked symlink at `STAMP` makes `write_text` overwrite whatever it
+        # points at, which a security review demonstrated by running it.
+        # Refused here rather than unlinked later, because a repository that
+        # tracks these names is wrong in a way the operator should hear about.
+        #
+        # **COMPARED CASE-INSENSITIVELY, BECAUSE THE FILESYSTEM IS.** This guard
+        # was an exact string match, and macOS's default APFS folds case, so
+        # `.Installed-By-Install-Backend` sailed past it and then WAS the stamp
+        # when `write_text` opened it. A second security review ran that:
+        # a tracked symlink at the case-variant name, exit 0, and a real source
+        # file in the deploy area replaced by the stamp's JSON — the exact
+        # failure the paragraph above says this guard prevents. `.VENV/...` did
+        # the same, landing a `.pth` in the venv's `site-packages`, which then
+        # EXECUTED on the next interpreter start.
+        #
+        # **`casefold()` RATHER THAN EITHER SIMPLER FOLDING, AND BOTH ARE REAL
+        # ALTERNATIVES SOMEONE COULD REACH FOR.** Four spellings that APFS
+        # resolves to these names were measured, and they split:
+        # U+017F LONG S and the `st` ligatures U+FB05 and U+FB06 survive
+        # `lower()`, while U+212A KELVIN SIGN survives `upper()`, being
+        # uppercase already. Only `casefold()` catches all four, and the
+        # reserved-name tests carry one input for each so that a rewrite to
+        # either simpler method fails rather than passing quietly.
+        #
+        # Over-refusing on a case-sensitive filesystem costs a repository
+        # nothing: the predicate was run over `git ls-tree` in all four
+        # shipping repositories and refuses nothing in any of them.
+        folded = name.casefold()
+        if (folded in (STAMP.casefold(), MARKER.casefold())
+                or Path(folded).parts[:1] == (".venv",)):
+            raise Refused(
+                f"refusing an archive that carries {name}, which is a name this "
+                f"installer writes into the deploy area itself"
+            )
+        if member.issym():
+            target = member.linkname
+            resolved = os.path.normpath(os.path.join(os.path.dirname(name), target))
+            if target.startswith("/") or escapes(resolved):
+                raise Refused(f"refusing a link that escapes the tree: {name} -> {target}")
+        # What `filter="data"` would have masked. Written out rather than as a
+        # conditional expression, because `a | b if c else d` parses in a way
+        # worth not making a reader check.
+        member.mode &= 0o755
+        if member.isfile() or member.isdir():
+            member.mode |= 0o600  # owner can always read and write what it installed
+        checked.append(member)
+    return checked
+
+
+def check_destination(into: Path, root: str, member: tarfile.TarInfo) -> str:
+    """Where `member` would be written, or a refusal. Asked BEFORE the write.
+
+    **The order is the whole of it.** This used to extract and then verify,
+    which cannot protect a write primitive: a security review built an archive
+    whose member `l` collides on a case-insensitive filesystem with an
+    already-extracted symlink `L -> d/sub/../victim`, ran it, and landed
+    `PWNED` OUTSIDE the tree. The check then refused — correctly, and far too
+    late. The write had happened, and the link that would have shown the escape
+    had been replaced by the file, so the later sweep saw nothing either.
+
+    Two questions of the DESTINATION, before anything opens it. Together they
+    are independent of case, of how a name is spelled, and of any bookkeeping
+    this module keeps about earlier members — which is why they replace the
+    ancestor tracking that used to compare raw strings and so missed `./s`
+    against `s`.
+    """
+    dest = os.path.join(into, member.name)
+    # **A DIRECTORY MEMBER MAY ONLY MEET A REAL DIRECTORY.** The first version
+    # of this exempted every directory member from the collision check, on the
+    # reasoning that `git archive` emits parent directories and re-extracting
+    # one writes through nothing. That is true of a real directory and false of
+    # a symlink wearing the same name: `tar.extract` of a directory calls
+    # `os.mkdir` (swallowing FileExistsError), then `os.chmod` and `os.utime`,
+    # and every one of those FOLLOWS the link. A security review reproduced it
+    # on stock macOS Python 3.9.6 — a directory outside the tree went from 0700
+    # to 0755, and the post-extract check refused afterwards, too late. The same
+    # predicate covers a regular file already sitting at a directory member's
+    # name, which otherwise raised an uncaught OSError on the next member
+    # beneath it.
+    occupied = os.path.lexists(dest)
+    meets_real_directory = (
+        member.isdir() and os.path.isdir(dest) and not os.path.islink(dest)
+    )
+    if occupied and not meets_real_directory:
+        raise Refused(
+            f"refusing {member.name}: something is already at that path, so "
+            f"extracting it would write through it"
+        )
+    parent = os.path.realpath(os.path.dirname(dest))
+    if parent != root and not parent.startswith(root + os.sep):
+        raise Refused(
+            f"refusing {member.name}: its directory resolves to {parent}, "
+            f"outside the tree being built at {root}"
+        )
+    return dest
+
+
+def export_tree(repo: Path, commit: str, into: Path,
+                subtree: str | None = None) -> int:
+    """`repo` at `commit`, extracted into `into`. Returns the file count.
+
+    `git archive` reads tracked blobs at a ref and nothing else, so an ignored
+    file cannot reach a deploy area even when it is sitting in the working tree
+    — which is rule 7's reason, and rule 3's protection in practice.
+
+    **`subtree` NAMES A DIRECTORY TO EXPORT AS THE ROOT**, for a component that
+    is one directory of a repository rather than the whole of it. `git archive`
+    takes `<commit>:<path>` as a tree-ish and emits its entries WITHOUT the
+    prefix, so `gateway/config.yaml` lands as `config.yaml`. That is what makes
+    `requirements.txt` and the stamp sit where the rest of this file already
+    expects them, with no stripping of its own.
+
+    **An untracked file under the subtree does not travel**, the same as for a
+    whole repository — `gateway/__pycache__` exists in the working tree here and
+    is absent from the archive, which is the point rather than a detail.
+    """
+    tree_ish = f"{commit}:{subtree}" if subtree else commit
+    # Named for the message below: the commit short, plus the subtree when
+    # there is one, so a refusal says which DIRECTORY could not be read rather
+    # than only which commit.
+    said = f"{commit[:9]}:{subtree}" if subtree else commit[:9]
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = Path(tmp) / "tree.tar"
+        with open(archive, "wb") as handle:
+            result = subprocess.run(
+                ["git", "-C", str(repo), "archive", "--format=tar", tree_ish],
+                stdout=handle, stderr=subprocess.PIPE, check=False,
+            )
+        if result.returncode != 0:
+            raise Refused(
+                f"could not archive {repo.name} at {said}: "
+                f"{result.stderr.decode(errors='replace').strip()}"
+            )
+        root = os.path.realpath(into)
+        with tarfile.open(archive) as tar:
+            members = checked_members(tar.getmembers())
+            # `filter="data"` IS NOT AVAILABLE ON THE PLATFORM THIS TARGETS.
+            # Ubuntu 22.04's `python3.11` package is 3.11.0rc1 — measured in a
+            # container — and the filter was backported in 3.11.4, so passing
+            # it there raises `TypeError`. It is applied where it exists, as a
+            # bonus rather than as the control.
+            supports_filter = "filter" in inspect.signature(tarfile.TarFile.extract).parameters
+            for member in members:
+                # **BEFORE THE WRITE, NOT AFTER, AND THAT ORDER IS THE WHOLE OF
+                # IT.** `check_destination`'s docstring says what it is
+                # protecting against and how that was found; it is written once,
+                # there, rather than restated at this call site.
+                dest = check_destination(into, root, member)
+                try:
+                    if supports_filter:
+                        tar.extract(member, into, filter="data")
+                    else:
+                        tar.extract(member, into)
+                except tarfile.TarError as exc:
+                    # THE FILTER'S OWN REFUSAL IS A REFUSAL, NOT A STACK TRACE.
+                    # `data` raises `LinkOutsideDestinationError` on some
+                    # versions, and letting it propagate printed a traceback
+                    # straight past the "never a stack trace" this module's
+                    # exception exists for. Measured: 3.14 and 3.10.12 raise
+                    # here where 3.11.16 rewrites the link instead.
+                    raise Refused(
+                        f"the archive was refused while extracting "
+                        f"{member.name}: {exc}"
+                    ) from None
+                # And the same question of the member once written, which is
+                # what catches a LINK that points outside — the pre-write check
+                # asks about its directory, not about where it leads. A link
+                # that escapes is caught here, before any later member can be
+                # written through it, and the pre-write collision check is what
+                # makes "any later member" true rather than hopeful.
+                landed = os.path.realpath(dest)
+                if landed != root and not landed.startswith(root + os.sep):
+                    raise Refused(
+                        f"refusing {member.name}: it resolves to {landed}, "
+                        f"outside the tree being built at {root}"
+                    )
+    # A FINAL SWEEP OVER THE WHOLE TREE, because the per-member check can only
+    # see chains whose links are already on disk, and because the three
+    # interpreters measured here disagree about what they do with an escaping
+    # link: 3.11.16's `data` filter REWRITES the target to keep it inside,
+    # 3.14 and 3.10.12 raise, and without the filter this file's own guard
+    # refuses. All three outcomes are safe, and none of them can be relied on to
+    # be the one that happened. This asserts the property instead of the route.
+    for path in into.rglob("*"):
+        if path.is_symlink():
+            landed = os.path.realpath(path)
+            if landed != root and not landed.startswith(root + os.sep):
+                raise Refused(
+                    f"refusing the built tree: {path.relative_to(into)} resolves "
+                    f"to {landed}, outside {root}"
+                )
+    # **MINUS THIS COMMAND'S OWN MARKER, which is in the tree BEFORE the extract
+    # starts** so that a kill mid-extract leaves a directory the next run can
+    # recognise as its own. Counting it would report one file more than the ref
+    # carries, in the stamp that answers "what is this serving".
+    # **THE ROOT MARKER ONLY, NOT EVERY FILE WITH THAT BASENAME.** Written as
+    # `p.name != MARKER` this dropped `sub/.built-by-install-backend` too — and
+    # that IS reachable, because `checked_members` refuses the name only as a
+    # whole root-level path, so a repository tracking it in a subdirectory
+    # installs it and the stamp then reports one file fewer than the ref
+    # carries. Both reviewers found it by running it.
+    return sum(1 for p in into.rglob("*") if p.is_file() and p != into / MARKER)
+
+
+def export_extra(repo: Path, commit: str, paths: tuple[str, ...],
+                 into: Path) -> int:
+    """Blobs from `paths` at `commit`, written into `into` by basename.
+
+    **READ WITH `git show`, NOT EXTRACTED FROM AN ARCHIVE, AND THE DIFFERENCE IS
+    WHERE THE NAME COMES FROM.** `checked_members` exists because an archive's
+    member names are chosen by whatever repository is being installed, so they
+    may try to escape the tree. These names are chosen HERE, in `Component`, and
+    only the basename is used — a repository cannot influence where its own
+    `builder_root.py` lands, because this never reads a name out of the
+    repository at all.
+
+    **A COLLISION IS A REFUSAL.** The subtree is extracted first, so a
+    repository that grows a `gateway/builder_root.py` of its own would otherwise
+    have it silently overwritten by the copy from `lib/`, and which of two
+    same-named modules the gateway imports would then depend on a line in this
+    file. Refusing says so instead.
+    """
+    written = 0
+    for path in paths:
+        name = Path(path).name
+        dest = into / name
+        if os.path.lexists(dest):
+            raise Refused(
+                f"refusing to place {path}: {name} is already in {repo.name}'s "
+                f"exported subtree, so one of the two would silently win"
+            )
+        result = subprocess.run(
+            ["git", "-C", str(repo), "show", f"{commit}:{path}"],
+            capture_output=True, check=False,
+        )
+        if result.returncode != 0:
+            raise Refused(
+                f"{repo.name} at {commit[:9]} has no {path}, which this "
+                f"component needs beside its own files: "
+                f"{result.stderr.decode(errors='replace').strip()}"
+            )
+        # **THE MODE IS SET AT CREATION, NOT INHERITED FROM THE UMASK**, which
+        # is what `checked_members` already guarantees for everything arriving
+        # through the archive: "Without this the same command produces a
+        # group-writable tree on one interpreter and not on another."
+        # `write_bytes` honours the umask, so this path reintroduced exactly
+        # that. Measured rather than reasoned: it produces 0o664 under
+        # `umask 002`, 0o666 under `umask 000` and 0o644 under `umask 022`,
+        # while the archive path produces 0o644 under all three.
+        #
+        # It matters here more than the asymmetry alone suggests. The file this
+        # places lands on the gateway's `PYTHONPATH` and is imported on every
+        # start, so group-writable means anyone in the group can choose what the
+        # gateway executes next time it restarts. `umask 002` is an ordinary
+        # default on a shared Linux machine, which is where an adopter's backend
+        # may well run.
+        #
+        # **`os.open` WITH THE MODE RATHER THAN A WRITE FOLLOWED BY `chmod`.**
+        # The two-step version leaves the file briefly more permissive than
+        # intended, which a security review raised as a small window
+        # inside the staging directory. Creating it with the mode removes the
+        # window instead of narrowing it, and `O_EXCL` makes the "something is
+        # already there" case an error rather than a silent overwrite — the
+        # same property the explicit collision check above asserts, now also
+        # enforced by the syscall.
+        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            os.write(fd, result.stdout)
+        finally:
+            os.close(fd)
+        # `os.open`'s mode argument is itself masked by the umask, so the file
+        # can still be created NARROWER than 0o644 (never wider). Widening it
+        # back is what makes the result independent of the environment in both
+        # directions, which is the property `checked_members` provides and the
+        # test asserts.
+        os.chmod(dest, 0o644)
+        written += 1
+    return written
+
+
+# **THE PROJECTS REGISTRY IS THE ADOPTER'S STATE, AND IT LIVES IN A DEPLOY AREA
+# EVERY INSTALL REPLACES.** agent-platform reads `config/projects.json` from its
+# own tree, `new-crew` registers each crew there, and the Library validates
+# products and review records against it (`AGENT_PLATFORM_PROJECTS` in
+# `jobs/library.toml`). The published export leaves the file out, because the
+# source repository's copy is Convivy's own registry, and ships
+# `config/projects.seed.json` instead. So a tree without a registry keeps the one
+# the replaced area held, which is what carries an adopter's registered crews
+# across an update, and a first install takes the seed.
+#
+# A tree that carries its own registry is left alone: that is a source-controlled
+# registry, and the file in the tree is the one meant to serve.
+REGISTRY_REPOSITORY = "agent-platform"
+REGISTRY = Path("config", "projects.json")
+REGISTRY_SEED = Path("config", "projects.seed.json")
+
+
+def _registry_text(top: Path, rel: Path) -> str | None:
+    """The text of `top/rel` when it is a regular file reached without
+    following a link at any component below `top`, and parses as a JSON object,
+    else None.
+
+    **EVERY COMPONENT, NOT THE LEAF ALONE.** `is_symlink()` sees only
+    `projects.json`, so a symlinked `config/` in the area passed it and `copy2`
+    read through it. The area is guarded only by a marker file anyone can forge,
+    so whatever such a link named would have become the registry the Library
+    authorizes against. A security review reproduced it.
+
+    **PARSED, BECAUSE A FILE THAT IS THERE IS NOT A REGISTRY.** A zero-byte or
+    truncated file left by a crash would otherwise be carried into every later
+    install."""
+    # **ONE COMPONENT AT A TIME, EACH OPENED RELATIVE TO THE LAST WITH
+    # `O_NOFOLLOW`**, so every check binds to the file actually read. A
+    # `realpath` check followed by a read re-walks the path, and a swap of
+    # `config/` between the two would read a file that was never checked.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fds: list[int] = []
+    try:
+        fds.append(os.open(top, flags | os.O_DIRECTORY))
+        for part in rel.parts[:-1]:
+            fds.append(os.open(part, flags | os.O_DIRECTORY, dir_fd=fds[-1]))
+        fd = os.open(rel.parts[-1], flags, dir_fd=fds[-1])
+        fds.append(fd)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        with os.fdopen(os.dup(fd), "rb") as handle:
+            text = handle.read().decode("utf-8")
+        if not isinstance(json.loads(text), dict):
+            return None
+    except (OSError, ValueError):
+        return None
+    finally:
+        for opened in fds:
+            os.close(opened)
+    return text
+
+
+# `owner/name` from a remote URL: `https://host/owner/name`, `ssh://user@host/
+# owner/name` and scp-style `user@host:owner/name`, each with or without `.git`.
+_REMOTE_RE = re.compile(
+    r"^(?:[a-z][a-z0-9+.-]*://(?:[^@/]+@)?[^/]+/|[^@/:\s]+@[^:/\s]+:)"
+    r"([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+?)(?:\.git)?/?$")
+
+
+# The bare repository `bin/install-payload` makes the knowledge checkout's
+# `origin` on an install without GitHub, and the name the registry gives it.
+LOCAL_REMOTE = Path(".remotes", "knowledge.git")
+LOCAL_REMOTE_NAME = "knowledge"
+
+
+def is_local_remote(url: str, root: Path) -> bool:
+    """Whether `url` is `<root>/.remotes/knowledge.git`, the remote an install
+    without GitHub has.
+
+    Only that one path. Any other local origin is still refused as naming no
+    repository, so this widens nothing beyond the remote the install itself
+    makes. A symlink at either component is refused, as install-payload
+    refuses one there.
+
+    **THE SAME DIRECTORY BY IDENTITY, NOT THE SAME PATH BY SPELLING.** An
+    `lstat` of each component followed by two `realpath` calls re-walks the
+    path between the check and the comparison, so a swap of `knowledge.git`
+    for a link in that window passed a remote that was never checked (security
+    review, round 1). Each component is opened relative to the last with
+    `O_NOFOLLOW`, as `_registry_text` does, and `url` is opened once; the two
+    descriptors must name one inode on one device."""
+    if not os.path.isabs(url):
+        return False
+    nofollow = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    fds: list[int] = []
+    try:
+        fds.append(os.open(root, os.O_RDONLY | os.O_DIRECTORY))
+        for part in LOCAL_REMOTE.parts:
+            fds.append(os.open(part, nofollow, dir_fd=fds[-1]))
+        expected = os.fstat(fds[-1])
+        fds.append(os.open(url, os.O_RDONLY | os.O_DIRECTORY))
+        named = os.fstat(fds[-1])
+    except OSError:
+        return False
+    finally:
+        for opened in fds:
+            os.close(opened)
+    return (named.st_dev, named.st_ino) == (expected.st_dev, expected.st_ino)
+
+
+def knowledge_repo_name(root: Path | None) -> str:
+    """The repository half of `owner/name` from the knowledge checkout's
+    `origin`, for the seed's `library` row.
+
+    **REFUSES RATHER THAN FALLING BACK TO `knowledge`**, except for the one
+    origin `is_local_remote` recognises, where `knowledge` is the repository's
+    name. The Library resolves a review record's repository through the
+    registry, so a row naming a repository the adopter does not have refuses
+    every review of the one they do, and says only "no such item". That is the
+    failure the rehearsal hit."""
+    if root is None:
+        raise Refused(
+            "cannot seed the projects registry: the Builder root is unknown, so "
+            "the knowledge checkout cannot be read. Pass --root, or run "
+            "bin/link-commands so `builder-root` can answer.")
+    checkout = root / "knowledge"
+    result = subprocess.run(["git", "-C", str(checkout), "remote", "get-url", "origin"],
+                            capture_output=True, text=True, check=False)
+    url = result.stdout.strip()
+    if result.returncode == 0 and is_local_remote(url, root):
+        return LOCAL_REMOTE_NAME
+    match = _REMOTE_RE.match(url) if result.returncode == 0 else None
+    if match is None:
+        # THE URL ITSELF IS NEVER QUOTED. An `origin` can carry a token
+        # (`https://<token>@host/...`), and the shape that fails this match is
+        # the one most likely to (security review, round 3). The command that
+        # shows it is named instead, for the operator to run.
+        if not url:
+            raise Refused(
+                f"cannot seed the projects registry: {checkout} has no `origin` "
+                f"remote. The registry's `library` row must name the knowledge "
+                f"repository, so set `origin` and re-run. agent-platform was not "
+                f"installed.")
+        raise Refused(
+            f"cannot seed the projects registry: {checkout} has an `origin` that "
+            f"does not name a GitHub repository as owner/name (see it with "
+            f"`git -C {checkout} remote get-url origin`). The registry's "
+            f"`library` row must name the knowledge repository, so set `origin` "
+            f"and re-run. agent-platform was not installed.")
+    return match.group(2)
+
+
+def seeded_registry(seed: str, knowledge: str) -> str:
+    """The seed with its `library` row naming the adopter's knowledge
+    repository, and only that one, so the registry claims no repository the
+    adopter does not have."""
+    data = json.loads(seed)
+    row = data.get("library")
+    if not isinstance(row, dict):
+        raise Refused(f"{REGISTRY_SEED} has no `library` row to name the knowledge "
+                      f"repository in. agent-platform was not installed.")
+    row["repos"] = [knowledge]
+    return json.dumps(data, indent=2) + "\n"
+
+
+def builder_root(given: Path | None, home: Path,
+                 staged: Path | None = None) -> Path | None:
+    """The Builder root: `--root`, else what `builder-root` prints, else None.
+
+    Asked the way `install-jobs` asks it: the linked copy first, never as root,
+    since another account could have placed either copy, and only a single
+    absolute path is accepted.
+
+    **THE STAGED AGENT-PLATFORM TREE IS THE LAST CANDIDATE**, because on a
+    first install nothing is linked yet: `stand-up-backend` runs the link step
+    after this one, so `--seed-registry` refused every first install that did
+    not pass `--root`. Its `builder-root` reads the `CREWS_ROOT` that
+    `install-payload` has already written. It is the export of the pinned ref,
+    which `export_tree` has checked and this install is about to place, and
+    NEVER the `--from` checkout's working tree, whose files no ref pins."""
+    if given is not None:
+        return given.expanduser()
+    if os.geteuid() == 0:
+        return None
+    exported = staged / "bin" / "builder-root" if staged is not None else None
+    for candidate in (home / ".local" / "bin" / "builder-root", shutil.which("builder-root"),
+                      exported):
+        if not candidate or not os.path.isfile(candidate):
+            continue
+        try:
+            result = subprocess.run([str(candidate)], capture_output=True, text=True,
+                                    check=False, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        out = result.stdout.strip()
+        if result.returncode == 0 and os.path.isabs(out) and "\n" not in out:
+            return Path(out)
+    return None
+
+
+def place_registry(staging: Path, area: Path,
+                   knowledge: Callable[[Path], str] | None = None,
+                   seed_registry: bool = False) -> str:
+    """Give a staged agent-platform tree its projects registry. Returns a note
+    for the install's report line.
+
+    `knowledge` is asked only when the seed is used, so an update, or an
+    install from a tree carrying its own registry, never reads the remote. It
+    is given `staging`, the one tree whose `builder-root` it may run.
+
+    **`seed_registry` IS FOR AN ADOPTER INSTALLING FROM SOURCE**, which until Builder is
+    public is every adopter. The source repository tracks Convivy's own
+    registry, so without it an adopter's registry names Convivy's crews and
+    none of theirs. With it the tree's registry is dropped from staging, and the
+    area gets what the published export would give it: the registry the
+    replaced area held, or else the seed."""
+    target = staging / REGISTRY
+    dropped = False
+    if seed_registry and (target.exists() or target.is_symlink()):
+        # Staging is this command's own fresh export, so removing a file from
+        # it touches nothing anyone else wrote.
+        target.unlink()
+        dropped = True
+    if target.exists() or target.is_symlink():
+        return "registry from the tree"
+    kept = _registry_text(area, REGISTRY)
+    seed = None if kept is not None else _registry_text(staging, REGISTRY_SEED)
+    if seed is not None:
+        if knowledge is None:
+            raise Refused("cannot seed the projects registry without the knowledge "
+                          "repository's name. agent-platform was not installed.")
+        seed = seeded_registry(seed, knowledge(staging))
+    text = kept if kept is not None else seed
+    if text is not None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # CREATED WITH ITS MODE, the way `export_extra` writes a file, rather
+        # than written and then `chmod`ed: under a loose umask the two-step
+        # version leaves the registry the Library authorizes against briefly
+        # group- or world-writable. The `chmod` after only widens a mode the
+        # umask narrowed, so the result is 0644 whatever the old area held.
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            os.write(fd, text.encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.chmod(target, 0o644)
+        if kept is not None:
+            return ("registry kept from the replaced area, not the tree's"
+                    if dropped else "registry kept from the replaced area")
+        unusable = (area / REGISTRY).exists() or (area / REGISTRY).is_symlink()
+        note = ("registry seeded; the replaced area's registry was not a regular "
+                "JSON file inside the area and was not kept" if unusable
+                else "registry seeded")
+        return f"{note}, not the tree's" if dropped else note
+    # A release from before the seed existed. Nothing is invented here: with no
+    # registry, agent-platform's own reads fail closed and the Library's
+    # validation is off, and the line below says so.
+    return (f"NO REGISTRY: neither {REGISTRY} nor {REGISTRY_SEED} is in this "
+            f"release and the replaced area held none")
+
+
+def build_venv(tree: Path, python: str, venv: Path | None = None,
+               program: Path | None = None) -> str | None:
+    """A venv from this tree's requirements, at `venv` or inside the tree.
+
+    Returns a one-line description, or None when the repository declares no
+    production requirements. **Rule 4 is why this is not optional**: a deploy
+    that pins code and leaves the interpreter in a development checkout has
+    pinned half of what decides which code runs.
+
+    **`venv` MAY SIT OUTSIDE `tree`, AND THEN THE EXISTING ONE IS PARKED RATHER
+    THAN DELETED.** A venv is not relocatable, so a component's venv has to be
+    built where its launcher will look for it; there is no staging copy to swap
+    in, and rebuilding over an earlier run's venv would layer one `pip install`
+    on another. So the path has to be cleared first.
+
+    **DELETING IT TO CLEAR IT MADE EVERY FAILED UPGRADE WORSE THAN NO UPGRADE,
+    AND THAT NEEDED NO KILL — AN ORDINARY `pip` FAILURE DID IT.** A component's
+    venv is outside the area `swap()` parks, so `install_one`'s rollback
+    restores the LIB tree to the commit that was working and nothing restores
+    the venv. Measured on a working component upgraded with `pip install`
+    failing once: the lib rolled back correctly and the venv's program was
+    gone, so the daemon could no longer start — where before the run it could.
+    A reviewer found it.
+
+    **The fix is the `previous` idiom this file already uses one field over.**
+    A rename does not touch the venv's contents, so the console-script shebangs
+    that make a venv unrelocatable stay valid: they name the original path, and
+    renaming the parked copy BACK to that path makes them correct again. While
+    parked the copy is not runnable, which does not matter, because the only
+    thing that ever happens to it is a rename in one direction or a delete.
+
+    **THE WINDOW WHERE THE PARKED COPY IS THE ONLY COMPLETE BUILD OPENS AT THE
+    RENAME AND CLOSES WHEN THE REBUILD FINISHES**, which is most of
+    `_fill_venv` — the `pip install` included, minutes of it. An earlier version
+    of this paragraph called it "between the two renames", borrowing the lib
+    side's `swap()` language; there is only ONE rename here, and what follows it
+    is `python -m venv` recreating the directory rather than a second rename.
+    The mis-description mattered: it made the window sound instantaneous, and
+    the recovery was written to match the description rather than the window.
+
+    So recovery is keyed on whether the live venv is COMPLETE rather than on
+    whether it exists. A kill part-way through leaves a live path that exists
+    and holds a partial build; testing existence skipped the recovery, and the
+    code then deleted the complete parked copy to make room for parking the
+    partial one. Rebuilding instead of recovering would be correct in the sense
+    that a venv is derivable from its requirements, and would still throw the
+    last good copy away at the moment this run might also fail — the defect
+    above, one window along.
+
+    **`program` IS ASSERTED AFTER THE INSTALL, AND IT IS NOT THE SAME CLAIM AS
+    "pip succeeded".** It names what the launcher execs. A requirements file
+    that resolves and installs can still leave no console script at the name the
+    launcher uses — a renamed entry point does exactly that — and the install
+    would then report success over a daemon that cannot start, which is the
+    failure this whole file is written against.
+    """
+    requirements = tree / REQUIREMENTS
+    if not requirements.is_file():
+        return None
+    out_of_tree = venv is not None
+    parked_venv: Path | None = None
+    if venv is None:
+        venv = tree / ".venv"
+    else:
+        parked = venv.with_name(venv.name + ".previous")
+        # RECOVER A CRASHED PARK BEFORE ANYTHING ELSE, so a failure in THIS run
+        # still has something to restore. See the docstring.
+        #
+        # **KEYED ON WHETHER THE LIVE VENV IS COMPLETE, NOT ON WHETHER IT
+        # EXISTS**, and the difference is a whole kill window. Written as
+        # `not os.path.lexists(venv)` this recovered only a kill between the
+        # rename and the start of the rebuild. A kill DURING `python -m venv`
+        # leaves a live path that exists and holds a partial build, so the
+        # branch was skipped — and the code below then deleted the complete
+        # parked copy to make room and parked the PARTIAL one in its place. The
+        # backup this whole mechanism exists to keep was destroyed by the run
+        # that was supposed to be protected by it.
+        #
+        # `program` is the same predicate `install_one.venv_present` uses: what
+        # the launcher execs, which a partial build does not have.
+        live_complete = program.is_file() if program is not None else venv.is_dir()
+        if os.path.lexists(parked) and not live_complete:
+            refuse_foreign(parked, "restore", COMPONENT_ADVICE)
+            if os.path.lexists(venv):
+                # A partial build, and it is in the way. Refused first, so a
+                # directory that is not this tool's is never removed.
+                refuse_foreign(venv, "replace", COMPONENT_ADVICE)
+                remove_ours(venv)
+            os.rename(parked, venv)
+        if os.path.lexists(venv):
+            # `os.path.lexists` RATHER THAN `Path.exists`, as
+            # `check_destination` already does one function over: a symlink to
+            # nothing is still something standing at the path, and `exists()`
+            # answers False for one — which would send this straight to
+            # `python -m venv` over a dangling link. `refuse_foreign` refuses
+            # any symlink here, dangling or not.
+            #
+            # **THROUGH `refuse_foreign` WITH `COMPONENT_ADVICE`, NOT A MESSAGE
+            # OF ITS OWN.** Written out here first, and the identical wrong
+            # advice was then left standing on the component's LIB path, which
+            # is the one an operator meets first — a fix applied where the
+            # problem was noticed rather than where it lives. One predicate and
+            # one advice constant now cover both.
+            refuse_foreign(venv, "replace", COMPONENT_ADVICE)
+            refuse_foreign(parked, "delete", COMPONENT_ADVICE)
+            if os.path.lexists(parked):
+                remove_ours(parked)
+            os.rename(venv, parked)
+            parked_venv = parked
+    try:
+        _fill_venv(tree, venv, python, program, requirements, out_of_tree)
+    except BaseException:
+        # PUT BACK WHAT WAS WORKING. `install_one` rolls the LIB tree back on
+        # the same exception; without this half the machine ends up with the
+        # old code and no venv, which is worse than the state the run started
+        # in.
+        remove_ours(venv, ignore_errors=True)
+        if parked_venv is not None:
+            os.rename(parked_venv, venv)
+        raise
+    if parked_venv is not None:
+        # `ignore_errors` deliberately, for the reason the lib side gives: the
+        # build has SUCCEEDED by here, and failing to remove the parked copy
+        # must not turn that into a nonzero exit.
+        remove_ours(parked_venv, ignore_errors=True)
+    frozen = run(str(venv / "bin" / "pip"), "freeze")
+    return f"{len(frozen.splitlines())} package(s) from {REQUIREMENTS}"
+
+
+def _fill_venv(tree: Path, venv: Path, python: str, program: Path | None,
+               requirements: Path, out_of_tree: bool) -> None:
+    """Create the venv at `venv` and install `requirements` into it.
+
+    Split out so that everything between clearing the path and a working venv
+    sits under one `try` in the caller, with nothing before it that a restore
+    would have to undo.
+    """
+    if out_of_tree:
+        # **BEFORE `python -m venv`, NOT AFTER IT, WHICH IS THE SAME CORRECTION
+        # THE STAGING MARKER ALREADY GOT ONE FUNCTION OVER** — and the lesson
+        # did not get re-applied here until a reviewer walked the state space.
+        # `python -m venv` is not instantaneous: it creates the tree and
+        # runs `ensurepip`'s wheel bootstrap. Written afterwards, a kill during
+        # that work left a non-empty directory with nothing saying this tool
+        # built it, `refuse_foreign` read it as somebody else's, and every later
+        # run stopped there — with the complete parked copy sitting untouched
+        # beside it and no path left that reached it. Recovery was `rm -rf` by
+        # hand, which is what "a failure part-way leaves a machine the same
+        # command can be re-run against" exists to prevent.
+        #
+        # `python -m venv` tolerates a pre-existing file in its target: measured
+        # rather than assumed, it exits 0, keeps the marker, and produces a
+        # working pip.
+        venv.mkdir(parents=True, exist_ok=True)
+        (venv / MARKER).write_text(
+            f"Built by {PROG}. Its presence is what allows this command to "
+            f"replace this directory; delete it and the command will refuse.\n",
+            encoding="utf-8",
+        )
+    run(python, "-m", "venv", str(venv))
+    print(f"{PROG}:   building the venv, which installs {REQUIREMENTS} and can "
+          f"take a while — do not start a second run")
+    pip = venv / "bin" / "pip"
+    if not pip.is_file():
+        raise Refused(f"{python} -m venv produced no pip at {pip}")
+    # `cwd=tree` SO A RELATIVE REQUIREMENT RESOLVES INSIDE THE AREA. Run with
+    # no cwd, an `-e .` or `./pkg` line resolves against whatever directory
+    # the operator happened to be in — putting an editable link to a
+    # development checkout into the deploy venv, which is precisely the
+    # rule 4 failure this whole file exists to prevent.
+    run(str(pip), "install", "--quiet", "--disable-pip-version-check",
+        "-r", str(requirements), cwd=tree)
+    # **WHAT THE LAUNCHER EXECS, ASKED OF THE FILESYSTEM.** `pip install`
+    # exiting 0 says the requirements resolved, which is a different claim from
+    # "the program is there under the name that will be run for it". Without
+    # this the install reports success and the daemon fails at exec, and launchd
+    # reports that exactly the way it reports a job that ran and did nothing.
+    if program is not None and not program.is_file():
+        raise Refused(
+            f"{REQUIREMENTS} installed, but its launcher runs {program}, which "
+            f"is not there. The venv was built and the requirements resolved, "
+            f"so what is wrong is the name rather than the install: check the "
+            f"console script the requirements provide."
+        )
+
+
+def read_stamp(area: Path) -> dict | None:
+    path = area / STAMP
+    if not path.is_file():
+        return None
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        # A STAMP THAT IS NOT THE SHAPE THIS WROTE IS UNREADABLE, NOT USABLE.
+        # `json.loads` happily returns a list or a string, and `stamp.get`
+        # then raises inside the one command whose job is to report what is
+        # being served. A security review found that.
+        if not isinstance(loaded, dict) or not isinstance(loaded.get("commit"), str):
+            return {"unreadable": True}
+        if not isinstance(loaded.get("installed_at"), str):
+            return {"unreadable": True}
+        return loaded
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError,
+            RecursionError):
+        # A stamp that cannot be read is reported rather than treated as
+        # absent: "absent" would silently reinstall over something, and the
+        # whole point of the stamp is answering what is being served.
+        #
+        # **`RecursionError` IS A `RuntimeError`, NOT A `ValueError`**, so the
+        # tuple above missed it and deeply nested JSON — `[` two hundred
+        # thousand times — came out of `json.loads` as a traceback. Measured on
+        # 3.9.6 (stock macOS), 3.10.12 and 3.11.0rc1 (Ubuntu 22.04's two),
+        # 3.10.21, 3.11.16, 3.12.13, 3.13.15, 3.14.5 and 3.14.7: EVERY ONE
+        # raises it. **THE FIRST THREE ARE THE INTERPRETERS THIS FILE NAMES AS
+        # TARGETS ELSEWHERE, so a list that omits them cannot support a claim
+        # about what this command supports** — which is the shape a version
+        # number takes when it is repeated from a message rather than run. Each
+        # was measured, because a wrong one here would invite a later reader to
+        # drop this handler as interpreter-specific.
+        # The stamp is the one input a person can leave in a deploy area by hand,
+        # and this branch is what keeps every malformed one a report rather
+        # than a crash — a hole in it made every run and every `--status`
+        # fail until the file was removed by hand.
+        return {"unreadable": True}
+
+
+def ours_to_remove(path: Path) -> bool:
+    """Whether this command may delete or move `path` aside.
+
+    Absent, an empty directory, or one carrying `MARKER`. Anything else belongs
+    to somebody else and is refused — a deploy root is an operator-supplied
+    path, and the directory sitting at `<root>/library` may be the Library
+    crew's working checkout.
+    """
+    if not path.exists():
+        return True
+    if not path.is_dir():
+        return False
+    if not any(path.iterdir()):
+        return True
+    return (path / MARKER).is_file()
+
+
+def remove_ours(path: Path, ignore_errors: bool = False) -> None:
+    """`shutil.rmtree`, but the MARKER is the last thing to go.
+
+    **WITH `ignore_errors=True` THIS CAN RETURN WITH `path` STILL PRESENT**, and
+    that is the contract rather than an accident: if a removal failure leaves
+    content behind, the marker stays with it so the directory is still
+    recognisable as this tool's. A caller that needs the path gone must pass
+    `ignore_errors=False`, where any failure raises.
+
+    **THREE CALLERS PASS `True`, AND ONLY ONE OF THEM CARES WHAT SURVIVED.** The
+    staging cleanup and the post-success `previous` cleanup both leave a marked
+    directory that the next upgrade finishes removing. The rollback is different
+    because its very next statement renames the parked copy back, which raises
+    `ENOTEMPTY` onto the original error if the area survived — loud rather than
+    silent, and the state it leaves (a marked, unstamped area beside a stamped
+    `.previous`) is what the restore branch recognises on the next run.
+
+    **A KILL BETWEEN `marker.unlink()` AND `rmdir()` LEAVES AN EMPTY DIRECTORY**,
+    which `ours_to_remove` accepts so nothing refuses it — but `ours_to_remove`
+    is the refusal predicate, and the restore needed its own clause to treat an
+    empty area as absent. That clause is in `install_one`; this docstring said
+    the state was handled when only half of it was.
+
+    **A KILL PARTWAY THROUGH A PLAIN `rmtree` WEDGES THE MACHINE, AND THAT IS
+    THE SAME DEFECT THE MARKER-BEFORE-EXTRACT FIX CLOSED ONE LEVEL UP.**
+    `shutil.rmtree` deletes in directory order and the marker is an ordinary
+    file to it, so where the marker goes early the kill leaves a non-empty
+    directory with nothing saying this tool built it. `refuse_foreign` then
+    reads it as somebody else's and refuses EVERY later run, with a message
+    blaming the operator's `--deploy`. Recovery is `rm -rf` by hand.
+
+    Both reviewers measured it independently rather than arguing it: on
+    this machine's APFS the marker is listed first, so 32 of 40 kills during a
+    3000-file removal, and 41 of 42 interruption points in a smaller one, left
+    exactly that state. A venv is thousands of files, so the window is seconds
+    wide. On a filesystem with a different scan order it is likelier than not
+    rather than near-certain, which is not a reason to leave it.
+
+    **THE WINDOW WAS MISSED BECAUSE THE WINDOWS WERE ENUMERATED FROM THE CODE'S
+    SHAPE** — the two renames, the extract, the `pip install` — rather than from
+    the question that actually generates the set: which operations take time
+    while `refuse_foreign` can read what they leave behind. Removal is one.
+    """
+    # **THE WHOLE BODY IS UNDER ONE GUARD, BECAUSE `ignore_errors=True` MUST NOT
+    # RAISE.** `iterdir`, `is_dir`, `is_symlink` and `is_file` are not inside any
+    # `try` of their own, so a `PermissionError` from any of them escaped to a
+    # caller that had asked for errors to be swallowed — turning a SUCCEEDED
+    # install into a traceback at the `previous` cleanup, and skipping the
+    # rollback's own `os.rename` at the failure path. `shutil.rmtree(...,
+    # ignore_errors=True)`, which this replaced, never raised. A reviewer found
+    # it.
+    try:
+        marker = path / MARKER
+        if not marker.is_file():
+            # Nothing to preserve the ordering of: an unmarked or empty
+            # directory, or a caller that has already been refused.
+            shutil.rmtree(path, ignore_errors=ignore_errors)
+            return
+        for child in path.iterdir():
+            if child.name == MARKER:
+                continue
+            # A LINK TO A DIRECTORY IS UNLINKED, NOT FOLLOWED. `is_dir()` alone
+            # is true for one, and `shutil.rmtree` on a link raises; following it
+            # would delete outside the tree.
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child, ignore_errors=ignore_errors)
+            else:
+                try:
+                    child.unlink()
+                except OSError:
+                    if not ignore_errors:
+                        raise
+        # **AND IF ANYTHING SURVIVED, THE MARKER STAYS WITH IT.** This is only
+        # reachable under `ignore_errors=True`, where a failed unlink is
+        # swallowed and the loop carries on: without this the marker was then
+        # removed from a directory that still held content, `rmdir` failed
+        # `ENOTEMPTY`, and that error was swallowed too — leaving exactly the
+        # unmarked non-empty directory this function exists to prevent, at three
+        # of its six call sites. Both reviewers found it independently,
+        # and the security review ran the two states side by side.
+        #
+        # Leaving the marker keeps the directory recoverable: `ours_to_remove`
+        # accepts it, so it is never refused. **The next UPGRADE finishes the
+        # removal, not the next run** — a run that finds the area current
+        # returns "unchanged" before any cleanup, so a kept `.previous` sits
+        # there until a new commit lands. It stays recoverable throughout,
+        # which is the property that matters, and a reviewer corrected this
+        # sentence.
+        if any(child.name != MARKER for child in path.iterdir()):
+            return
+        # LAST, and only once the directory is otherwise empty: from here a kill
+        # leaves an empty directory, which `ours_to_remove` already accepts.
+        marker.unlink()
+        path.rmdir()
+    except OSError:
+        if not ignore_errors:
+            raise
+
+
+# The second half of a refusal: what the operator should look at. **WHICH ONE
+# APPLIES IS A PROPERTY OF THE PATH, NOT OF THE REFUSAL**, and a message that
+# names the wrong one sends a person to a flag that cannot affect what they are
+# looking at. A component's directory is not under `--deploy` and no argument
+# moves it, so `DEPLOY_ADVICE` is actively misleading there — it was, on this
+# machine, for the one path an operator hits first.
+DEPLOY_ADVICE = (
+    "Check --deploy: it names the directory deploy areas are created IN, and "
+    "pointing it at a directory that already holds repositories of the same "
+    "name would destroy them."
+)
+COMPONENT_ADVICE = (
+    "This is a component's fixed path — its launcher names it outright, so no "
+    "argument to this command moves it. An earlier installer's copy is the "
+    "usual occupant; move or remove it to let {prog} own it."
+).format(prog=PROG)
+
+
+def refuse_foreign(path: Path, verb: str, advice: str = DEPLOY_ADVICE) -> None:
+    # A SYMLINK AT ONE OF THESE PATHS IS REFUSED RATHER THAN FOLLOWED. `is_dir`
+    # and `iterdir` both follow a link, so a link to a marked directory would
+    # read as ours and `shutil.rmtree` would then raise OSError on the link —
+    # a traceback, and on `.previous` a permanent one, since every later run
+    # hits it again until a person removes it by hand.
+    if path.is_symlink():
+        raise Refused(
+            f"{path} is a symlink. Refusing to {verb} it: this command writes "
+            f"real directories, and following a link here would act on "
+            f"whatever it points at."
+        )
+    if not ours_to_remove(path):
+        raise Refused(
+            f"{path} is not empty and was not built by {PROG} — it has no "
+            f"{MARKER}. Refusing to {verb} it. {advice}"
+        )
+
+
+def swap(staging: Path, area: Path, previous: Path,
+         advice: str = DEPLOY_ADVICE) -> bool:
+    """Move `staging` into place, parking any existing area at `previous`.
+
+    Returns whether something was parked, so the caller can roll back. A
+    directory rename cannot clobber a non-empty target, so the old area moves
+    aside first; between the two renames the area is briefly absent, and a
+    death there leaves the parked copy as the only complete tree on disk. The
+    next run RESTORES it rather than rebuilding — `install_one`'s `area_absent`
+    branch — because rebuilding first deletes that copy to make room.
+    """
+    refuse_foreign(previous, "delete", advice)
+    if previous.exists():
+        remove_ours(previous)
+    area.parent.mkdir(parents=True, exist_ok=True)
+    parked = area.exists()
+    if parked:
+        os.rename(area, previous)
+    os.rename(staging, area)
+    return parked
+
+
+def venv_interpreter(venv: Path) -> str | None:
+    """The interpreter a venv runs, with every link resolved, or None if it has none.
+
+    `python -m venv` links `bin/python` to the interpreter that built it, so the
+    resolved link names that interpreter. A link whose target is gone still
+    returns that target, which no longer exists: an interpreter upgrade that
+    removed it leaves a venv that cannot start.
+    """
+    exe = venv / "bin" / "python"
+    if not os.path.lexists(exe):
+        return None
+    return os.path.realpath(exe)
+
+
+def real_interpreter(python: str) -> str:
+    """The file `python` runs as, with every link resolved.
+
+    Asked of the interpreter itself, because a version manager's shim (pyenv,
+    asdf, mise) is a script that execs the real interpreter: resolving the
+    shim's own path names the script, which no venv was ever built on, and an
+    install would rebuild on every run. `_base_executable` is the interpreter a
+    venv built from `python` links to, even when `python` is itself a venv's.
+    Falls back to the resolved path when the interpreter cannot be asked.
+    """
+    exe = shutil.which(python) or python
+    try:
+        done = subprocess.run(
+            [exe, "-c", "import sys; print(getattr(sys, '_base_executable', sys.executable))"],
+            capture_output=True, text=True, check=False, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return os.path.realpath(exe)
+    told = done.stdout.strip()
+    if done.returncode != 0 or not told:
+        return os.path.realpath(exe)
+    return os.path.realpath(told)
+
+
+def install_one(name: str, source: Path, area: Path, ref: str,
+                python: str, dry_run: bool, subtree: str | None = None,
+                venv: Path | None = None, program: Path | None = None,
+                extra: tuple[str, ...] = (),
+                report_into: list[str] | None = None,
+                knowledge: Callable[[Path], str] | None = None,
+                seed_registry: bool = False,
+                python_named: bool = False) -> tuple[str, str]:
+    """Place one repository, or one component. Returns (state, detail).
+
+    `report_into`, when given, receives one line per process still running the
+    version this install replaced, or one line saying none is, or saying the
+    check could not run. See `tools/stale_holders.py`.
+
+    `subtree`, `extra`, `venv` and `program` are a component's differences from
+    a repository, and `Component` says why each exists. Absent, this places a
+    whole repository into `area` with its venv at `area/.venv`, which is what
+    the three backend repositories get.
+    """
+    commit = commit_of(source, ref)
+    stamp = read_stamp(area)
+
+    # **WHAT "the venv is there" MEANS, ASKED ONCE.** For a component it is the
+    # program the launcher execs; for a repository it stays the directory, which
+    # is the test that was here before and is not this change's to move.
+    def venv_present() -> bool:
+        if program is not None:
+            return program.is_file()
+        return (venv or area / ".venv").is_dir()
+
+    if stamp and not stamp.get("unreadable") and stamp.get("commit") == commit:
+        built_on = venv_interpreter(venv or area / ".venv")
+        asked = real_interpreter(python) if python_named and built_on else None
+        if built_on is not None and not os.path.exists(built_on):
+            # The interpreter the venv links to is gone, so nothing in the area
+            # can start, though the venv directory is still there.
+            detail = (f"code at {commit[:9]} but its venv's interpreter {built_on} "
+                      f"is gone — rebuilding")
+        elif asked is not None and built_on != asked and venv_present():
+            # **A NAMED --python THE VENV WAS NOT BUILT ON IS A REASON TO
+            # REBUILD.** Reporting "unchanged" left a venv on another account's
+            # interpreter, which a service running as another account can
+            # refuse to start from, with no way to move it short of deleting
+            # the area by hand. Only a named --python counts: the default is
+            # whatever ran this, which says nothing about what the operator
+            # wants the venv on.
+            detail = (f"code at {commit[:9]} but its venv was built on {built_on} "
+                      f"and --python is {asked} — rebuilding")
+        elif venv_present() or not (area / REQUIREMENTS).is_file():
+            return "unchanged", f"already serving {commit[:9]}"
+        else:
+            # The code is current and the interpreter is missing, which is half
+            # an install and exactly the state rule 4 warns about. Rebuild.
+            detail = f"code at {commit[:9]} but no venv — rebuilding"
+    else:
+        detail = f"{commit[:9]}"
+
+    staging = area.with_name(area.name + ".staging")
+    previous = area.with_name(area.name + ".previous")
+    # CHECKED BEFORE ANYTHING IS TOUCHED, all three paths, so a refusal happens
+    # while the machine is still exactly as it was.
+    #
+    # **AND ABOVE THE `dry_run` RETURN, BECAUSE A MODE WHOSE JOB IS TO PREDICT
+    # MUST NOT PREDICT THE OPPOSITE OF WHAT HAPPENS.** Below it, `--dry-run`
+    # printed "would install" and exited 0 against a `--deploy` holding somebody
+    # else's `library/`, while the real run refused with exit 2 — the mistyped
+    # `--deploy` case this marker exists for, wrong in the one mode a careful
+    # operator runs FIRST to avoid it. Reproduced by a reviewer, and no
+    # test named `--dry-run` at all.
+    #
+    # `--check` now exits 2 with the reason instead of reporting "stale", which
+    # is the truer answer: the area is not stale, it is not ours.
+    # **THE ADVICE FOLLOWS THE PATH.** All three of these hang off `area`, so a
+    # component's three are its fixed path and two siblings of it, none of them
+    # reachable by `--deploy`; a repository's three are exactly what `--deploy`
+    # names. `program` is what distinguishes the two, being set only by a
+    # component.
+    advice = COMPONENT_ADVICE if program is not None else DEPLOY_ADVICE
+    for path, verb in ((area, "replace"), (previous, "delete"), (staging, "delete")):
+        refuse_foreign(path, verb, advice)
+
+    if dry_run:
+        return "would install", detail
+    # **AN UNSTAMPED AREA BESIDE A PARKED COPY IS A CRASHED RUN, AND IT IS PUT
+    # BACK BEFORE ANYTHING ELSE HAPPENS.** Both reviewers found this
+    # independently. Building the venv after the swap, which is what makes the
+    # venv usable, widened the window between "the new tree is in place" and "the stamp says
+    # it is good" from two renames to a whole `pip install`, minutes of it, over
+    # the network. `except BaseException` does not run on SIGKILL, SIGTERM or a
+    # dropped ssh, so that window ends with the new tree unstamped at `area` and
+    # the last good, stamped copy parked at `previous`.
+    #
+    # Left alone, the next run's `swap()` deletes `previous` to make room, which
+    # destroys the only complete tree on disk before its replacement exists —
+    # and a second failure would then park the broken one as the thing it
+    # "restores". Restoring rather than refusing is what the definition of done
+    # asks for: a failure part-way leaves a machine the same command can be
+    # re-run against.
+    #
+    # **A KILL BETWEEN `swap()`'s TWO RENAMES LEAVES NO AREA AT ALL**, and that
+    # loses the good copy exactly the same way: `swap()` deletes `previous` to
+    # make room whether or not anything is standing at `area`. So the absent
+    # area is restored too. It is the narrower case of the two — the window is
+    # one rename rather than a whole `pip install` — but the outcome is
+    # identical, and a restore that covers only the wide window would have been
+    # a guard that reads as complete and is not.
+    parked_stamp = read_stamp(previous)
+    crashed_tree = not (area / STAMP).is_file() and (area / MARKER).is_file()
+    # `refuse_foreign(area, ...)` above has already raised on a symlink here, so
+    # `exists()` cannot be answering about a link's target.
+    #
+    # **AN EMPTY DIRECTORY COUNTS AS ABSENT, AND THAT IS NOT A TIDINESS POINT.**
+    # `remove_ours` unlinks the marker and then calls `rmdir`, so a kill between
+    # those two leaves an empty directory — and the two callers that remove
+    # `area` are the restore itself and the venv-failure rollback, both of which
+    # have the last complete tree parked at `.previous`. Without this clause the
+    # next run sees no marker (so not `crashed_tree`) and a path that exists (so
+    # not absent), skips the restore, and `swap()` then deletes that parked copy
+    # as the first thing it does. If the rebuild then fails, the machine has no
+    # serving tree and no copy of one.
+    #
+    # **AN EARLIER ROUND DECLINED THIS STATE BECAUSE NOTHING IN THE TOOL COULD
+    # PRODUCE IT** — true when `rename(staging, area)` was the only way an area
+    # appeared. `remove_ours` made it a second producer, so the reason stopped
+    # holding and nobody re-checked the decision that rested on it. The
+    # recoverability claim written beside that change was checked against
+    # `ours_to_remove`, which is the REFUSAL predicate, while the thing that
+    # needed to accept an empty area was the RESTORE predicate here. A security
+    # review found it.
+    area_absent = not area.exists() or (area.is_dir() and not any(area.iterdir()))
+    if (previous.is_dir() and parked_stamp and not parked_stamp.get("unreadable")
+            and (crashed_tree or area_absent)):
+        print(f"{PROG}: {name} — an earlier run did not finish; restoring "
+              f"{parked_stamp['commit'][:9]} before continuing")
+        if not area_absent:
+            remove_ours(area)
+        os.rename(previous, area)
+        stamp = read_stamp(area)
+        # THE SAME "ALREADY CURRENT" TEST AS THE ONE AT THE TOP OF THIS
+        # FUNCTION, including the `REQUIREMENTS` clause. A repository with no
+        # requirements file gets no venv by design, so testing `.venv` alone
+        # declared the restored copy incomplete and reinstalled over a tree that
+        # was already exactly right.
+        #
+        # **THROUGH `venv_present()` RATHER THAN A SECOND COPY OF THE
+        # PREDICATE.** Written out twice, the component's program test would
+        # have gone into one of them and not the other, and the restore would
+        # then call a component complete on the strength of a directory the top
+        # of this function already refuses to accept. Two checks over one
+        # subject reading different halves of it is how one of them goes stale.
+        if (stamp and stamp.get("commit") == commit
+                and (venv_present() or not (area / REQUIREMENTS).is_file())):
+            # **NOT "unchanged": THIS RUN CHANGED THE MACHINE.** It deleted an
+            # unfinished tree and moved a parked copy back into service. Reported
+            # as "unchanged", the closing line read "nothing changed; every area
+            # was already current", which is the one sentence an operator would
+            # use to decide they need not look.
+            return "restored", f"restored and now serving {commit[:9]}"
+    if staging.exists():
+        remove_ours(staging)
+    staging.mkdir(parents=True)
+    # **THE MARKER GOES IN BEFORE THE EXTRACT, NOT AFTER IT, AND THAT ORDER IS A
+    # THIRD KILL WINDOW.** Written after `export_tree` returned, a SIGTERM or a
+    # dropped ssh DURING the extract left a non-empty staging directory with no
+    # marker — and `refuse_foreign(staging, "delete")` above then refused every
+    # later run, with a message about a directory this tool did not build and
+    # advice to check `--deploy`. Both are wrong: this tool built it, seconds
+    # earlier. Only deleting it by hand cleared the machine, which is the
+    # opposite of the definition of done's "a failure part-way leaves a machine
+    # the same command can be re-run against". A reviewer reproduced it.
+    #
+    # It is the same shape as the two windows the restore covers, and it is the
+    # one nobody had built a state for — the tests modelled the windows the code
+    # was written for and not the one it was not.
+    (staging / MARKER).write_text(
+        f"Built by {PROG}. Its presence is what allows this command to "
+        f"replace this directory; delete it and the command will refuse.\n",
+        encoding="utf-8",
+    )
+    try:
+        # MINUS THE MARKER, which is this command's own file rather than
+        # deployed content. `export_tree` counts what it extracted, so the
+        # subtraction that used to be implicit in the ordering is now explicit;
+        # without it the stamp would report one file more than the ref carries.
+        files = export_tree(source, commit, staging, subtree)
+        # **INSIDE THE SAME `try`, SO A REFUSAL HERE CLEANS UP THE STAGING
+        # DIRECTORY TOO.** Placed after it and the collision refusal would leave
+        # a marked, half-built staging tree behind on every run.
+        files += export_extra(source, commit, extra, staging)
+        registry = (place_registry(staging, area, knowledge,
+                                   seed_registry=seed_registry)
+                    if name == REGISTRY_REPOSITORY and subtree is None else None)
+    except BaseException:
+        # A partial tree that looks finished is what gets served by mistake, and
+        # the deploy area already in place stays untouched and keeps working.
+        remove_ours(staging, ignore_errors=True)
+        raise
+
+    # **THE VENV IS BUILT AFTER THE SWAP, AT ITS FINAL PATH, BECAUSE A VENV IS
+    # NOT RELOCATABLE.** Built in `<area>.staging` and renamed, every console
+    # script in `.venv/bin` keeps a shebang naming the staging path, which stops
+    # existing at the rename: `.venv/bin/pip --version` then fails with `bad
+    # interpreter`. `.venv/bin/python` survives only because it RESOLVES to the
+    # base interpreter, which is what made this look fine — the interpreter
+    # a job declaration names still starts, and everything else in the venv is
+    # dead. Found by a reviewer and confirmed by running that one line
+    # against a real deploy area; no test here could see it, because every
+    # fixture has an empty `requirements.txt` and so installs no console script.
+    swapped_at = time.time()
+    parked = swap(staging, area, previous, advice)
+    try:
+        packages = build_venv(area, python, venv, program)
+        # THE STAMP IS WRITTEN LAST. It is the answer to "what is this serving",
+        # so it must not exist until the thing it describes is complete: a stamp
+        # beside a half-built venv reports a working install.
+        (area / STAMP).write_text(
+            json.dumps({
+                "repository": name,
+                "commit": commit,
+                "ref": ref,
+                "source": str(source),
+                # `datetime.timezone.utc` RATHER THAN `datetime.UTC`, and it is
+                # not a style preference. `datetime.UTC` arrived in 3.11, and
+                # Ubuntu 22.04's stock `python3` is 3.10 — measured in a
+                # container, where this file would not even IMPORT:
+                # `cannot import name 'UTC' from 'datetime'`. Every shebang
+                # here is `#!/usr/bin/env python3`, so on the platform this
+                # installer exists to support, that import decided the command
+                # could not run at all.
+                "installed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "files": files,
+            }, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except BaseException:
+        # Roll back to what was serving. Building after the swap buys a working
+        # venv at the cost of a window where the area is new and unstamped, and
+        # this is what pays that cost back.
+        remove_ours(area, ignore_errors=True)
+        if parked:
+            os.rename(previous, area)
+        raise
+
+    # **WHO IS STILL RUNNING WHAT THIS REPLACED, ASKED BEFORE THE PARKED COPY
+    # GOES.** Once it is deleted, a process still holding it shows a path that
+    # no longer exists, and a process that loaded pure Python shows nothing at
+    # all. This reports and never restarts: restarting a live daemon or a
+    # session's MCP server is the operator's decision, not an installer's.
+    # A first install replaced nothing, so there is nothing to say about it.
+    if report_into is not None and parked:
+        report_into.extend(stale_holders.holders(previous, area, swapped_at).lines(name))
+    if parked:
+        # `ignore_errors` deliberately: the install has SUCCEEDED by here, and
+        # failing to remove the parked copy must not turn that into a nonzero
+        # exit that the next run then reports as "unchanged" while never
+        # cleaning up.
+        remove_ours(previous, ignore_errors=True)
+    return "installed", (f"{commit[:9]}, {files} file(s)"
+                         + (f", {packages}" if packages else "")
+                         + (f", {registry}" if registry else ""))
+
+
+@dataclass(frozen=True)
+class Placement:
+    """One thing to place, resolved against this machine.
+
+    **ONE RECORD READ BY BOTH `--status` AND THE INSTALL**, rather than a dict
+    of areas beside a dict of venvs. The two would be built from the same names
+    and then drift on the fields only one of them reads — which is how
+    `--status` comes to report a component healthy on a venv path the install
+    stopped using.
+    """
+
+    name: str
+    source: Path
+    area: Path
+    subtree: str | None = None
+    venv: Path | None = None
+    program: Path | None = None
+    extra: tuple[str, ...] = ()
+
+    def venv_present(self) -> bool:
+        if self.program is not None:
+            return self.program.is_file()
+        return (self.venv or self.area / ".venv").is_dir()
+
+
+def status(placements: tuple[Placement, ...]) -> int:
+    """What each deploy area is serving.
+
+    The deploy-area rule: "it must be possible to ask what commit a service is serving and get
+    an answer, because the whole failure this decision addresses was that
+    nobody could tell."
+    """
+    missing = 0
+    for placement in placements:
+        name, area = placement.name, placement.area
+        stamp = read_stamp(area)
+        if stamp is None:
+            print(f"  {name:<16} not installed at {area}")
+            missing += 1
+        elif stamp.get("unreadable"):
+            print(f"  {name:<16} {area}/{STAMP} is unreadable — reinstall to fix")
+            missing += 1
+        else:
+            # **THROUGH THE PLACEMENT, NOT `area/".venv"`.** A component's venv
+            # is not inside its area at all, so the literal path reported every
+            # component `NO VENV` while its gateway was running — a status line
+            # that is wrong in the direction an operator acts on.
+            venv = "venv" if placement.venv_present() else "NO VENV"
+            # Which interpreter it runs, so an operator can see a venv still on
+            # another account's Python before asking `--python` to move it.
+            built_on = venv_interpreter(placement.venv or area / ".venv")
+            if placement.venv_present() and built_on:
+                venv = (f"venv on {built_on}" if os.path.exists(built_on)
+                        else f"VENV INTERPRETER GONE ({built_on})")
+            print(f"  {name:<16} {stamp['commit'][:9]}  {stamp['installed_at']}  {venv}")
+    return 1 if missing else 0
+
+
+def outstanding() -> list[str]:
+    """What this cannot do, named with the exact command or file.
+
+    Named on stdout rather than left in a comment, because the installer this
+    replaces ended with its manual steps in its closing text and that is where
+    they stayed.
+    """
+    return [
+        (
+            "Supervision is not installed by this. It is rendered from job "
+            "declarations by the command that already does it, and pointing a "
+            "job at a deploy area is what the deploy-area rule is about:"
+        ),
+        "    bin/install-jobs --help",
+        "",
+        (
+            "An install NEVER copies or overwrites a credential or configuration, "
+            "since copying one multiplies where it lives and overwriting one "
+            "destroys a working machine. The LLM gateway's code and venv ARE "
+            "placed by this, so its one remaining requirement is the secrets "
+            "file. It holds provider keys issued to you, which no install can "
+            "generate, and its refusal without one is deliberate. Create it yourself:"
+        ),
+        "    install -m 600 /dev/null ~/.config/convivy/llm-gateway.env",
+        "    # then add KEY=value lines; see agent-platform gateway/README",
+        "",
+        (
+            "The gateway's location is its launcher's rather than this "
+            "command's: llm-gateway-run.sh names ~/.local/lib/llm-gateway and "
+            "~/.local/venv-llm-gateway outright, so --deploy does not move "
+            "them and neither does anything else. Until that script takes an "
+            "override the way it already takes LLM_GATEWAY_ENV_FILE, those two "
+            "paths are where the gateway is."
+        ),
+        "",
+        "Code that names one machine is each owning crew's to convert, and this does not touch it.",
+        "",
+        (
+            "Packages this machine lacks are a separate command, which verifies "
+            "every program by running it rather than trusting the package "
+            "manager:"
+        ),
+        "    bin/provision-backend --check",
+        "",
+        (
+            "The MCP servers are not registered by this. Until they are, a "
+            "session on this machine has no Reference Room and no work queue, "
+            "which is the one gap nothing used to name:"
+        ),
+        "    bin/register-mcp --check",
+    ]
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Place Builder's backend in deploy areas, from a published ref.",
+    )
+    parser.add_argument("--from", dest="source", type=Path, default=None,
+                        help="directory holding the repository checkouts "
+                             "(default: this repository's parent)")
+    parser.add_argument("--deploy", type=Path, default=None,
+                        help="deploy root (default: ~/.local/deploy, or "
+                             "$BUILDER_DEPLOY_ROOT)")
+    parser.add_argument("--ref", default="origin/main",
+                        help="ref to install from (default: origin/main). Never "
+                             "the checkout's HEAD unless you name it.")
+    parser.add_argument("--only", action="append", choices=PLACEABLE,
+                        help="place only this repository or component; repeatable")
+    parser.add_argument("--root", type=Path, default=None,
+                        help="the Builder root, whose knowledge/ checkout names the "
+                             "knowledge repository when the projects registry is "
+                             "seeded (default: what `builder-root` prints)")
+    parser.add_argument("--python", default=None,
+                        help="interpreter to build each deploy venv with (default: "
+                             "the one running this); named, it also rebuilds an area "
+                             "whose venv was built on another")
+    parser.add_argument("--seed-registry", action="store_true",
+                        help="ignore the projects registry an agent-platform tree "
+                             "carries and keep the replaced area's or take the seed, "
+                             "as the published export does. For an adopter "
+                             "installing from source, whose tree carries the "
+                             "maintainers' own registry.")
+    # **A COMPONENT'S PATHS HANG OFF THIS RATHER THAN OFF `--deploy`**, because
+    # its launcher hardcodes them; `Component` says why. Moving it is how a test
+    # places the gateway without touching the machine's live one, and it is not
+    # a deployment layout: the shipped declaration says `{home}`, which
+    # `install-jobs` resolves to the real home whatever was passed here.
+    parser.add_argument("--home", type=Path, default=None,
+                        help="home directory a component's fixed paths hang off "
+                             "(default: this account's). For tests.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--status", action="store_true",
+                      help="what each deploy area is serving")
+    mode.add_argument("--dry-run", action="store_true",
+                      help="say what would happen, change nothing")
+    mode.add_argument("--check", action="store_true",
+                      help="report only; exit 1 if anything is missing or stale, 2 if a deploy path is refused")
+    args = parser.parse_args(argv)
+
+    # `Path("")` IS `PosixPath('.')`, WHICH IS TRUTHY. Writing this as
+    # `Path(os.environ.get(NAME, "")) or default` silently deploys into the
+    # current working directory whenever the variable is unset — an empty
+    # string and an unset variable are the same thing to `get`, and neither is
+    # falsy once it has been through `Path`.
+    from_env = os.environ.get("BUILDER_DEPLOY_ROOT")
+    root = args.deploy or (Path(from_env) if from_env else Path.home() / ".local" / "deploy")
+    root = root.expanduser()
+    if not root.is_absolute():
+        raise Refused(f"--deploy must be an absolute path: {root}")
+
+    home = (args.home or Path.home()).expanduser()
+    if not home.is_absolute():
+        raise Refused(f"--home must be an absolute path: {home}")
+
+    names = tuple(args.only) if args.only else PLACEABLE
+
+    # THE SIBLINGS LIVE BESIDE THE PRIMARY CHECKOUT, so this is its parent
+    # rather than the checkout itself. Written the other way first, and the
+    # dry-run caught it: it looked for `library` INSIDE `shipwright`, refused
+    # clearly, and named the directory it had searched — which is the only
+    # reason it took seconds rather than a puzzled read of the code.
+    #
+    # **RESOLVED BEFORE `--status` RETURNS, BECAUSE A COMPONENT'S SOURCE IS
+    # ANOTHER NAME ENTIRELY**: the gateway comes out of `agent-platform`, so a
+    # placement cannot be built from its own name the way a repository's can.
+    source_root = (args.source or primary_worktree().parent).expanduser().resolve()
+
+    placements = []
+    for name in names:
+        component = COMPONENTS_BY_NAME.get(name)
+        if component is None:
+            placements.append(Placement(name=name, source=source_root / name,
+                                        area=root / name))
+        else:
+            placements.append(Placement(
+                name=name,
+                source=source_root / component.repository,
+                area=component.lib_at(home),
+                subtree=component.subtree,
+                venv=component.venv_at(home),
+                program=component.program_at(home),
+                extra=component.extra,
+            ))
+    placements = tuple(placements)
+
+    if args.status:
+        print(f"{PROG}: deploy root {root}")
+        return status(placements)
+
+    # **THE CHECKOUTS A COMPONENT NEEDS, NOT THE NAMES ASKED FOR.** Keyed on the
+    # requested names, `--only llm-gateway` looked for a checkout called
+    # `llm-gateway` and refused, naming a repository that has never existed.
+    wanted = {placement.source for placement in placements}
+    missing = sorted(p.name for p in wanted if not (p / ".git").exists())
+    if missing:
+        raise Refused(
+            f"no checkout for {', '.join(missing)} under {source_root}. "
+            f"Name the directory holding them with --from."
+        )
+
+    results = []
+    still_running: list[str] = []
+    for placement in placements:
+        report: list[str] = []
+        state, detail = install_one(
+            placement.name, placement.source, placement.area, args.ref,
+            args.python or sys.executable, args.dry_run or args.check,
+            subtree=placement.subtree, venv=placement.venv,
+            program=placement.program, extra=placement.extra,
+            report_into=report,
+            knowledge=lambda staged: knowledge_repo_name(builder_root(args.root, home, staged)),
+            seed_registry=args.seed_registry,
+            python_named=args.python is not None,
+        )
+        results.append((placement.name, state, detail))
+        print(f"{PROG}: {placement.name:<16} {state} — {detail}")
+        for line in report:
+            print(line)
+        still_running += [line for line in report if "is still running" in line]
+
+    stale = [n for n, s, _ in results if s != "unchanged"]
+    if args.check:
+        if stale:
+            print(f"\n{PROG}: {len(stale)} deploy area(s) stale or missing: "
+                  f"{', '.join(stale)}")
+            return 1
+        print(f"\n{PROG}: all {len(results)} deploy area(s) current")
+        return 0
+
+    if not args.dry_run:
+        # SAYS WHICH, NOT HOW MANY. "3 installed" reads the same whether it
+        # placed what you meant or three things you did not. And a restore is
+        # named separately from an install, because it is the line that tells an
+        # operator a previous run died here.
+        placed = [n for n, s, _ in results if s == "installed"]
+        restored = [n for n, s, _ in results if s == "restored"]
+        parts = []
+        if placed:
+            parts.append(f"installed {', '.join(placed)}")
+        if restored:
+            parts.append(f"restored {', '.join(restored)} after an unfinished run")
+        print(f"\n{PROG}: " + (
+            "; ".join(parts) if parts
+            else "nothing changed; every area was already current"
+        ))
+        # THE ONE LINE AN OPERATOR MUST NOT MISS, repeated after the summary
+        # because the per-area lines above scroll past on a real install.
+        if still_running:
+            print(f"{PROG}: {len(still_running)} process(es) are still running a "
+                  f"version this replaced, listed above. This installer does not "
+                  f"restart them; restart each one to run what was just installed.")
+
+    print()
+    for line in outstanding():
+        print(line)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except Refused as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None

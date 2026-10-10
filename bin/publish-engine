@@ -1,0 +1,983 @@
+#!/usr/bin/env python3
+"""publish-engine — build the public tree of one of Builder's engine repositories.
+
+`publish-payload` builds the install path. Someone who wants to change
+Builder's engine forks the engine's own repositories, so each of them needs a
+public counterpart too, and like the payload each is an EXPORT at a release
+rather than the private repository made public.
+
+WHY THIS IS NOT A COPY OF publish-payload. The payload is a curated subtree
+that a purity checker gates on every pull request. An engine repository has no
+such subtree: its export is the whole repository, and nothing gated what went
+into it. So this reads the built tree with four detectors, and each exists
+because the others cannot see what it sees:
+
+  1. SYMLINKS. A committed link ships as its target text, and a link into
+     someone's machine dangles everywhere else.
+  2. THE `.example` SIBLING CHECK. A `.example` file exists because somebody
+     decided the real file should not be committed, so the real file sitting
+     beside it in the export is that decision being overridden. This reads a
+     decision the repository already records rather than guessing what a
+     secret looks like, and it catches a tracked per-machine file whose
+     content no pattern would flag.
+  3. THE CONTENT SCAN, the only thing that finds a credential or an address
+     in a file named nothing like a config: a test, a script, a document. It
+     reports where and what kind, and for an email address the domain, and
+     NEVER THE MATCHED VALUE, because a report of a leaked credential that
+     prints it is a second leak into a terminal and a log.
+  4. THE VALUE-BLIND CLASSIFIER, for configuration files. It prints each
+     secret-shaped key's NAME and a class (empty, environment reference,
+     literal scalar, inline value of N characters), and never the value, so
+     clearing a config file cannot leak what is in it.
+
+The sibling check and the content scan each catch something the other misses,
+in the same directory, which the tests show with one fixture.
+
+EVERY FINDING IS COLLECTED BEFORE REFUSING, and a refusal DISCARDS THE TREE.
+Stopping at the first finding would turn a cleanup into one round trip per
+finding, and a half-built tree that looks finished is what gets published by
+mistake.
+
+WHAT THIS DOES NOT DECIDE. Which tests, property lists and per-machine files
+cross into each export is each repository owner's call. EXCLUDE starts empty,
+so the gate refuses what is not clean, and the refusal is the list of what an
+owner has to decide about. A bare hostname is not detected: no shape
+distinguishes one from any other word, and the purity checker keeps names as a
+closed list for that reason.
+
+WHAT THIS REFUSES TO DO. It does not push, create a repository, or change any
+repository's visibility. It writes a directory. Publishing is a separate,
+deliberate act by a person, because content once fetched stays fetched.
+"""
+
+from __future__ import annotations
+
+import argparse
+import functools
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+from datetime import UTC, datetime
+from pathlib import Path
+
+import tomllib
+
+PROG = "publish-engine"
+BIN = Path(__file__).resolve().parent
+REPO = BIN.parent
+
+# Written into every tree this tool builds, and the only thing that makes a
+# directory eligible for --force to replace.
+BUILD_MARKER = ".built-by-publish-engine"
+
+
+def load(name: str, path: Path):
+    """A sibling script as a module, refusing when it is not there."""
+    if not path.is_file():
+        raise SystemExit(f"{PROG}: {path} is missing; nothing was built")
+    spec = importlib.util.spec_from_loader(
+        name, importlib.machinery.SourceFileLoader(name, str(path))
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# THE SHARED PIECES COME FROM publish-payload rather than being copied, so a
+# fix to how a ref is resolved or a licence file is read reaches both exports.
+payload = load("publish_payload", BIN / "publish-payload")
+Refused = payload.Refused
+run = payload.run
+
+# Every engine repository: all of publish-payload's but the one it exports.
+ENGINES = tuple(name for name in payload.KNOWN_REPOSITORIES if name != "shipwright")
+
+# PATHS LEFT OUT OF EACH EXPORT, as git pathspecs. Empty to start: each owner
+# decides what crosses, and until they do the gate refuses what is not clean.
+EXCLUDE: dict[str, tuple[str, ...]] = {name: () for name in ENGINES}
+# agent-platform's `config/projects.json` is Convivy's own projects registry: it
+# names the company's crews, its private crews and the people behind them, and
+# the private-crew rule keeps all of that off an adopter's machine. Its owner
+# ruled it out of the export. The release carries `config/projects.seed.json`,
+# and `install-backend` writes the registry from that.
+EXCLUDE["agent-platform"] = ("config/projects.json",)
+# convivy-deck's `inbox/` holds memos between Convivy's crews, which are
+# correspondence rather than product. Its `.github/workflows/ci.yml` runs on a
+# self-hosted runner that exists only on Convivy's machine, so it cannot run in
+# a public repository; an adopter builds and tests with `swift build` and
+# `swift test`. Its owner ruled both out of the export.
+EXCLUDE["convivy-deck"] = ("inbox", ".github/workflows/ci.yml")
+
+# FILES LEFT OUT OF EACH EXPORT WHOSE PATH IS ITSELF PRIVATE, as (sha256 of the
+# exact tracked path, reason). This file ships, and the purity checker refuses
+# a machine's name in it, so a path that carries one is pinned by its hash the
+# way an ALLOW entry pins a value. Each entry is one file, never a directory,
+# and is matched against the paths tracked at the exported commit.
+EXCLUDE_HASHED: dict[str, tuple[tuple[str, str], ...]] = {name: () for name in ENGINES}
+# Four tools set up one operator's own pair of Macs (volume mounts, and an ssh
+# config naming that operator's tailnet hosts and user), and the fifth is a
+# bash test that pins the ssh tool's hostnames and cannot run without it. An
+# adopter has none of those machines. agent-platform's owner ruled all five out.
+EXCLUDE_HASHED["agent-platform"] = (
+    ("7843404144ed9d99e0a507fcbb1d76512d6b94ab1b3776cd704b75036a404f87",
+     "a tool that mounts one operator's volumes"),
+    ("eb993213f4ec159ed4765aeababc13e116b01c5ea8d30a4552b4a20434223446",
+     "a tool that remounts one operator's volumes"),
+    ("5e063469c7155bd88bc01091cf84eab846405592a7e6023d3431b11e48524f46",
+     "the retired predecessor of the remount tool"),
+    ("a842d2243efd2f981444844e7682e0235a007f89541009ee23e30da37ae82128",
+     "a tool that writes an ssh config naming one operator's hosts and user"),
+    ("515ca98957dcb7a346961974afb88c1dc77d6bbb836ed5509e55fef56b0930bb",
+     "the bash test of that ssh config tool, which pins its hostnames"),
+)
+
+
+def hashed_exclusions(name: str, root: Path, commit: str) -> list[str]:
+    """The tracked paths at `commit` that an EXCLUDE_HASHED entry names."""
+    pinned = {digest for digest, _ in EXCLUDE_HASHED[name]}
+    if not pinned:
+        return []
+    result = subprocess.run(
+        ["git", "-C", str(root), "ls-tree", "-r", "-z", "--name-only", commit],
+        capture_output=True, check=False,
+    )
+    if result.returncode != 0:
+        raise Refused(
+            f"could not list {name} at {commit}: "
+            f"{scrubbed(result.stderr.decode(errors='replace').strip())}"
+        )
+    paths = result.stdout.decode("utf-8", "surrogateescape").split("\0")
+    return [path for path in paths if path and fingerprint(path) in pinned]
+
+# FINDINGS ACCEPTED IN EACH EXPORT, as (path, kind, fingerprint, reason). Empty
+# to start. This is for a redaction fixture, which is synthetic by construction:
+# a test asserting that a scrubber turns a token into `[redacted]` has to carry
+# a token. Every entry needs its reason, because an exemption without one
+# becomes a hole nobody remembers agreeing to.
+#
+# THE FINGERPRINT PINS THE ENTRY TO ONE VALUE: the sha256 of the exact text the
+# detector matched, computed by fingerprint(). An entry keyed on file and kind
+# alone cleared every value of that kind in the file, so a real address added
+# beside the fixture, or swapped in for it, shipped with no finding (security
+# review: convivy-orient's main held a different address on the very line its
+# allowance covers). The hash stores no value in this public file.
+ALLOW: dict[str, tuple[tuple[str, str, str, str], ...]] = {name: () for name in ENGINES}
+
+# THE CONTENT SCAN'S PATTERNS ARE THE PURITY CHECKER'S, SELECTED BY LABEL, so
+# a pattern fixed there is fixed here. A label missing from the checker is a
+# refusal rather than a smaller scan: a relabel there must not silently drop a
+# category here. The checker's internal-id, company-domain, repository-reference
+# and crew-name categories are left out, because they describe the payload's
+# vocabulary rather than a person, a machine or a credential. Its person's-name
+# pattern and its launchd label are in, since a person and a machine are what
+# this scan exists to keep out (security review, round 1).
+PERSON = ("a person's name",)
+HOME = (
+    "a macOS home directory path",
+    "a Linux home directory path",
+    "a Windows home directory path",
+)
+CREDENTIAL = (
+    "a GitHub token",
+    "a GitHub fine-grained token",
+    "an API key",
+    "an AWS access key id",
+    "an AWS temporary access key id",
+    "a private key",
+    "a Slack token",
+    "a Slack app-level token",
+    "a JSON Web Token",
+    "a Stripe API key",
+    "a Stripe webhook signing secret",
+    "a Google API key",
+    "a connection string with an embedded password",
+)
+MACHINE = (
+    "a Tailscale address",
+    "a Tailscale IPv6 address",
+    "an IPv6 address in a globally routable or unique-local range",
+    "a tailnet hostname",
+    "a volume mounted only on this machine",
+    "an install prefix specific to this machine",
+    "a Windows UNC network path",
+    "a launchd label outside the product's namespace",
+)
+
+EMAIL = "an email address"
+# `git@host:` is git's SSH remote shorthand, not an address.
+EMAIL_PATTERN = re.compile(r"\b(?!git@[A-Za-z0-9.-]+:)([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})")
+# Domains reserved for documentation and testing (RFC 2606), and the no-reply
+# forms, name nobody. `.local` is NOT here: it names a machine on a network.
+EMAIL_DOMAIN_ALLOWED = re.compile(
+    r"(?:.*\.)?example\.(?:com|org|net)|.*\.(?:example|test|invalid)|users\.noreply\.github\.com",
+    re.IGNORECASE,
+)
+EMAIL_LOCAL_ALLOWED = re.compile(r"no-?reply", re.IGNORECASE)
+# Homebrew names a versioned formula's service file `homebrew.mxcl.<formula>@<version>.plist`,
+# which reads as an address at the domain `<version>.plist`. No domain ends in `.plist`.
+EMAIL_DOMAIN_NOT_A_DOMAIN = re.compile(r"\d+(?:\.\d+)*\.plist", re.IGNORECASE)
+
+# convivy-orient's owner asked for these three, each a synthetic value in a test
+# that exists to catch that exact shape.
+ALLOW["convivy-orient"] = (
+    ("tests/test_push_api.py", "a Tailscale address", "9fee1dbd126b61ad5eb62f3d8f5e212f23c9b2e198dc972306821b4b2b9df745",
+     "a synthetic CGNAT address in the push endpoint's SSRF test, which must refuse a tailnet host"),
+    ("tests/test_deploy_watch.py", "a connection string with an embedded password", "9e57caee446e8f9cb63d5c7dccf6540352e9bb6b184c812582936842f5c1a242",
+     "a fake token-bearing git remote in stderr that the test proves never reaches a signal"),
+    ("tests/test_deploy_watch.py", EMAIL, "40c4dc9292903322b99fc983e3290d122d359946ee0b370c10fe9b0ca8778b83",
+     "the same fake git remote line, which the scan reads as an address at github.com"),
+)
+
+# agent-platform's owner asked for these, each a synthetic value: a placeholder in
+# a comment or doc, or a fixture a sanitiser or scrubber test feeds in on purpose.
+# Each was read at 6bcc29b without printing its value.
+ALLOW["agent-platform"] = (
+    ("bin/agentctl", "a connection string with an embedded password", "27b1f1415482004fafa005369ef6f6834a0e8f69dbc8d529e663898f8bc34d7e",
+     "a user:password placeholder in a comment describing an HTTPS origin"),
+    ("gateway/llm-gateway-run.sh", "a connection string with an embedded password", "adab7b8b6bb6bb743a4bf04e8a233388b586f189127db2ff7d3f33ef98a3546f",
+     "a comment giving the URL syntax, with user and password as bracketed optional parts"),
+    ("tests/bash/test_gateway_provision_db.sh", "a connection string with an embedded password", "43befccdf58981ed3bca99a782a3a8f52167d33d6746a0dafa7e5eef50bc4f82",
+     "a connection string with a shell variable in the password slot, fed to the provisioning test"),
+    ("tests/test_run_verdict.py", "a connection string with an embedded password", "fdda8961c7346f6e935394f6a3c69be76d6d8ff3f18251e3cb5c4f6b65f296e3",
+     "a placeholder user:password URL in the verdict test's list of loopback URLs"),
+    ("tests/bash/test_gateway_prisma_gate.sh", "a connection string with an embedded password", "433d97dc976cc6705afb66301a7384fdd5229a18bc68c89916b8e60f68eb2458",
+     "a fake database URL the prisma gate test feeds in"),
+    ("tests/test_agentctl.py", "an API key", "a99aaf04f878e95dc79caa81f8f76983918168eb3fcce48dcae7d85e819b5c73",
+     "a fake credential the redaction tests feed in to prove it is scrubbed"),
+    ("tests/test_agentctl.py", "an API key", "664765959ddb6fb1567ef3c8505a98658ce03064b6852d282c3d35dc2e7798fc",
+     "a fake credential the redaction tests feed in to prove it is scrubbed"),
+    ("tests/test_agentctl.py", "a GitHub token", "d246339c6c7d1c3382863e12af8fc7df737bf934b7ff0607d4a9499dfa5b40aa",
+     "a fake credential the redaction tests feed in to prove it is scrubbed"),
+    ("tests/test_agentctl.py", "an API key", "3e50ac2c55a47e547b254b45cbc56e963705974132b7fe1d078ef8d8de339ed1",
+     "a fake credential the redaction tests feed in to prove it is scrubbed"),
+    ("tests/test_agentctl.py", "an AWS access key id", "1a5d44a2dca19669d72edf4c4f1c27c4c1ca4b4408fbb17f6ce4ad452d78ddb3",
+     "a fake credential the redaction tests feed in to prove it is scrubbed"),
+    ("tests/test_agentctl.py", "an AWS temporary access key id", "cb20d34a7adda2f5d2043836051e242fd4c2b233e02c80c91fe9d5af9b100574",
+     "a fake credential the redaction tests feed in to prove it is scrubbed"),
+    ("tests/test_agentctl.py", "a Slack token", "171d6bb4c43f38115a75f299253d86f234edb5e897447c8b6fb72af6490e790d",
+     "a fake credential the redaction tests feed in to prove it is scrubbed"),
+    ("tests/test_agentctl.py", "a Slack token", "17191e20aa9617726c1298389ef8cb569e1d683ca0bda3ff3689f2bee4659be7",
+     "a fake credential the redaction tests feed in to prove it is scrubbed"),
+    ("tests/test_gateway_mint_keys.py", "an API key", "023f085cf602b9edaf53182c165ae74b49fb5114a9252fd25a1e609a3bde113c",
+     "a fake gateway key the key-minting test feeds in"),
+    ("tests/test_kb_merge.py", "a GitHub token", "6fe45ec03207163cfe093bf195e0a5b16a11b5ccabe20c716dd1af714b8049e2",
+     "a fake token the merge test proves never reaches its output"),
+    ("tests/test_sanitise.py", "an API key", "c9279cc311cd7fb13932cdff45582cf8f56045790537be99f236edd35f24690d",
+     "a fake credential the sanitiser tests feed in to prove it is scrubbed"),
+    ("tests/test_sanitise.py", "an API key", "a2e2e92855e2a9dd237481cbf4818c4cd6c2c233f877a813959870a8a026fb2a",
+     "a fake credential the sanitiser tests feed in to prove it is scrubbed"),
+    ("tests/test_sanitise.py", "a GitHub token", "f2e2c6d99c8ca52749a22759252a506b7432ca0a62c9b84f3a74f6829d32b4bd",
+     "a fake credential the sanitiser tests feed in to prove it is scrubbed"),
+    ("tests/test_sanitise.py", "a GitHub fine-grained token", "0c4a66b195045b28350c46bb2ffbf6b365b4953b18b80edf625e8014bc9402ed",
+     "a fake credential the sanitiser tests feed in to prove it is scrubbed"),
+    ("tests/test_sanitise.py", "an API key", "a1bfff60d2666c8296c95b9e9796cd64e1bc22a4afd9387ed619d7ad341297e0",
+     "a fake credential the sanitiser tests feed in to prove it is scrubbed"),
+    ("tests/test_sanitise_error.py", "a GitHub token", "f2e2c6d99c8ca52749a22759252a506b7432ca0a62c9b84f3a74f6829d32b4bd",
+     "a fake token the error sanitiser test proves is scrubbed"),
+    ("tests/test_vivy_main_suite.py", "a GitHub token", "f2e2c6d99c8ca52749a22759252a506b7432ca0a62c9b84f3a74f6829d32b4bd",
+     "a fake token the suite's scrubbing test feeds in"),
+    # GitHub's SSH user, which the address pattern reads as an address at
+    # github.com. It names no person; an entry is per file, so one per file.
+    ("bin/create-lab-app", EMAIL, "3de132cd98be7bf26b6f08e81c31c799a891bc32046b61f0b6fe3671ca2e44b5",
+     "GitHub's SSH user in a git+ssh clone URL pattern"),
+    ("bin/velocity-report", EMAIL, "3de132cd98be7bf26b6f08e81c31c799a891bc32046b61f0b6fe3671ca2e44b5",
+     "GitHub's SSH user in the ssh:// form of a remote-URL comment"),
+    ("tests/test_velocity_report.py", EMAIL, "3de132cd98be7bf26b6f08e81c31c799a891bc32046b61f0b6fe3671ca2e44b5",
+     "GitHub's SSH user in a mocked git remote URL"),
+    ("bin/agentctl", EMAIL, "3de132cd98be7bf26b6f08e81c31c799a891bc32046b61f0b6fe3671ca2e44b5",
+     "GitHub's SSH user in a comment on remote URL forms"),
+    ("bin/agentctl", EMAIL, "896cddb03b3f74a926809cba75964d7c90cdbf5a197e280c66737b87d5d0bb89",
+     "the password placeholder of the HTTPS origin comment, read as an address at github.com"),
+    ("tests/test_agentctl.py", EMAIL, "3de132cd98be7bf26b6f08e81c31c799a891bc32046b61f0b6fe3671ca2e44b5",
+     "GitHub's SSH user in a test's remote URL"),
+    ("tests/test_kb_non_github_origin.py", EMAIL, "3de132cd98be7bf26b6f08e81c31c799a891bc32046b61f0b6fe3671ca2e44b5",
+     "GitHub's SSH user in a test's remote URL"),
+    # Three invented `/opt` names, chosen because they sort differently under C
+    # and en_US.UTF-8 collation, which is the property the test checks. None
+    # exists on any machine; renaming them could lose that property.
+    ("tests/test_shared_safe_path_dirs.py", "an install prefix specific to this machine",
+     "9c2045d5e8b3d98cea1c454dcb5574c6205bb0bce15a191ceb5eedfe7afbcbbf",
+     "an invented /opt name in a collation-order fixture"),
+    ("tests/test_shared_safe_path_dirs.py", "an install prefix specific to this machine",
+     "8dae381cde9aad13ac59489cd04d2e1e29466b17898eb87cb6260570081ed186",
+     "an invented /opt name in a collation-order fixture"),
+    ("tests/test_shared_safe_path_dirs.py", "an install prefix specific to this machine",
+     "1d8c40ef8857ad51a242730c51cb642f8dd92fd9bc8d033c3388c565a4912c50",
+     "an invented /opt name in a collation-order fixture"),
+    # An invented install root two fixtures build their fake builder trees
+    # under; it names no machine and no person.
+    ("tests/test_deck_config.py", "an install prefix specific to this machine",
+     "b4648fe484eaf1ac6b3ac459d9755e36b414e68182811e990f7a3f1e66dc15c7",
+     "the invented install root two config-test fixtures build under"),
+)
+
+# What the classifier reads, and which keys it treats as secret-shaped.
+CONFIG_SUFFIXES = (".json", ".toml", ".yaml", ".yml", ".ini", ".cfg", ".env")
+SECRET_KEY = re.compile(
+    r"secret|token|password|passwd|api[_-]?key|private[_-]?key|credential", re.IGNORECASE
+)
+INLINE = "an inline value under a secret-shaped key"
+# A GitHub Actions expression (`${{ ... }}`) and opencode's `{env:NAME}` are
+# references too: the first is how every workflow passes its token, and the
+# second is how an opencode provider names its key. Each was reported as an
+# inline value in the first run against the real repositories.
+#
+# EVERY FORM IS A BARE NAME AND NOTHING ELSE. A reference that can carry a
+# literal beside the name is not a reference: `${KEY:-value}`,
+# `os.environ.get("KEY", "value")` and `${{ secrets.KEY || 'value' }}` each
+# hold a value that is used whenever the variable is unset, which is where a
+# real secret gets written (security review, round 1). The one modifier kept is
+# `${KEY:?message}`, which fails when the variable is unset and holds no value.
+_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
+ENV_REFERENCE = re.compile(
+    rf"\$\{{\{{\s*{_NAME}(?:\.{_NAME})*\s*\}}\}}"
+    rf"|\{{env:{_NAME}\}}"
+    rf"|\$\{{{_NAME}(?::?\?[^}}]*)?\}}"
+    rf"|\${_NAME}"
+    rf"|os\.environ(?:/{_NAME}|\[[\"']{_NAME}[\"']\]|\.get\([\"']{_NAME}[\"']\))"
+    rf"|env:{_NAME}"
+)
+# A `key: value` or `key = value` line, with the key optionally quoted and an
+# `export` in front, as YAML, dotenv, INI and a JSON line each write one.
+KEY_LINE = re.compile(
+    r"""^\s*(?:export\s+)?["']?([A-Za-z0-9_.-]+)["']?\s*[:=]\s*(.*?)\s*,?\s*$"""
+)
+# Stands in for a YAML block scalar, whose value is on the lines below its key.
+BLOCK = object()
+
+
+@functools.cache
+def _checker(path: Path):
+    return load("check_payload_purity", path)
+
+
+def withheld(text: str) -> str:
+    """`text` as a finding may print it: a path segment or a config key name.
+
+    A name is content too. A file named for an address or a token prints that
+    value in every finding about it, and so does a JSON or TOML key holding
+    one, on a build that passes as well as one that refuses (security review,
+    rounds 1 and 2). Those two kinds are withheld, and so is a private
+    person's name or one of the operator's machine names: those lists exist to
+    keep the names out of anything passed along, and finding text gets passed
+    along (security review of the machine names, round 1). The segment alone is withheld, so the rest
+    of the path still says where to look. A home path, a hostname the checker's own
+    patterns know, or a launchd label in a name is how the operator finds the
+    file to fix, and withholding it would hide every property list in a
+    `launchd/` directory.
+
+    Every character outside printable ASCII becomes `?`, so a name carrying a
+    newline or a terminal escape cannot forge a line of the report.
+    """
+    patterns = [(p, label) for p, label in content_patterns() if label in CREDENTIAL]
+    kinds = [label for pattern, label in patterns if pattern.search(text)]
+    if emails(text):
+        kinds.append(EMAIL)
+    kinds += [label for pattern, label in private_name_patterns() + machine_name_patterns()
+              if pattern.search(text)]
+    if kinds:
+        return f"<a name holding {', '.join(kinds)}>"
+    return "".join(c if " " <= c <= "~" else "?" for c in text)
+
+
+def scrubbed(message: str) -> str:
+    """A message quoting a path, such as git's or tarfile's, with each match withheld.
+
+    Error text names the entry it failed on, and that name comes from the
+    repository being exported (security review, round 3). Matches are found
+    across the whole message rather than word by word, because the private-key
+    header carries spaces and never matched a single word (security review,
+    round 4). A private person's name and a machine name are withheld here
+    too, for the reason withheld() gives (security review of the machine
+    names, round 2).
+    """
+    patterns = [(p, label) for p, label in content_patterns() if label in CREDENTIAL]
+    patterns.append((EMAIL_PATTERN, EMAIL))
+    patterns += private_name_patterns() + machine_name_patterns()
+    for pattern, label in patterns:
+        message = pattern.sub(f"<{label} withheld>", message)
+    return "".join(c if " " <= c <= "~" else "?" for c in message)
+
+
+def shown(rel: str) -> str:
+    """`rel` with each segment passed through withheld()."""
+    return "/".join(withheld(segment) for segment in rel.split("/"))
+
+
+def content_patterns() -> list[tuple[re.Pattern[str], str]]:
+    """The purity checker's patterns for the three categories, by label."""
+    checker_path = REPO / "tools" / "check-payload-purity.py"
+    if not checker_path.is_file():
+        # A fork of the public tree has none, since the checker does not ship.
+        # Exporting without one is refused rather than done unchecked.
+        raise Refused(
+            f"there is no purity check at {checker_path}, so nothing was built. The "
+            f"content scan reads its patterns from it, and a fork that publishes adds one there"
+        )
+    checker = _checker(checker_path)
+    # A LIST PER LABEL, NOT ONE PATTERN, because two FORBIDDEN entries can
+    # share a label — the tailnet hostname and its split-fragment companion
+    # both read "a tailnet hostname". Keeping only the last pattern
+    # seen for a label would silently drop the other one from this scan
+    # while check-payload-purity.py's own scan, which never groups by label,
+    # kept applying both.
+    by_label: dict[str, list[re.Pattern[str]]] = {}
+    for entry in checker.FORBIDDEN:
+        by_label.setdefault(entry[1], []).append(entry[0])
+    wanted = PERSON + HOME + CREDENTIAL + MACHINE
+    missing = [label for label in wanted if label not in by_label]
+    if missing:
+        raise Refused(
+            f"the purity checker has no pattern labelled {', '.join(repr(m) for m in missing)}, "
+            f"so the content scan would silently lose that category; nothing was built"
+        )
+    return [(pattern, label) for label in wanted for pattern in by_label[label]]
+
+
+@functools.cache
+def private_name_patterns() -> list[tuple[re.Pattern[str], str]]:
+    """The names the purity checker cannot hold, from the operator's own file.
+
+    REQUIRED, because this is the release gate: without the file the scan
+    would know the operator's first name and nobody else's, and pass a tree
+    naming them (see PRIVATE_NAMES_VARIABLE in the checker). Cached, because
+    withheld() asks for it once per path segment; one run reads the file once.
+    """
+    checker = _checker(REPO / "tools" / "check-payload-purity.py")
+    try:
+        names = checker.private_names(required=True)
+    except checker.PrivateNamesUnavailable as exc:
+        raise Refused(f"{exc}, so nothing was built") from None
+    return [(checker.private_names_pattern(names), PERSON[0])]
+
+
+# **A MACHINE'S OWN NAME IS READ FROM THE OPERATOR'S FILE, LIKE A PERSON'S.**
+# The checker's tailnet patterns catch a machine named inside a full tailnet
+# hostname, and nothing caught the bare name, which an engine repository carried
+# in comments, error messages, fixture keys and compound words. The names cannot
+# be written here, since this file ships and the purity checker refuses them, so
+# the operator lists them one per line, blank lines and `#` comments ignored, in
+# a file named by MACHINE_NAMES_VARIABLE. It is a separate file from the private
+# people's names because other tools read that one as a list of people, and the
+# finding names a machine. A name matches in any case and INSIDE A LONGER WORD,
+# so `<name>-builder` and `<Name>Config` are caught: a machine name is a coined
+# word, and the occurrences found were compounds. Required, like the people's
+# names: without the file the scan would pass a tree naming every machine.
+MACHINE_NAME = "a machine's name"
+MACHINE_NAMES_VARIABLE = "BUILDER_MACHINE_NAMES"
+
+
+def machine_names() -> list[str]:
+    """The names in the file MACHINE_NAMES_VARIABLE names; refuses without one."""
+    named = os.environ.get(MACHINE_NAMES_VARIABLE, "")
+    if not named:
+        raise Refused(
+            f"{MACHINE_NAMES_VARIABLE} is not set. It names the file, kept outside every "
+            f"repository, that lists one per line the operator's machine names a published "
+            f"tree must not carry, so nothing was built")
+    path = Path(named).expanduser()
+    try:
+        # utf-8-sig, because a byte-order mark read as text would become part
+        # of the first name, which would then match nothing.
+        text = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise Refused(
+            f"{MACHINE_NAMES_VARIABLE} names {path}, which cannot be read "
+            f"({exc.__class__.__name__}), so nothing was built") from None
+    names = [line.strip() for line in text.splitlines()
+             if line.strip() and not line.strip().startswith("#")]
+    if not names:
+        raise Refused(f"{path}, named by {MACHINE_NAMES_VARIABLE}, lists no name, so nothing was built")
+    return names
+
+
+@functools.cache
+def machine_name_patterns() -> list[tuple[re.Pattern[str], str]]:
+    """One pattern matching any machine name, in any case, inside a word or not.
+
+    Cached, because withheld() asks for it once per path segment; one run reads
+    the file once.
+    """
+    longest_first = sorted(machine_names(), key=len, reverse=True)
+    pattern = re.compile("|".join(re.escape(n) for n in longest_first), re.IGNORECASE)
+    return [(pattern, MACHINE_NAME)]
+
+
+def export(name: str, root: Path, commit: str, into: Path) -> None:
+    """The repository at `commit`, minus both exclusion lists, extracted into `into`."""
+    pathspecs = ["."] + [f":(exclude){path}" for path in EXCLUDE[name]]
+    pathspecs += [f":(exclude,literal){path}" for path in hashed_exclusions(name, root, commit)]
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = Path(tmp) / "engine.tar"
+        with open(archive, "wb") as handle:
+            result = subprocess.run(
+                ["git", "-C", str(root), "archive", commit, "--", *pathspecs],
+                stdout=handle, stderr=subprocess.PIPE, check=False,
+            )
+        if result.returncode != 0:
+            raise Refused(
+                f"could not archive {name} at {commit}: "
+                f"{scrubbed(result.stderr.decode(errors='replace').strip())}"
+            )
+        with tarfile.open(archive) as tar:
+            members = tar.getmembers()
+            for member in members:
+                # git archive does not produce these, which is not a reason to
+                # skip the check before writing anything.
+                path = Path(member.name)
+                if path.is_absolute() or ".." in path.parts:
+                    raise Refused(f"refusing a tar entry that escapes the tree: {shown(member.name)}")
+            try:
+                tar.extractall(into, members=members, filter="data")
+            except tarfile.TarError as exc:
+                raise Refused(
+                    f"refusing what {name} at {commit} would put in the tree: {scrubbed(str(exc))}"
+                ) from exc
+
+
+def walk(tree: Path) -> tuple[list[Path], list[Path]]:
+    """Every regular file and every symlink in the tree, without following links."""
+    files, links = [], []
+    for dirpath, dirnames, filenames in os.walk(tree, followlinks=False):
+        for entry in sorted(dirnames + filenames):
+            path = Path(dirpath) / entry
+            if path.is_symlink():
+                links.append(path)
+            elif path.is_file():
+                files.append(path)
+    return sorted(files), sorted(links)
+
+
+def symlinks(tree: Path, links: list[Path]) -> list[str]:
+    """Detector 1: a symlink anywhere. Its target is not printed, since it is content."""
+    return [
+        f"{shown(link.relative_to(tree).as_posix())}: a symlink, which ships as its target text"
+        for link in links
+    ]
+
+
+def example_siblings(tree: Path, files: list[Path]) -> list[str]:
+    """Detector 2: a real file exported beside the `.example` that stands in for it."""
+    findings = []
+    for path in files:
+        if ".example" not in path.name:
+            continue
+        real = path.with_name(path.name.replace(".example", "", 1))
+        if real.exists() or real.is_symlink():
+            findings.append(
+                f"{shown(real.relative_to(tree).as_posix())}: exported beside "
+                f"{shown(path.name)}, which exists so that this file is not committed"
+            )
+    return findings
+
+
+def fingerprint(value: str) -> str:
+    """The sha256 of a matched value, which is what an ALLOW entry pins."""
+    return hashlib.sha256(value.encode("utf-8", "surrogateescape")).hexdigest()
+
+
+def allowed(allow: tuple[tuple[str, str, str, str], ...], rel: str, kind: str, value: str) -> bool:
+    """Whether an entry accepts this exact value of this kind in this file."""
+    digest = fingerprint(value)
+    return any(path == rel and allowed_kind == kind and pinned == digest
+               for path, allowed_kind, pinned, _ in allow)
+
+
+# Every byte outside printable ASCII becomes a space before the scan, keeping
+# newlines so line numbers hold. Decoded as latin-1, a byte such as 0xff is a
+# letter to the regex engine, so a token stored right after one in a binary
+# had no word boundary in front of it and went unseen; the planted binary in
+# the tests is what showed it.
+PRINTABLE = bytes(
+    byte if byte in (9, 10, 13) or 32 <= byte < 127 else 32 for byte in range(256)
+)
+
+# An ANSI escape sequence blanked byte-for-byte, before PRINTABLE above turns
+# the lone ESC into a single space. A CSI sequence's final byte is itself a
+# letter (`m`, `J`, `K`, `H`, ...), so turning only the ESC into a space left
+# that letter sitting against whatever followed it with no word boundary
+# between them: a terminal capture of a prompt storing `\x1b[J<name>@<host>`
+# read as `[J<name>@<host>`, and `\bname\b` cannot start on a `J`. Blanking
+# the whole sequence, not only the ESC byte, is what restores the boundary,
+# and spaces of the same length keep every later offset and line number
+# where it was.
+#
+# **BLANKING CAN HIDE AS WELL AS REVEAL, SO IT ONLY EVER ADDS A READING.** No
+# byte rule tells `ESC[J<name>`, where `J` ends the sequence, from a stray
+# `ESC[<name>`, where the first letter of the name would be taken as the final
+# byte and blanked; an OSC with a distant terminator would blank everything up
+# to it. Both reviews of the first version showed a token the plain reading
+# caught going missing. So content_scan matches the plain reading and the
+# blanked one and reports the union, and a newline inside a sequence survives
+# blanking so line numbers agree between the two.
+#
+# The union is kept once per path, line and label, because a finding never
+# prints the value it matched: two tokens on one line would print two
+# identical lines, and the person fixing them reads both on that line anyway.
+# The allowlist is checked per matched value before this, so an allowed value
+# cannot stand in for an unallowed one beside it.
+ESCAPE_SEQUENCE = re.compile(
+    rb"\x1b\[[0-?]*[ -/]*[@-~]"  # CSI: params, intermediates, one final byte.
+    rb"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC: up to BEL or ESC backslash.
+    rb"|\x1b[^\[\]]"  # any other two-byte ESC sequence.
+)
+
+
+def _blanked(match: re.Match[bytes]) -> bytes:
+    return bytes(byte if byte == 10 else 32 for byte in match.group())
+
+
+def located(text: str, textual: bool, start: int) -> str:
+    """The line of `start`, and its byte offset too when the file is not text."""
+    line = text.count("\n", 0, start) + 1
+    return f"{line}" if textual else f"{line} (byte {start})"
+
+
+def content_scan(
+    tree: Path, files: list[Path], patterns: list[tuple[re.Pattern[str], str]],
+    allow: tuple[tuple[str, str, str, str], ...],
+) -> tuple[list[str], list[str]]:
+    """Detector 3: (findings, notices) — credentials, addresses and machine
+    paths, by location and kind.
+
+    Every file is read as latin-1, which decodes any byte, so a binary is
+    scanned for the strings embedded in it rather than reported unscannable
+    and waved through. Each path segment is scanned too, since the path ships.
+
+    A file that is not valid UTF-8 text has its findings reported by byte
+    offset as well as line, since "line" means little in a binary and the
+    offset is what points a reader at the exact bytes.
+
+    A hand-written page is scanned like any other; what would be a finding on
+    it is kept as a notice instead, never a refusal — the scan still reports
+    what it would have flagged.
+    """
+    findings: list[str] = []
+    notices: list[str] = []
+    for path in files:
+        hand_written = payload.is_hand_written(path)
+        rel = path.relative_to(tree).as_posix()
+        where = shown(rel)
+        for segment in rel.split("/"):
+            for pattern, label in patterns:
+                if any(not allowed(allow, rel, label, m.group(0)) for m in pattern.finditer(segment)):
+                    if hand_written:
+                        notices.append(payload.authorship_notice(f"{where} (its name)", label))
+                    else:
+                        findings.append(f"{where}: its name contains {label}")
+            for _, domain, found in emails(segment):
+                if not allowed(allow, rel, EMAIL, found):
+                    category = f"{EMAIL} at {domain}"
+                    if hand_written:
+                        notices.append(payload.authorship_notice(f"{where} (its name)", category))
+                    else:
+                        findings.append(f"{where}: its name contains {category}")
+        raw = path.read_bytes()
+        try:
+            raw.decode("utf-8")
+            textual = True
+        except UnicodeDecodeError:
+            textual = False
+        readings = (
+            raw.translate(PRINTABLE).decode("latin-1"),
+            ESCAPE_SEQUENCE.sub(_blanked, raw).translate(PRINTABLE).decode("latin-1"),
+        )
+        seen: set[str] = set()
+        for text in readings:
+            for pattern, label in patterns:
+                for match in pattern.finditer(text):
+                    if allowed(allow, rel, label, match.group(0)):
+                        continue
+                    place = f"{where}:{located(text, textual, match.start())}"
+                    finding = f"{place}: {label}"
+                    if finding not in seen:
+                        seen.add(finding)
+                        if hand_written:
+                            notices.append(payload.authorship_notice(place, label))
+                        else:
+                            findings.append(finding)
+            for start, domain, found in emails(text):
+                if allowed(allow, rel, EMAIL, found):
+                    continue
+                place = f"{where}:{located(text, textual, start)}"
+                category = f"{EMAIL} at {domain}"
+                finding = f"{place}: {category}"
+                if finding not in seen:
+                    seen.add(finding)
+                    if hand_written:
+                        notices.append(payload.authorship_notice(place, category))
+                    else:
+                        findings.append(finding)
+    return findings, notices
+
+
+def emails(text: str) -> list[tuple[int, str, str]]:
+    """(offset, domain, address) of every address in `text` that could name a person."""
+    found = []
+    for match in EMAIL_PATTERN.finditer(text):
+        local, domain = match.group(1), match.group(2)
+        if (EMAIL_DOMAIN_ALLOWED.fullmatch(domain) or EMAIL_LOCAL_ALLOWED.fullmatch(local)
+                or EMAIL_DOMAIN_NOT_A_DOMAIN.fullmatch(domain)):
+            continue
+        found.append((match.start(), domain, match.group(0)))
+    return found
+
+
+def classify(value: object) -> str:
+    """What a value is, in words that never include the value."""
+    if value is BLOCK:
+        return "inline value in a block below the key"
+    if value is None or value == "":
+        return "empty"
+    if isinstance(value, (bool, int, float)):
+        return "literal scalar"
+    text = str(value).strip().strip("\"'")
+    if text == "" or text.lower() in ("null", "none", "~"):
+        return "empty"
+    if text.lower() in ("true", "false", "yes", "no") or re.fullmatch(r"-?\d+(?:\.\d+)?", text):
+        return "literal scalar"
+    if ENV_REFERENCE.fullmatch(text):
+        return "environment reference"
+    return f"inline value of {len(text)} characters"
+
+
+def walk_keys(data: object, trail: str = "", secret: bool = False) -> list[tuple[str, object]]:
+    """Every (dotted key, value) under a secret-shaped key in parsed data.
+
+    A list under a secret-shaped key has no key of its own per item, so its
+    scalars are classified under the list's key.
+    """
+    found = []
+    if isinstance(data, dict):
+        for key, value in data.items():
+            name = f"{trail}.{key}" if trail else str(key)
+            if isinstance(value, (dict, list)):
+                found += walk_keys(value, name, bool(SECRET_KEY.search(str(key))))
+            elif SECRET_KEY.search(str(key)):
+                found.append((name, value))
+    elif isinstance(data, list):
+        for index, value in enumerate(data):
+            name = f"{trail}[{index}]"
+            if isinstance(value, (dict, list)):
+                found += walk_keys(value, name, secret)
+            elif secret:
+                found.append((name, value))
+    return found
+
+
+def line_keys(text: str) -> list[tuple[str, object]]:
+    """The same, read line by line, for formats the standard library cannot parse."""
+    found = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        if line.lstrip().startswith(("#", ";", "//")):
+            continue
+        match = KEY_LINE.match(line)
+        if not match or not SECRET_KEY.search(match.group(1)):
+            continue
+        value = match.group(2)
+        # A trailing comment is not part of the value. A quoted value ends at
+        # its closing quote, so what follows it is dropped rather than counted
+        # into the reported length (review, round 1).
+        if value.startswith(("'", '"')):
+            closing = value.find(value[0], 1)
+            if closing != -1:
+                value = value[: closing + 1]
+        else:
+            value = re.split(r"\s+#", value, maxsplit=1)[0]
+        # An opening brace or bracket starts a nested block, which is walked
+        # as its own lines rather than classified here.
+        if value in ("{", "["):
+            continue
+        # A YAML block scalar carries its value on the lines below.
+        if value in ("|", ">", "|-", ">-"):
+            value = BLOCK
+        found.append((f"{match.group(1)} (line {lineno})", value))
+    return found
+
+
+def is_config(path: Path) -> bool:
+    return path.suffix.lower() in CONFIG_SUFFIXES or path.name.startswith(".env")
+
+
+def classifier(
+    tree: Path, files: list[Path], allow: tuple[tuple[str, str, str, str], ...],
+) -> tuple[list[str], list[str]]:
+    """Detector 4: (findings, report) for every secret-shaped key in a config file."""
+    findings, report = [], []
+    for path in files:
+        if not is_config(path):
+            continue
+        rel = path.relative_to(tree).as_posix()
+        text = path.read_bytes().decode("utf-8", errors="replace")
+        keys = None
+        try:
+            if path.suffix.lower() == ".json":
+                keys = walk_keys(json.loads(text))
+            elif path.suffix.lower() == ".toml":
+                keys = walk_keys(tomllib.loads(text))
+        except (ValueError, tomllib.TOMLDecodeError):
+            keys = None
+        if keys is None:
+            keys = line_keys(text)
+        for key, value in keys:
+            kind = classify(value)
+            report.append(f"{shown(rel)}: {withheld(key)}: {kind}")
+            if kind.startswith("inline value") and not allowed(allow, rel, INLINE, str(value)):
+                findings.append(f"{shown(rel)}: {withheld(key)}: {kind}")
+    return findings, report
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG, description="Build the public tree of one of Builder's engine repositories.",
+    )
+    parser.add_argument("name", choices=ENGINES, help="the repository to export")
+    parser.add_argument("--version", required=True, help="release version, e.g. 0.6.0")
+    parser.add_argument("--out", type=Path, required=True, help="directory to build into")
+    parser.add_argument("--from", dest="source", type=Path, default=None,
+                        help="the repository's checkout (default: beside this one's primary checkout)")
+    parser.add_argument("--ref", default=payload.PUBLISHED_REF,
+                        help=f"ref to export (default: {payload.PUBLISHED_REF})")
+    parser.add_argument("--force", action="store_true",
+                        help="replace a directory this tool built before")
+    args = parser.parse_args(argv)
+
+    # EVERYTHING CHECKABLE WITHOUT TOUCHING DISK IS CHECKED FIRST, so a refusal
+    # leaves no partial tree.
+    if not hasattr(tarfile, "data_filter"):
+        raise Refused(
+            f"this Python ({sys.version.split()[0]}) has no tarfile data filter, "
+            f"which extraction relies on; run {PROG} with Python 3.11.4 or later"
+        )
+    # The version is written into release.json after every detector has run,
+    # so it takes a release's identifiers rather than free text.
+    if not re.fullmatch(r"\d+\.\d+\.\d+(?:-(?:alpha|beta|rc)(?:\.\d+)?)?", args.version):
+        raise Refused(
+            f"{args.version!r} is not a version of the form MAJOR.MINOR.PATCH, "
+            f"optionally followed by -alpha, -beta or -rc and a number"
+        )
+    # A ref beginning with a dash would be read by git as an option.
+    if args.ref.startswith("-"):
+        raise Refused(f"{args.ref!r} is not a ref")
+
+    allow = ALLOW[args.name]
+    for path, kind, pinned, reason in allow:
+        if not reason.strip():
+            raise Refused(f"the allowance for {path} ({kind}) gives no reason")
+        if not re.fullmatch(r"[0-9a-f]{64}", pinned):
+            raise Refused(f"the allowance for {path} ({kind}) pins no sha256 fingerprint")
+    for pinned, reason in EXCLUDE_HASHED[args.name]:
+        if not reason.strip():
+            raise Refused(f"the hashed exclusion {pinned[:12]} gives no reason")
+        if not re.fullmatch(r"[0-9a-f]{64}", pinned):
+            raise Refused(f"a hashed exclusion ({reason}) pins no sha256 fingerprint")
+    patterns = content_patterns() + private_name_patterns() + machine_name_patterns()
+    root =(args.source or payload.siblings_dir() / args.name).resolve()
+    commit = payload.commit_of(root, args.ref)
+    if commit is None:
+        raise Refused(f"{args.ref} names no commit in {root}, so there is nothing to export")
+    # The licence files are read at the exported commit, never the working
+    # tree, and a missing or linked one is refused before anything is written.
+    payload.licence_blobs(args.name, root, commit)
+
+    out = args.out.resolve()
+    if out.exists() and any(out.iterdir()):
+        if not args.force:
+            raise Refused(f"{out} is not empty; pass --force to replace it")
+        # --force deletes an operator-supplied path, so it deletes only a
+        # directory this tool built, which carries the marker.
+        if not (out / BUILD_MARKER).is_file():
+            raise Refused(
+                f"{out} is not empty and was not built by {PROG}: it has no "
+                f"{BUILD_MARKER}. Refusing to delete it."
+            )
+        shutil.rmtree(out)
+    out.mkdir(parents=True, exist_ok=True)
+
+    # Anything that fails after the tree exists takes the tree with it.
+    try:
+        export(args.name, root, commit, out)
+        for filename in payload.LICENCE_FILES:
+            placed = out / filename
+            if placed.is_symlink() or not placed.is_file():
+                raise Refused(
+                    f"{filename} is not in the built tree as a regular file; an "
+                    f"exclusion must not remove a licence file"
+                )
+        files, links = walk(out)
+        classified, report = classifier(out, files, allow)
+        content_findings, content_notices = content_scan(out, files, patterns, allow)
+        detectors = (
+            ("symlinks", symlinks(out, links)),
+            (".example siblings", example_siblings(out, files)),
+            ("content scan", content_findings),
+            ("secret-shaped keys", classified),
+        )
+        found = [(title, items) for title, items in detectors if items]
+        if found:
+            lines = []
+            for title, items in found:
+                lines.append(f"{title} ({len(items)}):")
+                lines += [f"  {item}" for item in items]
+            raise Refused(
+                f"{args.name} at {commit} cannot be exported as it stands. The tree "
+                f"was DISCARDED. No value is printed; open each file to judge it.\n  "
+                + "\n  ".join(lines)
+            )
+        # The manifest and marker are written inside the same cleanup, so a
+        # failure here leaves no vetted-looking tree without them (review,
+        # round 1).
+        record = {
+            "version": args.version,
+            "built_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "repositories": {args.name: commit},
+            "files": {
+                path.relative_to(out).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in files
+            },
+        }
+        (out / "release.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+        (out / BUILD_MARKER).write_text(
+            f"Built by {PROG}. Its presence is what allows --force "
+            f"to replace this directory; delete it and the tool will refuse.\n",
+            encoding="utf-8",
+        )
+    except BaseException:
+        # NO ignore_errors: a refusal here says the tree was DISCARDED, so a
+        # removal that fails must fail loudly rather than leave what was found
+        # on disk under that claim (security review of publish-payload's
+        # multi-tree build, which runs this for every sibling).
+        shutil.rmtree(out)
+        raise
+
+    print(f"{PROG}: built {len(files)} file(s) of {args.name} at {commit[:9]} for v{args.version} at {out}")
+    print("  symlinks, .example siblings, content scan: nothing found")
+    print(f"  secret-shaped keys: {len(report)} classified, none inline")
+    for line in report:
+        print(f"    {line}")
+    if content_notices:
+        print(f"  {len(content_notices)} notice(s) on a hand-written page, not refused:")
+        for n in content_notices:
+            print(f"    {n}")
+    print(
+        "\n  Nothing was pushed and no repository was created or made public. "
+        "Publishing is a person's deliberate act, because content once fetched "
+        "stays fetched."
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except Refused as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc

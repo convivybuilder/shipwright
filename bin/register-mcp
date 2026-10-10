@@ -1,0 +1,700 @@
+#!/usr/bin/env python3
+"""Register Builder's MCP servers, and read back what was actually registered.
+
+    bin/register-mcp              register both servers
+    bin/register-mcp --status     what is registered, and whether it connects
+    bin/register-mcp --dry-run    say what would happen, change nothing
+    bin/register-mcp --check      report only; 1 if anything is missing or wrong
+
+**A SESSION WITH NO MCP SERVERS HAS NO REFERENCE ROOM AND NO WORK QUEUE**, and
+until this existed nothing installed them and nothing said they were missing.
+`bin/install-backend`'s `outstanding()` named supervision, the gateway
+credentials file and per-repository path conversion, and never mentioned this —
+so an operator who followed every line the installer printed ended with a
+machine whose agents could not reach the Library, and no output told them.
+The instructions lived in `agent-platform/install.sh`'s closing text, which is
+prose in a shell comment, which is where they stayed.
+
+## `claude mcp add` CANNOT REPAIR A WRONG ENTRY, AND SAYS SO THE SAME WAY IT
+## SAYS EVERYTHING IS FINE
+
+This is the trap the whole file is shaped around, measured against the real CLI:
+
+    claude mcp add --scope user ops -- /fake/mcp-ops-server   # first time, 0
+    claude mcp add --scope user ops -- /fake/mcp-ops-server   # identical
+    → "MCP server ops already exists in user config", EXIT 1
+    claude mcp add --scope user ops -- /a/completely/other/path
+    → "MCP server ops already exists in user config", EXIT 1,
+      and the entry STILL points at /fake/mcp-ops-server
+
+**The two cases are indistinguishable from outside.** A re-run against a machine
+that is already correct and a re-run against one registered with a stale path
+produce the same message and the same exit code, and in the second case the
+command has silently declined to fix the thing it was asked to fix. An installer
+branching on that code would either treat a harmless no-op as a failure or treat
+a real conflict as "already done"; there is no reading of it that is right in
+both cases.
+
+A check whose passing and failing states produce identical evidence is not a
+check. **So nothing here believes an exit code. Every run reads the registration
+back out of the config and compares it to what was intended**, which is the same
+reason `bin/provision-backend` executes every program it installs rather than
+trusting apt's exit code.
+
+This matters concretely: on the machine this was built on, `ops` pointed into a
+live working tree, so
+a naive installer would report "already exists" over exactly the registration
+that most needs replacing.
+
+## THE DEFAULT SCOPE IS `local`, AND `local` MEANS ONE DIRECTORY
+
+`agent-platform/install.sh` documents the registration as:
+
+    claude mcp add kb -- ~/.local/bin/mcp-kb-server
+
+`--scope` defaults to `local`, and a local registration is written under
+`projects.<cwd>.mcpServers` in `~/.claude.json` — scoped to the directory the
+command ran in. Measured against a throwaway HOME: that exact command leaves
+top-level `mcpServers` empty and the entry under the working directory. An
+operator following the documented procedure on a fresh machine registers the
+servers for whichever directory they happened to be standing in, and every crew
+session started anywhere else has no Library.
+
+**`--scope user` is the only correct scope here** and is what puts the entry at
+top-level `mcpServers`, which is the shape a working install has.
+
+## WHY THIS WRITES THROUGH THE CLI AND READS THROUGH THE FILE
+
+`~/.claude.json` is written by every running Claude session, continuously — it
+holds per-project session state, not just this registration. A read-modify-write
+of that file from here would race every live session and could drop whatever
+they wrote in between, so **this never writes it.** `claude mcp add` is the
+supported surface and owns that concurrency.
+
+Reading it is a different matter and is exact, so the registration facts — the
+name, the scope, the command, the environment — are read from the JSON rather
+than parsed out of console output. Only one fact cannot be got that way.
+
+## HEALTH IS READ FROM `Status:`, BECAUSE THE EXIT CODE CANNOT SEE IT
+
+    claude mcp get <a working server>   → exit 0, "Status: ✔ Connected"
+    claude mcp get <a broken server>    → exit 0, "Status: ✘ Failed to connect"
+
+Both measured. The exit code distinguishes *configured* from *not configured*
+and never *healthy* from *broken*, so a check written on it would produce
+identical evidence in its passing and failing states. The `Status:` line is the
+only place the difference appears, and an unrecognised status is reported as
+`unknown` rather than guessed in either direction.
+
+## It writes no credentials
+
+The `ops` server needs an agent-class token at `~/.orient-control/ops-mcp-token`.
+The Library's job declaration mints it, once, the first time the install prepares
+the Library, and never replaces it. This command only registers servers.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+PROG = "register-mcp"
+
+# Where a service is allowed to serve from: a deploy area, never a checkout
+# anybody develops in. `bin/install-backend` places `agent-platform`
+# here, and this points the registrations at that copy rather than at
+# `~/.local/bin/mcp-*-server`, which on a development machine is a symlink into the live
+# working tree — so every session's MCP subprocess runs whatever branch was
+# last left checked out there.
+DEFAULT_DEPLOY_ROOT = Path.home() / ".local" / "deploy"
+
+# The servers, what each is for, and where inside a deploy area it lives.
+#
+# NEITHER CARRIES AN ENVIRONMENT VARIABLE, and that is a decision rather than an
+# omission. An older `ops` entry carries `VAULTS_ON_LIBRARY=1`, which was needed
+# while the vault plane still defaulted to Orient. That default was deliberately
+# inverted after the cutover — `agent-platform/lib/agent-platform/vault_plane.py`
+# states that unset now means the Library, because a default meaning "the store
+# we migrated away from" needed 75 correct edits to be safe and one omission to
+# be wrong. Unset is now the safe answer, so carrying the variable forward would
+# be copying a value because one machine happens to have it.
+SERVERS = (
+    {
+        "name": "kb",
+        "why": "the Reference Room — every session's knowledge tools",
+        "relative": "agent-platform/bin/mcp-kb-server",
+        "env": {},
+    },
+    {
+        "name": "ops",
+        "why": "the work queue, signals and the vaults",
+        "relative": "agent-platform/bin/mcp-ops-server",
+        "env": {},
+    },
+)
+
+
+class Refused(Exception):
+    """Something the operator has to decide about. Never a stack trace."""
+
+
+def run(argv: list[str], **kwargs) -> subprocess.CompletedProcess:
+    return subprocess.run(argv, capture_output=True, text=True, check=False, **kwargs)
+
+
+def claude_cli() -> str:
+    """The `claude` binary, or a refusal naming what to do about it."""
+    found = shutil.which("claude")
+    if found is None:
+        raise Refused(
+            "`claude` is not on PATH, and it is what registers an MCP server. "
+            "Install Claude Code first; nothing was registered."
+        )
+    return found
+
+
+def config_path() -> Path:
+    """The config file THE CLI WILL ACTUALLY WRITE, not merely `~/.claude.json`.
+
+    `CLAUDE_CONFIG_DIR` relocates it, and this was measured rather than assumed:
+    with that variable set, `claude mcp add --scope user` writes
+    `$CLAUDE_CONFIG_DIR/.claude.json` and leaves `$HOME/.claude.json` absent.
+
+    **Reading the wrong file here would make the whole design lie.** This tool
+    decides what is registered, and confirms its own writes, by reading this
+    path; pointed at `$HOME` on a machine that relocates the config, it would
+    see nothing registered, run `add`, read back nothing again, and refuse with
+    "still not registered as intended" over a registration that had in fact
+    succeeded. It fails closed, which is the right direction and still wrong.
+
+    HOME comes from the environment rather than `Path.home()` for the same
+    reason: a test points the CLI and this at one throwaway directory.
+    """
+    relocated = os.environ.get("CLAUDE_CONFIG_DIR")
+    if relocated:
+        return Path(relocated).expanduser() / ".claude.json"
+    return Path(os.environ.get("HOME", str(Path.home()))) / ".claude.json"
+
+
+def registered_servers() -> dict:
+    """The user-scope registrations, read from the file rather than from output.
+
+    A missing or unreadable file means nothing is registered, which is the true
+    answer on a fresh machine. A file that exists and does not parse is a
+    refusal: something else owns that file and this must not write over it.
+    """
+    path = config_path()
+    if not path.exists():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise Refused(f"{path} cannot be read ({exc}).")
+    except UnicodeDecodeError as exc:
+        # A TORN READ IS THE CASE TO EXPECT HERE, not an exotic one: every live
+        # session writes this file continuously, so catching it one frame away
+        # from the JSON error — where it would surface as a traceback at exit 1,
+        # the same code `--check` uses for "not registered as intended" — is the
+        # difference between a refusal and a crash that reads like a verdict.
+        raise Refused(
+            f"{path} is not valid UTF-8 ({exc}), which a read torn by a "
+            f"concurrent write looks like. Try again."
+        )
+    if not text.strip():
+        return {}
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError) as exc:
+        # RecursionError is a RuntimeError rather than a ValueError, so it
+        # escapes a bare `except ValueError` and comes out as a traceback.
+        raise Refused(
+            f"{path} is not valid JSON ({exc}). This will not write over a file "
+            f"it cannot read."
+        )
+    if not isinstance(data, dict):
+        raise Refused(f"{path} does not hold a JSON object.")
+    servers = data.get("mcpServers")
+    return servers if isinstance(servers, dict) else {}
+
+
+def health(cli: str, name: str) -> str:
+    """`connected`, `broken`, or `unknown` — read from `Status:`, never the code.
+
+    `claude mcp get` exits 0 for a working server and 0 for one that cannot
+    start, so the exit code is evidence of being configured and of nothing else.
+    An unrecognised status is `unknown`: reporting it as broken would invent a
+    failure and as connected would hide one.
+    """
+    done = run([cli, "mcp", "get", name], timeout=120)
+    if done.returncode != 0:
+        return "absent"
+    for line in (done.stdout or "").splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("Status:"):
+            continue
+        value = stripped[len("Status:"):].strip()
+        # FAILURE MARKERS ARE TESTED FIRST, AND `connected` NEEDS THE EXACT
+        # MEASURED FORM. Written the other way round — `"Connected" in value`
+        # before the failure check — a status such as `✘ Not Connected` comes
+        # back `connected`, which resolves an ambiguous string in the one
+        # direction that hides a broken server. Only `✔ Connected` was
+        # measured, so only it counts; everything else is `unknown`, which is
+        # what this function claims to do with a string it does not recognise.
+        if value.startswith("✘") or "Failed" in value:
+            return "broken"
+        if value == "✔ Connected":
+            return "connected"
+        return "unknown"
+    return "unknown"
+
+
+def env_keys(env) -> list[str]:
+    """The NAMES of an entry's environment variables, never their values.
+
+    `claude mcp add -e KEY=value` is the standard place an MCP server's
+    credentials live, and these messages print an entry this tool did not write
+    — so a value here is somebody's API key on the stderr of an installer whose
+    output gets captured and pasted. The names are what the reader needs to see
+    which entry is wrong; the values add nothing and carry the whole risk.
+    """
+    if not isinstance(env, dict):
+        return []
+    return sorted(env)
+
+
+def brief(value, limit: int = 60) -> str:
+    """A value's repr, cut to `limit` characters plus a truncation marker.
+
+    **A SIZE LIMIT, NOT A REDACTION.** An earlier version of this docstring said
+    the bound was "enough to identify it, not enough to dump it", which read as
+    a promise about secrets. It is not one: `['--token=ghp_` and a 36-character
+    token is about 52 characters and prints whole under the cap, and so do most
+    API keys and URL passwords. What this bounds is how much of an entry this
+    tool did not write reaches stderr, so a pasted refusal stays short. Whether
+    a secret appears there is decided by what is passed in, which is why a
+    malformed `env` is printed as its type rather than through this function.
+    If a credential in `args` is ever seen in a pasted refusal, print each arg
+    only up to its first `=` instead.
+
+    `repr` also escapes control characters and newlines, so a crafted value
+    cannot forge a second "should be:" line in this message.
+    """
+    text = repr(value)
+    return text if len(text) <= limit else text[:limit] + "…(truncated)"
+
+
+def intended(server: dict, deploy_root: Path) -> dict:
+    return {
+        "name": server["name"],
+        "why": server["why"],
+        "command": str(deploy_root / server["relative"]),
+        "env": dict(server["env"]),
+    }
+
+
+def compare(want: dict, have: dict | None) -> str:
+    """What state this registration is in, before anything is changed.
+
+    `mismatch` is the state that matters, because it is the one `claude mcp add`
+    will not repair.
+
+    **Every field the registration carries is compared, not just the command.**
+    A check narrower than the thing it claims to verify is the defect this file
+    is otherwise about: `args` and `type` drift exactly as `env` does — the
+    `VAULTS_ON_LIBRARY` left on an older `ops` entry is that drift already
+    having happened — and an entry with the right command and a stray `args`
+    would otherwise read `present` while the tool reported nothing to do.
+    """
+    if have is None:
+        return "absent"
+    # A NON-DICT ENTRY IS SOMEBODY ELSE'S IDEA OF THIS FILE, not ours to read
+    # through. `{"ops": "x"}` otherwise raises AttributeError on the next line
+    # and leaves at exit 1 with a traceback — which is the code `--check` uses
+    # for "not registered as intended", so a crash would read as a verdict.
+    if not isinstance(have, dict):
+        return "mismatch"
+    if have.get("command") != want["command"]:
+        return "mismatch"
+    have_env = have.get("env") or {}
+    have_args = have.get("args") or []
+    # Guarded for the same reason `have` itself is: a hand-edited `"env": ["x"]`
+    # would otherwise raise inside a comparison, one frame from the `env_keys()`
+    # that already defends the identical field.
+    if not isinstance(have_env, dict) or not isinstance(have_args, list):
+        return "mismatch"
+    if dict(have_env) != want["env"]:
+        return "mismatch"
+    if have_args != []:
+        return "mismatch"
+    if have.get("type", "stdio") != "stdio":
+        return "mismatch"
+    return "present"
+
+
+def plan(deploy_root: Path) -> list[dict]:
+    """Every registration's intended and actual state, computed before any write.
+
+    Computed up front so `--dry-run` and a real run answer the same question,
+    and so a refusal names the whole picture rather than the first thing wrong.
+    """
+    have = registered_servers()
+    items = []
+    for server in SERVERS:
+        want = intended(server, deploy_root)
+        actual = have.get(want["name"])
+        items.append({
+            **want,
+            "state": compare(want, actual),
+            "actual": actual,
+            "deployed": Path(want["command"]).exists(),
+        })
+    return items
+
+
+def refuse_mismatches(items: list[dict]) -> None:
+    """A wrong entry is the operator's to clear, because a re-add cannot.
+
+    This is the whole reason the command reads its work back. Left to itself,
+    `claude mcp add` would exit 0 here and change nothing.
+    """
+    wrong = [item for item in items if item["state"] == "mismatch"]
+    if not wrong:
+        return
+    lines = [
+        (
+            "these servers are registered with something other than what "
+            "belongs there, and `claude mcp add` will not repair them — it "
+            "reports `already exists` and leaves them as they are:"
+        )
+    ]
+    for item in wrong:
+        actual = item["actual"] if isinstance(item["actual"], dict) else {}
+        lines.append(f"  {item['name']}:")
+        # SHOW WHICHEVER FIELD DIFFERS, for every class `compare()` can return.
+        # Printing only the command and the env keys rendered a mismatch caused
+        # by `args`, `type`, a malformed `env` or a non-dict entry as two
+        # IDENTICAL lines under a heading saying they differ.
+        extra_have, extra_want = "", ""
+        # NOT `list(...)`: `compare()` deliberately calls a non-list `args` a
+        # mismatch, so `"args": 5` reaches here, and `list(5)` raises TypeError
+        # — a traceback at exit 1, which is the code `--check` uses for a
+        # verdict. That crash-that-reads-like-a-verdict is the shape this file
+        # exists to avoid, and the previous line reintroduced it one frame down.
+        have_args = actual.get("args") or []
+        if have_args != []:
+            extra_have += f" args={brief(have_args)}"
+            extra_want += " args=[]"
+        if actual.get("type", "stdio") != "stdio":
+            extra_have += f" type={brief(actual.get('type'))}"
+            extra_want += " type='stdio'"
+        have_env = actual.get("env") or {}
+        if not isinstance(have_env, dict):
+            # `env_keys` renders this as `[]`, which matches the intended empty
+            # env exactly — so without this the two lines agree while the entry
+            # is the reason for the refusal.
+            #
+            # THE TYPE, NEVER THE CONTENT. `env` is the one field `env_keys`
+            # exists to keep off stderr, and a list-form env is exactly where
+            # `["API_KEY=…"]` would sit, so printing it through `brief()` put
+            # the value back. The type is what the operator needs to fix it.
+            extra_have += f" env=<{type(have_env).__name__}>"
+        if not isinstance(item["actual"], dict):
+            extra_have += f" entry={brief(item['actual'])}"
+        lines.append(
+            f"    registered: {actual.get('command')!r} "
+            f"env keys={env_keys(actual.get('env'))}{extra_have}"
+        )
+        lines.append(
+            f"    should be:  {item['command']!r} "
+            f"env keys={env_keys(item['env'])}{extra_want}"
+        )
+    lines.append("")
+    lines.append("Remove each one and run this again:")
+    for item in wrong:
+        lines.append(f"    claude mcp remove {item['name']} -s user")
+    lines.append("")
+    lines.append("Nothing was registered.")
+    raise Refused("\n".join(lines))
+
+
+def refuse_undeployed(items: list[dict]) -> None:
+    """Registering a path that does not exist is accepted silently by the CLI.
+
+    `claude mcp add --scope user missing -- /does/not/exist` exits 0 and writes
+    the entry, so the registration would look installed and fail at every
+    session start. The deploy area is what should exist first.
+    """
+    absent = [item for item in items if not item["deployed"]]
+    if not absent:
+        return
+    lines = ["the deploy area does not hold these servers yet:"]
+    for item in absent:
+        lines.append(f"    {item['command']}")
+    lines.append("")
+    lines.append(
+        "`claude mcp add` accepts a command that does not exist and exits 0, so "
+        "registering now would look installed and fail at every session start. "
+        "Place the backend first:"
+    )
+    lines.append("    bin/install-backend")
+    lines.append("")
+    lines.append("Nothing was registered.")
+    raise Refused("\n".join(lines))
+
+
+def register_one(cli: str, item: dict) -> None:
+    """Add one server, then READ IT BACK, because the exit code proves nothing.
+
+    **The exit code is deliberately not consulted at all.** `claude mcp add`
+    exits 1 both when the entry is already exactly right and when it is present
+    but wrong, so the code cannot separate the harmless case from the one that
+    needs the operator. What settles it is the config afterwards: either the
+    registration now says what it should, or it does not.
+    """
+    argv = [cli, "mcp", "add", "--scope", "user", item["name"]]
+    for key, value in item["env"].items():
+        argv += ["-e", f"{key}={value}"]
+    argv += ["--", item["command"]]
+
+    done = run(argv, timeout=120)
+
+    # THE READ-BACK CAN ITSELF FAIL, AND IT RUNS AFTER THE WRITE. A torn read —
+    # the case this file calls the one to expect, since every live session writes
+    # that config — would otherwise surface through `registered_servers()`, whose
+    # refusals used to end "Nothing was registered" over a server the `add` may
+    # just have created. Same false-claim class as the half-registered comment.
+    try:
+        actual = registered_servers().get(item["name"])
+    except Refused as exc:
+        raise Refused(
+            f"`claude mcp add` ran for {item['name']} and the read-back could "
+            f"not confirm it: {exc}\nWhether it was registered is unknown; run "
+            f"`{PROG} --check` to find out."
+        ) from exc
+    if compare(item, actual) != "present":
+        found = actual if isinstance(actual, dict) else {}
+        raise Refused(
+            f"{item['name']} is still not registered as intended after "
+            f"`claude mcp add` (which exited {done.returncode}).\n"
+            f"    wanted: {item['command']!r} env keys={env_keys(item['env'])}\n"
+            f"    found:  {found.get('command')!r} "
+            f"env keys={env_keys(found.get('env'))}\n"
+            f"    said:   {(done.stderr or done.stdout).strip()[-200:]!r}\n"
+            f"Nothing further was attempted."
+        )
+
+
+def report(items: list[dict], cli: str, changed: list[str], probe: bool) -> None:
+    print(f"{PROG}: user scope, {config_path()}")
+    for item in items:
+        mark = "registered" if item["name"] in changed else item["state"]
+        line = f"  {mark:<11} {item['name']:<5} {item['why']}"
+        if probe:
+            line += f"  [{health(cli, item['name'])}]"
+        print(line)
+    print()
+    # THE "NOTHING TO DO" LINE IS ABOUT THE PLAN, NOT ABOUT `changed`. Keyed on
+    # an empty `changed` it also printed under `--dry-run`, `--check` and
+    # `--status` on a machine with absent or mismatched servers — so the output
+    # said "every server was already registered as intended" and then, two lines
+    # later, "would register: kb, ops". A report that contradicts itself is
+    # what this output exists to prevent.
+    if changed:
+        print(f"registered {len(changed)}: {', '.join(changed)}")
+    elif all(item["state"] == "present" for item in items):
+        print("nothing to do — every server was already registered as intended")
+
+
+def outstanding() -> list[str]:
+    """What this cannot do, named with the exact command or file.
+
+    On stdout rather than in a comment, because the procedure this replaces
+    ended with its manual steps in its closing text and that is where they
+    stayed.
+    """
+    return [
+        (
+            "The ops server's token is ~/.orient-control/ops-mcp-token, which "
+            "the Library's install step mints once and never replaces."
+        ),
+        "",
+        (
+            "A server shows `broken` until its own dependencies are met. Ask it "
+            "directly rather than guessing, since the exit code of `get` is 0 "
+            "either way:"
+        ),
+        "    claude mcp get ops",
+        "",
+        (
+            "A registration already in place with the wrong command is the "
+            "operator's to clear, because `claude mcp add` will not repair it "
+            "— it reports `already exists` and changes nothing:"
+        ),
+        "    claude mcp remove <name> -s user",
+        "",
+        (
+            "Sessions read their MCP registration when they spawn, so one "
+            "already running does not pick this up. Start a new session to use "
+            "what was just registered."
+        ),
+    ]
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Register Builder's MCP servers from a deploy area, at user scope.",
+    )
+    parser.add_argument(
+        "--deploy", dest="deploy_root", type=Path, default=None,
+        help="deploy root (default: ~/.local/deploy, or $BUILDER_DEPLOY_ROOT)",
+    )
+    parser.add_argument(
+        "--status", action="store_true",
+        help="what is registered and whether it connects, changing nothing",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="say what would happen, change nothing"
+    )
+    parser.add_argument(
+        "--check", action="store_true",
+        help="report only, and exit 1 if anything is missing or wrong",
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        cli = claude_cli()
+
+        # `Path(os.environ.get(NAME, ""))` is `PosixPath('.')`, which is TRUTHY,
+        # so the obvious default silently resolves the deploy root to the
+        # working directory. The environment value is taken only when it is a
+        # non-empty string.
+        from_env = os.environ.get("BUILDER_DEPLOY_ROOT")
+        if args.deploy_root is not None:
+            deploy_root = args.deploy_root
+        elif from_env:
+            deploy_root = Path(from_env)
+        else:
+            deploy_root = DEFAULT_DEPLOY_ROOT
+
+        # A RELATIVE ROOT IS WRITTEN INTO A MACHINE-WIDE CONFIG, WHICH IS THE
+        # FAILURE THIS TOOL EXISTS TO PREVENT, ONE LEVEL DOWN. `--deploy
+        # ./deploy` registers `deploy/agent-platform/bin/mcp-kb-server`; it
+        # passes the existence check (resolved against THIS run's working
+        # directory) and passes the read-back (the same relative string on both
+        # sides), so nothing here would fail — and every session started from
+        # another directory then cannot find the server, which is exactly the
+        # per-directory breakage the module docstring warns about for `local`
+        # scope. `bin/install-backend` refuses the same way.
+        deploy_root = deploy_root.expanduser()
+        if not deploy_root.is_absolute():
+            raise Refused(
+                f"the deploy root must be an absolute path: {deploy_root}\n"
+                f"A relative path is resolved against whatever directory this "
+                f"run happened to start in, and the registration it writes is "
+                f"read by every session from every directory. Nothing was "
+                f"registered."
+            )
+
+        # This read precedes every write, so a refusal from it CAN promise
+        # that nothing was registered — which the reader itself cannot.
+        try:
+            items = plan(deploy_root)
+        except Refused as exc:
+            raise Refused(f"{exc}\nNothing was registered.") from exc
+
+        if args.status:
+            report(items, cli, changed=[], probe=True)
+            return 0
+
+        unready = [i for i in items if i["state"] != "present"]
+
+        if args.check or args.dry_run:
+            report(items, cli, changed=[], probe=False)
+            # A PREDICTION THAT DISAGREES WITH THE RUN IS WORSE THAN NO
+            # PREDICTION. Written as "would register everything not present",
+            # `--dry-run` printed `would register: kb, ops` and exited 0 for a
+            # mismatched entry or an unplaced backend — the two states where a
+            # real run refuses and registers nothing. Those are exactly the
+            # machine states this tool was built for, and `--dry-run` is what a
+            # careful operator runs first to find them. So the refusals are
+            # evaluated here too, and their own message is the prediction.
+            refusal = None
+            try:
+                refuse_mismatches(items)
+                refuse_undeployed(items)
+            except Refused as exc:
+                refusal = exc
+            if refusal is not None:
+                print(f"\na real run would refuse — {refusal}")
+            elif unready:
+                verb = "would register" if args.dry_run else "not registered as intended"
+                print(f"\n{verb}: {', '.join(i['name'] for i in unready)}")
+            print()
+            for line in outstanding():
+                print(line)
+            if args.check and (unready or refusal is not None):
+                return 1
+            return 0
+
+        # Both refusals run over the WHOLE plan before any write, so nothing is
+        # registered when either fires. **That is not the same as ruling out a
+        # partly-registered machine**: the loop below writes one server at a
+        # time, so an `add` that fails its read-back — or a kill between the two
+        # — leaves the servers already done registered and the rest absent. The
+        # refusal below names what was written, and a re-run completes it.
+        refuse_mismatches(items)
+        refuse_undeployed(items)
+
+        changed: list[str] = []
+        for item in items:
+            if item["state"] == "absent":
+                try:
+                    register_one(cli, item)
+                except Refused as exc:
+                    # SAY WHAT WAS ALREADY WRITTEN. Without this the refusal
+                    # ends "Nothing further was attempted", which is true and
+                    # reads as "nothing was written" — and the servers done
+                    # before this one ARE registered.
+                    if changed:
+                        raise Refused(
+                            f"{exc}\n\nAlready registered before this failed, "
+                            f"and left in place: {', '.join(changed)}. Running "
+                            f"this again completes the rest."
+                        ) from exc
+                    raise
+                changed.append(item["name"])
+
+        # Re-planned rather than assumed. The report says what IS, which is the
+        # only thing worth printing after a run claiming to have changed things.
+        # A failure of this LAST read must not lose what was registered: the
+        # work succeeded, only the confirming re-read did not.
+        try:
+            report(plan(deploy_root), cli, changed, probe=False)
+        except Refused as exc:
+            # NAMES A NEXT STEP, because this path skips outstanding(). An
+            # operator who has just registered both servers would otherwise see
+            # neither the ops-token instructions nor the "start a new session"
+            # line, and `--check` prints both.
+            print(f"{PROG}: registered {', '.join(changed) or 'nothing'}, but the "
+                  f"confirming re-read failed: {exc}\n"
+                  f"Run `{PROG} --check` to confirm; it also prints the "
+                  f"remaining steps.", file=sys.stderr)
+            return 2
+        print()
+        for line in outstanding():
+            print(line)
+        return 0
+
+    except Refused as exc:
+        print(f"{PROG}: refusing — {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

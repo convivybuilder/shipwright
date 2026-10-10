@@ -1,0 +1,33 @@
+name = "tmux-keeper"
+description = "Starts a tmux server from the desktop login and keeps a session named keeper open in it. Claude Code on macOS keeps its login in the login Keychain, which an SSH session cannot read, and Deck starts crews over SSH; a session started inside this server inherits the desktop login's Keychain access, so those crews come up logged in."
+label = "com.convivy.tmux-keeper"
+# THE PATH TO TMUX IS AN ARGUMENT, NOT PART OF THE SHELL TEXT. `$0` is the
+# first argument after the script, so the resolved path never has to survive
+# shell quoting. `exec` leaves no shell waiting on tmux, which detaches and
+# exits once its server is up.
+command = [
+  "/bin/sh",
+  "-c",
+  "\"$0\" has-session -t keeper 2>/dev/null || exec \"$0\" new-session -d -s keeper -c \"$HOME\"",
+  "{tmux}",
+]
+# LINUX IS LEFT OUT because Claude Code there keeps its login in a file rather
+# than a Keychain, so a session started over SSH is expected to read it without
+# help. That is an expectation until a sign-in in the clean Linux container
+# shows it.
+platforms = ["macos"]
+scope = "user"
+enabled-by-default = true
+programs = ["tmux"]
+
+[log]
+stderr = "{state}/tmux-keeper.log"
+
+[schedule]
+at-load = true
+
+# THE COMMAND EXITS ONCE THE SERVER IS UP, and launchd kills whatever is left
+# in a finished job's process group. The tmux server holding every crew's
+# session must not be part of that.
+[macos]
+abandon-process-group = true

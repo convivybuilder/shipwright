@@ -1,0 +1,959 @@
+#!/usr/bin/env python3
+"""Put Builder's commands where an operator can type their names, and its two
+writing skills and its session hook where every session loads them.
+
+    bin/link-commands              link the core set into ~/.local/bin, the
+                                   writing skills into ~/.claude/skills, and
+                                   add the stale-backup hook to
+                                   ~/.claude/settings.json
+    bin/link-commands --status     what is linked, and to what
+    bin/link-commands --dry-run    say what would happen, change nothing
+    bin/link-commands --check      report only; 1 if work is left, 2 if refused
+
+**WITHOUT THIS, A FRESH INSTALL STOPS AT ITS FIRST CREW.** On a machine with an
+empty home, a steward can create an adopter's first crew and then cannot type
+`co` to start that crew's session or run `agentctl` to register the crew's
+agent prefix. The code is all present, since `bin/install-backend` places
+`agent-platform` whole, and none of it can be invoked by name.
+
+## Why this is its own command
+
+`bin/install-backend` places code. `bin/register-mcp` registers servers.
+`bin/install-jobs` installs supervision. Each refuses to become the place
+another's concern is invented, and this is a fourth: what the operator can
+type. `bin/stand-up-backend` runs them in order, and this belongs after
+`place`, because it links into an area that has to exist first.
+
+## What it links, and why not everything
+
+`agent-platform/bin` holds many commands, and this links a named core set
+rather than all of them. The whole directory would put the tooling Builder's own developers use
+on a stranger's PATH, where at best it is noise and at worst it names a
+company the adopter has nothing to do with.
+
+**The set will need revisiting, and that is expected rather than a flaw.** It
+is written here as data so each change to it is one line.
+
+## What it refuses, and why each refusal exists
+
+**A NAME THE DEPLOY AREA DOES NOT CARRY.** Linking it would create a dangling
+symlink, and a dangling link on PATH is a command that exits 127 saying `No
+such file or directory` — which reads as a broken PATH or a missing package
+rather than as an install that placed a link to nothing.
+
+**ANYTHING AT THE DESTINATION THAT IS NOT THIS COMMAND'S OWN LINK.** A regular
+file, a directory, or a symlink pointing somewhere other than the deploy area
+belongs to somebody else. **This fires on a machine Builder is developed on**,
+and correctly: `~/.local/bin` there may hold symlinks into an `agent-platform`
+WORKING TREE, which the deploy-area rule exempts on purpose, since a person
+re-invoking a binary at a prompt is working on it rather than using it. Such a
+link farm is a developer affordance keyed to a checkout. Replacing it would be this
+command deciding to end that, which is not its call.
+
+## What it reports rather than fixes
+
+**Whether the link directory is on PATH.** Linking into a directory the shell
+does not search produces an install where every check passes and nothing can be
+typed — the exact shape of failure this whole file exists to end, one level
+further out. It is reported and not repaired: editing a stranger's shell
+profile is a larger liberty than an installer should take, and which file to
+edit depends on a shell and a login mode this command cannot see.
+
+## The session hook, the one thing here that is not a link
+
+**A STALE BACKUP IS REPORTED WHERE THE OPERATOR IS, WHICH IS A SESSION.** The
+operator decided that a Claude Code SessionStart hook runs
+`builder-backup --session-hook` as each session starts or resumes, and that it
+says something only when the last backup is STALE. Hooks live in
+`~/.claude/settings.json`, which is a file of the operator's with their own
+settings in it, so this adds one entry to it and changes nothing else: the file
+is read, the entry is appended to `hooks.SessionStart` if no entry already runs
+the same command, and the whole is written back through a staging file and an
+atomic rename. A file that is not a JSON object, or whose `hooks` is shaped
+differently from what Claude Code reads, is refused by name and left alone.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import secrets
+import shlex
+import sys
+import tempfile
+from pathlib import Path
+
+PROG = "link-commands"
+
+DEFAULT_DEPLOY_ROOT = Path.home() / ".local" / "deploy"
+DEFAULT_BIN = Path.home() / ".local" / "bin"
+DEFAULT_SKILLS = Path.home() / ".claude" / "skills"
+DEFAULT_SETTINGS = Path.home() / ".claude" / "settings.json"
+
+# The repository inside the deploy area that carries these commands. Named once
+# rather than spelled into every path below, because the day a command comes
+# from somewhere else this becomes a per-command field and the change should be
+# in one place.
+SOURCE_REPOSITORY = "agent-platform"
+
+# **THE CORE SET, AS DATA.** Each entry says what
+# the command is FOR, because a reader deciding whether to add another needs to
+# know what the ten have in common: everything here is something a session, a
+# steward skill, or the person at the prompt invokes by name.
+COMMANDS = (
+    ("co", "start a session in a crew's directory — what new-crew and new-subcrew run"),
+    ("agentctl", "dispatch agents and register a crew's agent prefix"),
+    ("co-working-on", "announce what a session is doing right now"),
+    ("co-rollover", "rotate a session that has filled its context"),
+    ("co-ask", "post a question for the operator to the crew's Slate, and resolve it"),
+    ("knowledge-ctx", "individuate a session's agents and skills"),
+    ("session-agent", "resolve which agent a session is running as"),
+    ("builder-root", "print the Builder root every other tool resolves from"),
+    ("mcp-kb-server", "the Reference Room, as a session's kb tools"),
+    ("mcp-ops-server", "the work queue, as a session's ops tools"),
+)
+
+# **COMMANDS BUILDER'S OWN PAYLOAD CARRIES**, from the area `bin/install-payload`
+# places rather than from agent-platform. Kept apart from `COMMANDS` because
+# that set is a decision about which agent-platform commands a stranger sees,
+# and these are Builder's own. `builder-backup` is here because the backup
+# decision has the operator run it by hand before a reboot, which means typing
+# its name.
+PAYLOAD_REPOSITORY = "builder-payload"
+PAYLOAD_COMMANDS = (
+    ("builder-backup", "back up the Library and the knowledge repository, or say when the last backup succeeded"),
+)
+
+# Which command places each area, for the refusal that finds one missing.
+PLACED_BY = {
+    SOURCE_REPOSITORY: "bin/install-backend",
+    PAYLOAD_REPOSITORY: "bin/install-payload",
+}
+
+# **THE TWO WRITING SKILLS, AND WHERE THEY COME FROM.** `/write-better` and
+# `/talk-better` are part of the machine-wide configuration an install sets up.
+# Anything Builder installs is authored in one place and copied out of no other
+# repository, so they are not copied into the payload: `bin/install-backend`
+# places their public repository whole, the way it places agent-platform, and
+# this links each skill's directory into the skills directory a session reads.
+SKILLS_REPOSITORY = "write-better"
+SKILLS = (
+    ("write-better", "the /write-better pass on prose a person will read"),
+    ("talk-better", "the /talk-better pass on a conversational reply"),
+)
+
+
+# **THE SESSION HOOK.** Its command is the payload's own `builder-backup`, by
+# its path in the deploy area rather than its name on PATH, because a session
+# may start with a PATH that does not include the link directory, and that is
+# reported above rather than repaired.
+HOOK_NAME = "session-hook"
+HOOK_EVENT = "SessionStart"
+# A new session and a resumed one. `clear` and `compact` are left out: the
+# session that runs them has already been told.
+HOOK_MATCHER = "startup|resume"
+HOOK_WHY = "tell each starting session when the last backup is STALE"
+
+
+def hook_command(deploy_root: Path) -> str:
+    """The hook's shell command, quoted as one string.
+
+    **ONE STRING, NEVER CLAUDE CODE'S `args` ARRAY.** A Claude Code that
+    predates `args` would drop it and run `builder-backup` bare, which takes a
+    full backup at every session start. A quoted string means the same thing
+    to every version that runs hooks through a shell.
+    """
+    path = source_for("builder-backup", deploy_root, PAYLOAD_REPOSITORY)
+    return f"{shlex.quote(str(path))} --session-hook"
+
+
+class Refused(Exception):
+    """Something a person has to decide about. Never a stack trace."""
+
+
+def read_settings(path: Path) -> dict:
+    """The settings file as an object, `{}` when there is none yet."""
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise Refused(f"could not read {path} ({exc.strerror or exc})") from None
+    try:
+        settings = json.loads(text) if text.strip() else {}
+    except ValueError as exc:
+        raise Refused(
+            f"{path} is not valid JSON ({exc}), so the session hook was not "
+            f"added. Claude Code will not read it either; fix it and run this "
+            f"again."
+        ) from None
+    if not isinstance(settings, dict):
+        raise Refused(f"{path} holds JSON that is not an object; left alone")
+    return settings
+
+
+def session_start_groups(settings: dict, path: Path) -> list:
+    """`hooks.SessionStart`, refused when it is shaped unlike Claude Code's."""
+    hooks = settings.get("hooks", {})
+    if not isinstance(hooks, dict):
+        raise Refused(f"`hooks` in {path} is not an object; left alone")
+    groups = hooks.get(HOOK_EVENT, [])
+    if not isinstance(groups, list):
+        raise Refused(f"`hooks.{HOOK_EVENT}` in {path} is not a list; left alone")
+    return groups
+
+
+def hook_state(settings: dict, path: Path, command: str) -> str:
+    """`ours` when some SessionStart entry already runs this command."""
+    for group in session_start_groups(settings, path):
+        entries = group.get("hooks", []) if isinstance(group, dict) else []
+        for entry in entries if isinstance(entries, list) else []:
+            if isinstance(entry, dict) and entry.get("command") == command:
+                return "ours"
+    return "absent"
+
+
+def place_hook(item: dict) -> None:
+    """Append the hook to the settings file, keeping everything else in it.
+
+    **WRITTEN TO THE FILE A SYMLINK NAMES, NOT OVER THE SYMLINK.** A settings
+    file kept in a dotfiles repository is a link, and renaming over the link
+    would quietly end that arrangement.
+    """
+    path = Path(os.path.realpath(item["link"]))
+    settings = read_settings(path)
+    command = item["command"]
+    if hook_state(settings, path, command) == "ours":
+        return
+    groups = session_start_groups(settings, path)
+    groups.append({"matcher": HOOK_MATCHER,
+                   "hooks": [{"type": "command", "command": command}]})
+    settings.setdefault("hooks", {})[HOOK_EVENT] = groups
+    try:
+        mode = path.stat().st_mode & 0o777
+    except FileNotFoundError:
+        mode = 0o600
+    try:
+        fd, staging = tempfile.mkstemp(prefix=f".{path.name}.link-commands.",
+                                       dir=path.parent)
+    except OSError as exc:
+        raise Refused(f"could not write in {path.parent} ({exc.strerror or exc}); "
+                      f"{path} was not changed") from None
+    try:
+        with os.fdopen(fd, "w") as out:
+            json.dump(settings, out, indent=2)
+            out.write("\n")
+            os.fchmod(out.fileno(), mode)
+        os.replace(staging, path)
+    except BaseException as exc:
+        try:
+            os.unlink(staging)
+        except OSError:
+            pass
+        if isinstance(exc, OSError):
+            raise Refused(f"could not write {path} ({exc.strerror or exc}); "
+                          f"it was not changed") from None
+        raise
+
+
+def source_for(name: str, deploy_root: Path, repository: str = SOURCE_REPOSITORY) -> Path:
+    return deploy_root / repository / "bin" / name
+
+
+def skill_source_for(name: str, deploy_root: Path) -> Path:
+    return deploy_root / SKILLS_REPOSITORY / "skills" / name
+
+
+def classify(link: Path, want: Path) -> str:
+    """What stands at `link`, in terms of what this command may do about it.
+
+    **`os.path.lexists` AND `os.readlink`, NOT `Path.exists` AND `resolve`.** A
+    symlink to a file that does not exist yet is still a symlink this command
+    placed, and `exists()` answers False for one — so a dangling link of our own
+    would read as absent, get "created" again, and report a change on every run.
+    `resolve()` is wrong for the opposite reason: it follows the whole chain, so
+    a link this command did not write, pointing at another link that happens to
+    end in the deploy area, would read as ours.
+    """
+    if not os.path.lexists(link):
+        return "absent"
+    if not link.is_symlink():
+        return "occupied"
+    if Path(os.readlink(link)) == want:
+        return "ours"
+    return "occupied"
+
+
+def plan(deploy_root: Path, bin_dir: Path, skills_dir: Path | None = None,
+         commands: bool = True, settings: Path | None = None) -> list[dict]:
+    """One record per link: where it should point, and what is there now.
+
+    A command is a file linked into `bin_dir`. A skill is a directory linked
+    into `skills_dir`, and counts as deployed when its `SKILL.md` is there.
+    `commands=False` plans the skills alone, for `--only skills`. The session
+    hook is one more record, with `link` naming the settings file it goes in.
+    """
+    items = []
+    wanted = ([(n, w, SOURCE_REPOSITORY) for n, w in COMMANDS]
+              + [(n, w, PAYLOAD_REPOSITORY) for n, w in PAYLOAD_COMMANDS]) if commands else []
+    for name, why, repository in wanted:
+        want = source_for(name, deploy_root, repository)
+        link = bin_dir / name
+        items.append({
+            "name": name,
+            "why": why,
+            "repository": repository,
+            "want": want,
+            "link": link,
+            # **THE SOURCE IS CHECKED, NOT ASSUMED FROM THE DEPLOY ROOT
+            # EXISTING.** `install-backend` places the repository whole, so a
+            # missing name here means the command was renamed or removed
+            # upstream rather than that the install did not run — and those
+            # want different messages.
+            "deployed": want.is_file(),
+            "state": classify(link, want),
+        })
+    if commands and settings is not None:
+        want = source_for("builder-backup", deploy_root, PAYLOAD_REPOSITORY)
+        command = hook_command(deploy_root)
+        items.append({
+            "name": HOOK_NAME,
+            "why": HOOK_WHY,
+            "repository": PAYLOAD_REPOSITORY,
+            "want": want,
+            "link": settings,
+            "command": command,
+            "deployed": want.is_file(),
+            "state": hook_state(read_settings(settings), settings, command),
+        })
+    if skills_dir is None:
+        return items
+    for name, why in SKILLS:
+        want = skill_source_for(name, deploy_root)
+        link = skills_dir / name
+        items.append({
+            "name": name,
+            "why": why,
+            "repository": SKILLS_REPOSITORY,
+            "want": want,
+            "link": link,
+            "deployed": (want / "SKILL.md").is_file(),
+            "state": classify(link, want),
+        })
+    return items
+
+
+def refuse_undeployed(items: list[dict], deploy_root: Path) -> None:
+    """A link to a file that is not there is worse than no link at all."""
+    absent = [item for item in items if not item["deployed"]]
+    if not absent:
+        return
+    lines = [f"{len(absent)} command(s) or skill(s) are not in the deploy area:"]
+    lines += [f"    {item['want']}" for item in absent]
+    for repository in dict.fromkeys(item["repository"] for item in absent):
+        area = deploy_root / repository
+        if not area.is_dir():
+            lines.append(
+                f"{area} does not exist, so nothing has been placed there yet. "
+                f"Run {PLACED_BY.get(repository, 'bin/install-backend')} first; "
+                f"this links what that places."
+            )
+        else:
+            lines.append(
+                f"{area} exists, so the install ran and the names above from it "
+                f"are not in it — they were renamed or removed upstream. Linking "
+                f"them anyway would leave links to nothing: a command on PATH "
+                f"that exits 127 saying 'No such file or directory', which reads "
+                f"as a broken PATH rather than as this, or a skill that never "
+                f"loads."
+            )
+    raise Refused("\n".join(lines))
+
+
+def refuse_bad_bin(bin_dir: Path, flag: str = "--bin") -> None:
+    """`--bin` names something that is not a directory.
+
+    **A REFUSAL RATHER THAN THE TRACEBACK THIS USED TO PRODUCE.** A regular
+    file, a symlink to one, or a dangling symlink at this path made `os.symlink`
+    raise `NotADirectoryError` from inside `link_one`, or `stat()` raise
+    `FileNotFoundError` from `ensure_bin_dir` — a stack trace out of a command
+    whose own exception type exists so a person never sees one. A reviewer found
+    it.
+
+    **Checked with the other refusals, above the `--dry-run` return**, because
+    otherwise the predicting modes print "would link" and exit 0 against a path
+    the real run crashes on — the predict-the-opposite failure the whole
+    refusal block is ordered to avoid.
+    """
+    if not os.path.lexists(bin_dir):
+        return                       # absent is fine; ensure_bin_dir creates it
+    if bin_dir.is_dir():
+        return                       # follows a link to a real directory
+    if bin_dir.is_symlink():
+        what = f"a symlink to {os.readlink(bin_dir)}, which is not a directory"
+    else:
+        what = "not a directory"
+    raise Refused(
+        f"{flag} names {bin_dir}, which is {what}. This links INTO a "
+        f"directory; name one, or let it create the default."
+    )
+
+
+def refuse_escaping(items: list[dict], deploy_root: Path) -> None:
+    """A link target that leaves the deploy area is refused, not followed.
+
+    Everything this command creates is something the operator will later
+    execute by typing its name, so what the link resolves to is the whole of
+    what it hands them.
+
+    **THIS HOLDS THE TARGET TO THE STANDARD `install-backend` ALREADY ENFORCES
+    ON THE TREE IT BUILDS**, rather than relying on the tree having been built
+    that way. `checked_members` refuses any archive member whose link escapes,
+    and rule 2 makes the deploy area copies rather than symlinks — so inside an
+    area that command placed, this cannot fire. But `--deploy` is
+    operator-supplied, `$BUILDER_DEPLOY_ROOT` more so, and neither carries any
+    evidence of having been through that extraction. A tool whose output is an
+    exec path should not take a neighbour's guarantee on trust.
+
+    **NO OCCURRENCE HAS BEEN SEEN, AND THAT IS RECORDED RATHER THAN DRESSED
+    UP.** It is here on layering grounds — the cost is one `realpath` per
+    command and the blast radius of being wrong is everything the operator
+    types — not because anyone has produced a deploy area shaped this way.
+    """
+    root = os.path.realpath(deploy_root)
+    escaping = []
+    for item in items:
+        landed = os.path.realpath(item["want"])
+        if landed != root and not landed.startswith(root + os.sep):
+            escaping.append((item["name"], landed))
+    if not escaping:
+        return
+    lines = [f"{len(escaping)} link target(s) resolve outside {deploy_root}:"]
+    lines += [f"    {name} -> {landed}" for name, landed in escaping]
+    lines.append(
+        "Refusing to put them on PATH. A deploy area built by "
+        "bin/install-backend holds copies rather than links and cannot produce "
+        "this, so something else populated this one — and what these resolve "
+        "to is what the operator would run by typing the name."
+    )
+    raise Refused("\n".join(lines))
+
+
+def refuse_occupied(items: list[dict]) -> None:
+    """Something else is at the destination, and it is not this command's."""
+    occupied = [item for item in items if item["state"] == "occupied"]
+    if not occupied:
+        return
+    lines = [f"{len(occupied)} destination(s) hold something this did not put there:"]
+    for item in occupied:
+        link = item["link"]
+        if link.is_symlink():
+            what = f"a symlink to {os.readlink(link)}"
+        elif link.is_dir():
+            what = "a directory"
+        else:
+            what = "a regular file"
+        lines.append(f"    {link} is {what}")
+    # **THE LIKELY CAUSE IS OFFERED AS ONE, NOT ASSERTED.** This said outright
+    # that the occupants are symlinks into the agent-platform working tree,
+    # which is true on a machine Builder is developed on and is one of several ways to get
+    # here: a respelled --deploy makes `classify` read this command's OWN
+    # previous links as occupied, since it compares the stored target as a
+    # string. A refusal that names the wrong cause sends its reader at the
+    # wrong remedy, and the listing above already shows what each one actually
+    # points at.
+    lines.append(
+        "Refusing to replace any of them. Most often these are symlinks into "
+        "a WORKING TREE of agent-platform or write-better, which the "
+        "deploy-area rule exempts "
+        "on purpose, since a person re-invoking a binary at a prompt is "
+        "working on it, and ending that is not this command's call. They can "
+        "also be this command's own earlier links, if --deploy now names the "
+        "same directory by a different path; the targets listed above say "
+        "which. Move them aside, or point --bin or --skills at a directory "
+        "this may own."
+    )
+    raise Refused("\n".join(lines))
+
+
+def ensure_bin_dir(bin_dir: Path) -> None:
+    """Create the link directory, and never leave it writable by anyone else.
+
+    **`mkdir` TAKES ITS MODE FROM THE UMASK, AND WHAT IS LINKED HERE RUNS OR
+    LOADS BY NAME.** `~/.local/bin` is on PATH, and `~/.claude/skills` is read by
+    every session at start, so both get the same treatment.
+    Measured: `mkdir(parents=True)` produces 0o775 under `umask 002` and 0o777
+    under `umask 000`, both group- or world-writable, where 0o022 and 0o077 give
+    0o755 and 0o700. `umask 002` is an ordinary default on a shared Linux
+    machine, which is where an adopter's backend may well run.
+
+    A writable directory on PATH is the sharpest version of this command's own
+    hazard: anyone else who can write there plants a file named `co` or
+    `agentctl` and it runs as the operator the next time they type the name.
+    **`bin/install-backend` learned this one file over**, for something
+    it wrote onto the gateway's `PYTHONPATH`; a reviewer had to point out here
+    that the lesson had not travelled.
+
+    **ONLY WHAT THIS COMMAND CREATES, AND ONLY EVER NARROWING.** An existing
+    `~/.local/bin` is the operator's, and a run that widened a deliberate 0o700
+    to 0o755 would be this command making a security decision on their behalf
+    in the wrong direction. Stripping the group and other write bits from a
+    directory we just made cannot widen anything.
+    """
+    if os.path.lexists(bin_dir):
+        # **AN EXISTING ONE IS REPORTED AND LEFT ALONE.** Narrowing it would be
+        # the same overreach as widening it, one direction over: a 0o775
+        # `~/.local/bin` on a shared machine may be exactly what its operator
+        # set up, and this command has no way to tell that from an accident.
+        # Silence is the wrong answer too — the hazard is real whoever created
+        # it — so it says so and changes nothing, like the PATH report.
+        mode = bin_dir.stat().st_mode & 0o777
+        if mode & 0o022:
+            print(
+                f"{PROG}: {bin_dir} is {oct(mode)}, writable by group or other, "
+                f"and what is linked there is run or loaded by name — anyone "
+                f"who can write there can shadow it. Left as it is: this command "
+                f"did not create "
+                f"it. Narrow it with: chmod g-w,o-w {bin_dir}"
+            )
+        return
+
+    # **EVERY LEVEL THIS COMMAND CREATES, NOT ONLY THE LEAF.** Narrowing
+    # `~/.local/bin` and leaving `~/.local` at the umask default defeats the
+    # guard entirely, and a reviewer found it in the code written to
+    # answer the round-1 security finding: deleting and replacing a directory
+    # ENTRY needs write on its PARENT, not on the directory. Measured on an
+    # empty home under `umask 000`, a fresh install's own scenario, `.local`
+    # landed 0o777 beside a correctly-narrowed 0o755 `.local/bin`, so anyone
+    # local could remove the narrowed directory and put a writable one holding
+    # a shadow `co` in its place.
+    #
+    # **This is the argument I used to defeat a finding on the sibling PR, now
+    # pointed the other way.** There, write access to `~/.local` already
+    # existed and the installer did not create it; here the installer is what
+    # grants it.
+    missing = []
+    probe = bin_dir
+    while not os.path.lexists(probe):
+        missing.append(probe)
+        if probe.parent == probe:
+            break
+        probe = probe.parent
+
+    # **THE FIRST ANCESTOR THAT ALREADY EXISTS IS REPORTED IF IT IS WIDE.**
+    # `probe` is now that directory. Write on a PARENT is what lets an entry
+    # beneath it be replaced, so a 0o775 `~/.local` leaves a narrowed
+    # `~/.local/bin` exactly as replaceable as if this command had never run —
+    # and `pip --user`, npm and others routinely create `~/.local` that way. It
+    # was silent here while the symmetric case a few lines up, where `bin_dir`
+    # itself pre-exists wide, warns: the one place the file's own
+    # report-what-we-cannot-fix convention did not apply. A reviewer found it.
+    try:
+        probe_mode = probe.stat().st_mode & 0o777
+    except OSError:
+        probe_mode = 0
+    if probe_mode & 0o022:
+        print(
+            f"{PROG}: {probe} is {oct(probe_mode)}, writable by group or "
+            f"other, and {bin_dir} sits under it — write access to a PARENT is "
+            f"what lets an entry beneath it be replaced, so narrowing "
+            f"{bin_dir.name} alone does not close it. Left as it is: this "
+            f"command did not create it. Narrow it with: chmod g-w,o-w {probe}"
+        )
+
+    # **`os.mkdir` PER LEVEL RATHER THAN `mkdir(parents=True, exist_ok=True)`,
+    # SO "WE CREATED IT" IS THE KERNEL'S ANSWER RATHER THAN A STALE SNAPSHOT.**
+    # With `exist_ok=True`, anything that appeared between the `lexists` above
+    # and the call read as ours and got narrowed — a directory this command did
+    # not create, which is the one thing the branch above exists to avoid.
+    # `FileExistsError` is now the signal that somebody else got there first.
+    for path in reversed(missing):
+        try:
+            os.mkdir(path)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise Refused(
+                f"could not create {path}: {exc.strerror or exc}"
+            ) from None
+        # **PINNED TO THE INODE `os.mkdir` JUST MADE, NOT TO ITS NAME.**
+        # `os.mkdir` returns no descriptor, so a following `stat`/`chmod` on
+        # `path` operates on whatever that NAME resolves to at the time — and
+        # both follow symlinks. Removing a directory entry needs write on its
+        # PARENT, which is precisely the access this whole function defends
+        # against: a co-writer can `rmdir` the empty directory between the
+        # `mkdir` and the `stat` and leave a symlink at the same name. Then
+        # either `stat` raises `FileNotFoundError` as a bare traceback, or
+        # `chmod` strips write bits from whatever the attacker pointed at —
+        # this command as a confused deputy. A security review found it,
+        # in the code added the same round to close a different race.
+        #
+        # `O_NOFOLLOW` makes a symlink at the name an error rather than
+        # something to follow, and `O_DIRECTORY` refuses anything that is not a
+        # directory; `fstat` and `fchmod` then act on the descriptor, which
+        # names the inode rather than the path. The ceiling here was a
+        # traceback or an unwanted narrowing rather than execution, since the
+        # mask only removes bits — but it is a real race in a fix written to
+        # close races.
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError as exc:
+            raise Refused(
+                f"{path} was replaced while this command was creating it "
+                f"({exc.strerror or exc}); refusing to go on"
+            ) from None
+        try:
+            mode = os.fstat(fd).st_mode & 0o777
+            if mode & 0o022:
+                os.fchmod(fd, mode & ~0o022)
+        finally:
+            os.close(fd)
+
+
+def link_one(item: dict) -> None:
+    """Create one link. The caller has already refused everything else."""
+    link, want = item["link"], item["want"]
+    # **`os.symlink` TO A TEMPORARY NAME AND `os.replace`, NOT A PLAIN
+    # `os.symlink` AT THE DESTINATION.** What this guards is the window between
+    # `plan()` taking its snapshot and this write: only ABSENT names reach here,
+    # so a plain `symlink` would be enough for the state `plan()` saw, and it
+    # raises `FileExistsError` if anything has appeared at the name since —
+    # after some of the ten are already written. `os.replace` is atomic and
+    # same-directory, so the run completes and the name never stops resolving.
+    #
+    # **AN EARLIER VERSION OF THIS COMMENT SAID "only 'ours' reaches here, so
+    # there may be a link already", WHICH IS THE OPPOSITE OF WHAT THE CALL SITE
+    # DOES** — `pending` is the absent ones. A reviewer caught it. The
+    # technique was right and the race it was credited with guarding was not,
+    # which would have misled whoever next touched this.
+    # **THE STAGING NAME IS UNGUESSABLE AND CREATED EXCLUSIVELY, BECAUSE A FIXED
+    # ONE IS RACEABLE IN A DIRECTORY THIS COMMAND MAY LEAVE GROUP-WRITABLE.**
+    # It was `<name>.link-commands.tmp`, fixed and unlinked-then-recreated. A
+    # security review built the whole chain: where `~/.local/bin`
+    # pre-exists at 0o775 — which the branch above deliberately permits and
+    # warns about rather than refusing — another user in the group loops on
+    # unlinking that predictable name and recreating it as a link to their
+    # payload. `os.replace` renames whatever inode sits at the NAME when the
+    # syscall runs, not the one this function created, so their link lands at
+    # `~/.local/bin/co` and the operator runs it as themselves.
+    #
+    # `os.symlink` fails with `EEXIST` rather than following or replacing, so a
+    # random name gives exclusive creation as well as unpredictability: nothing
+    # else can have been at it, and nothing else can find it to race.
+    # **THERE IS NO LEFTOVER SWEEP, AND REMOVING IT IS THE FIX RATHER THAN A
+    # SIMPLIFICATION.** Round 2 globbed `.<name>.link-commands.*` and unlinked
+    # every match before creating its own, reasoning that anything under the
+    # prefix was this command's own litter. It is not: a CONCURRENT run's live
+    # staging name matches too, and nothing distinguishes it from a dead one.
+    # So two ordinary invocations against the same `--bin` — a retried
+    # orchestrator step, an operator re-running after a Ctrl-C — had one delete
+    # the other's staging link, and the `readlink` below then raised
+    # `FileNotFoundError` as a bare traceback. No adversary needed. A reviewer
+    # found it, in code added the round before to fix a different race.
+    #
+    # What the sweep was for is litter, and the litter is harmless: the name is
+    # a DOTFILE, so it cannot shadow a command on PATH, and a killed run leaves
+    # at most one per command. Paying for that tidiness with a traceback on an
+    # ordinary concurrent run is the wrong trade.
+    prefix = f".{link.name}.link-commands."
+    for _ in range(8):
+        staging = link.with_name(prefix + secrets.token_hex(8))
+        try:
+            os.symlink(want, staging)
+            break
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            # **EVERY OTHER `OSError` IS THE OPERATOR'S TO DECIDE ABOUT** — a
+            # read-only `--bin`, a full disk. Uncaught, it was a traceback in
+            # the function rewritten to stop producing them. A reviewer found
+            # it.
+            raise Refused(
+                f"could not create a link in {link.parent} "
+                f"({exc.strerror or exc}); nothing was changed for {link.name}"
+            ) from None
+    else:
+        raise Refused(
+            f"could not create a staging name for {link} after 8 attempts"
+        )
+    try:
+        # **VERIFIED IMMEDIATELY BEFORE THE RENAME.** The name is unguessable,
+        # so this should be unreachable; it is here because the cost is one
+        # syscall and the thing handed to `os.replace` is what the operator
+        # will execute. **Wrapped, because `readlink` on a name something else
+        # has removed raises** — which is how the swept-away case surfaced as a
+        # traceback rather than as this refusal.
+        try:
+            landed = Path(os.readlink(staging))
+        except OSError as exc:
+            raise Refused(
+                f"the staging link for {link} vanished before it could be put "
+                f"in place ({exc.strerror or exc}); nothing was changed for "
+                f"this command"
+            ) from None
+        if landed != want:
+            raise Refused(
+                f"the staging link for {link} changed under us; refusing to "
+                f"put it on PATH"
+            )
+        try:
+            os.replace(staging, link)
+        except OSError as exc:
+            raise Refused(
+                f"could not put {link} in place ({exc.strerror or exc}); "
+                f"nothing was changed for this command"
+            ) from None
+    except BaseException:
+        # OUR OWN STAGING NAME, REMOVED BY US. Nothing else knows it, so this
+        # is the only thing that will ever clean it up.
+        try:
+            os.unlink(staging)
+        except OSError:
+            pass
+        raise
+
+
+def path_entries() -> list[Path]:
+    """`PATH`, as paths, with the empty entries that mean the cwd dropped."""
+    raw = os.environ.get("PATH", "")
+    return [Path(part) for part in raw.split(os.pathsep) if part]
+
+
+def on_path(bin_dir: Path) -> bool:
+    """Whether a shell searching `PATH` would find what is linked here.
+
+    **COMPARED BY RESOLVED PATH.** `~/.local/bin` and the same path spelled out
+    from `$HOME` are the same directory and different strings, and a string comparison reports a
+    correctly-configured machine as broken — advice that sends someone to edit
+    a profile that is already right.
+    """
+    try:
+        target = bin_dir.resolve()
+    except OSError:
+        return False
+    for entry in path_entries():
+        try:
+            if entry.resolve() == target:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def report(items: list[dict], bin_dir: Path | None, changed: list[str], verb: str) -> None:
+    for item in items:
+        state = item["state"]
+        if state == "ours" and item["name"] not in changed:
+            said = "linked"
+        elif item["name"] in changed:
+            said = verb
+        else:
+            said = "not linked"
+        if "command" in item:
+            said = said.replace("linked", "added").replace("link", "add")
+            print(f"  {item['name']:<16} {said:<14} {item['command']} in {item['link']}")
+            continue
+        print(f"  {item['name']:<16} {said:<14} {item['want']}")
+    if changed:
+        print(f"\n{PROG}: {verb} {', '.join(changed)}")
+    else:
+        print(f"\n{PROG}: nothing changed; every command and skill was already linked")
+    if bin_dir is not None and not on_path(bin_dir):
+        # REPORTED, NOT REPAIRED. The file docstring says why.
+        print(
+            f"\n{PROG}: {bin_dir} is NOT on PATH, so none of these can be typed "
+            f"by name yet.\n"
+            f"{PROG}: add it to your shell's profile, then open a new shell:\n"
+            f'    export PATH="{bin_dir}:$PATH"'
+        )
+
+
+def status(items: list[dict], bin_dir: Path | None) -> int:
+    missing = 0
+    for item in items:
+        link, state = item["link"], item["state"]
+        if "command" in item:
+            ok = "" if item["deployed"] else "  (TARGET MISSING)"
+            said = f"in {link}{ok}" if state == "ours" else f"not in {link}"
+            print(f"  {item['name']:<16} {said}")
+            if state != "ours" or not item["deployed"]:
+                missing += 1
+            continue
+        if state == "ours":
+            where = os.readlink(link)
+            ok = "" if item["deployed"] else "  (TARGET MISSING)"
+            print(f"  {item['name']:<16} -> {where}{ok}")
+            if not item["deployed"]:
+                missing += 1
+        elif state == "occupied":
+            what = os.readlink(link) if link.is_symlink() else "not a symlink"
+            print(f"  {item['name']:<16} occupied by something else: {what}")
+            missing += 1
+        else:
+            print(f"  {item['name']:<16} not linked")
+            missing += 1
+    if bin_dir is not None and not on_path(bin_dir):
+        print(f"\n{PROG}: {bin_dir} is not on PATH")
+    return 1 if missing else 0
+
+
+def outstanding(skills_only: bool = False) -> list[str]:
+    lines = [
+        (
+            "This links what bin/install-backend places. It does not place "
+            "anything, and it refuses rather than creating a link to a file "
+            "that is not there:"
+        ),
+        "    bin/install-backend --status",
+    ]
+    if skills_only:
+        return lines
+    return lines + [
+        "",
+        (
+            "It also does not edit your shell profile. If it says the link "
+            "directory is not on PATH, that is the one step left and it is "
+            "yours — which file to edit depends on your shell and whether the "
+            "session is a login one."
+        ),
+    ]
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Link Builder's core commands onto PATH and its writing "
+                    "skills into the skills directory, from deploy areas.",
+    )
+    parser.add_argument("--deploy", type=Path, default=None,
+                        help="deploy root (default: ~/.local/deploy, or "
+                             "$BUILDER_DEPLOY_ROOT)")
+    parser.add_argument("--bin", dest="bin_dir", type=Path, default=None,
+                        help="directory to link into (default: ~/.local/bin)")
+    parser.add_argument("--skills", dest="skills_dir", type=Path, default=None,
+                        help="directory to link skills into (default: "
+                             "~/.claude/skills, or $BUILDER_SKILLS_DIR)")
+    parser.add_argument("--settings", type=Path, default=None,
+                        help="the Claude Code settings file the session hook "
+                             "goes in (default: ~/.claude/settings.json, or "
+                             "$BUILDER_CLAUDE_SETTINGS)")
+    # **`--only skills` LEAVES THE LINK DIRECTORY ALONE.** A machine whose
+    # commands are linked by another installer has a `~/.local/bin` this
+    # command did not make, and no `agent-platform` deploy area, so a full run
+    # there refuses on both. This links the two writing skills by the same
+    # rules, and refuses a destination it did not create exactly as a full run
+    # does.
+    parser.add_argument("--only", choices=("skills",), default=None,
+                        help="link only the writing skills, and leave the link "
+                             "directory alone")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--status", action="store_true",
+                      help="what is linked, and to what")
+    mode.add_argument("--dry-run", action="store_true",
+                      help="say what would happen, change nothing")
+    mode.add_argument("--check", action="store_true",
+                      help="report only; 1 if work is left, 2 if something is refused")
+    args = parser.parse_args(argv)
+
+    # `Path("")` IS `PosixPath('.')`, WHICH IS TRUTHY — the same trap
+    # `install-backend` documents. An unset variable and an empty one are the
+    # same thing to `get`, and neither is falsy once it has been through `Path`.
+    from_env = os.environ.get("BUILDER_DEPLOY_ROOT")
+    deploy_root = args.deploy or (Path(from_env) if from_env else DEFAULT_DEPLOY_ROOT)
+    deploy_root = deploy_root.expanduser()
+    bin_dir = (args.bin_dir or DEFAULT_BIN).expanduser()
+    # The same variable `bin/install-payload` reads for the same directory.
+    skills_env = os.environ.get("BUILDER_SKILLS_DIR")
+    skills_dir = (args.skills_dir
+                  or (Path(skills_env) if skills_env else DEFAULT_SKILLS)).expanduser()
+    settings_env = os.environ.get("BUILDER_CLAUDE_SETTINGS")
+    settings = (args.settings
+                or (Path(settings_env) if settings_env else DEFAULT_SETTINGS)).expanduser()
+    for flag, path in (("--deploy", deploy_root), ("--bin", bin_dir),
+                       ("--skills", skills_dir), ("--settings", settings)):
+        if not path.is_absolute():
+            raise Refused(f"{flag} must be an absolute path: {path}")
+
+    skills_only = args.only == "skills"
+    items = plan(deploy_root, bin_dir, skills_dir, commands=not skills_only,
+                 settings=settings)
+    header = f"{PROG}: {skills_dir} -> {deploy_root / SKILLS_REPOSITORY}/skills"
+    if not skills_only:
+        header = (f"{PROG}: {bin_dir} -> {deploy_root / SOURCE_REPOSITORY}/bin, "
+                  f"{deploy_root / PAYLOAD_REPOSITORY}/bin\n" + header
+                  + f"\n{PROG}: {settings}, {HOOK_EVENT} hook")
+    # The link directory is out of scope under `--only skills`, so nothing
+    # below checks it or reports on PATH.
+    path_dir = None if skills_only else bin_dir
+
+    if args.status:
+        print(header)
+        return status(items, path_dir)
+
+    # **BOTH REFUSALS BEFORE THE `--dry-run` RETURN**, which is the correction
+    # `install-backend` had to make: a mode whose job is to predict must
+    # not predict the opposite of what happens. Below the return, `--dry-run`
+    # would print "would link" and exit 0 against a `--bin` full of somebody
+    # else's files, while the real run refused with exit 2 — wrong in the one
+    # mode a careful operator runs FIRST to avoid exactly that.
+    if not skills_only:
+        refuse_bad_bin(bin_dir)
+    refuse_bad_bin(skills_dir, "--skills")
+    refuse_undeployed(items, deploy_root)
+    refuse_escaping(items, deploy_root)
+    refuse_occupied(items)
+
+    pending = [item for item in items if item["state"] == "absent"]
+
+    if args.check:
+        print(header)
+        for item in items:
+            print(f"  {item['name']:<16} "
+                  f"{'not linked' if item['state'] == 'absent' else 'linked'}")
+        if pending:
+            print(f"\n{PROG}: {len(pending)} command(s) or skill(s) not linked: "
+                  f"{', '.join(item['name'] for item in pending)}")
+            return 1
+        if path_dir is not None and not on_path(path_dir):
+            print(f"\n{PROG}: every command is linked, but {path_dir} is not on "
+                  f"PATH, so none of them can be typed by name")
+            return 1
+        if path_dir is None:
+            print(f"\n{PROG}: all {len(items)} linked")
+        else:
+            print(f"\n{PROG}: all {len(items)} linked, and {path_dir} is on PATH")
+        return 0
+
+    print(header)
+    if args.dry_run:
+        report(items, path_dir, [item["name"] for item in pending], "would link")
+        return 0
+
+    changed = []
+    # Each destination is created, narrowed, only when something will be
+    # linked into it, by the same rules: the skills directory is read by every
+    # session, as the link directory is searched by every shell, and the
+    # settings file's directory holds what every session runs as it starts.
+    for directory in dict.fromkeys(item["link"].parent for item in pending):
+        ensure_bin_dir(directory)
+    for item in pending:
+        if "command" in item:
+            place_hook(item)
+        else:
+            link_one(item)
+        changed.append(item["name"])
+    report(items, path_dir, changed, "linked")
+
+    print()
+    for line in outstanding(skills_only):
+        print(line)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except Refused as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None

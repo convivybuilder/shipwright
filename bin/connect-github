@@ -1,0 +1,723 @@
+#!/usr/bin/env python3
+"""Connect a single-account install to GitHub through the operator's GitHub App.
+
+    bin/connect-github --mode enforced|instruction   place, link, configure, rewrite, report
+    bin/connect-github                               the same, in the mode already recorded
+    bin/connect-github --check                       report only; 1 work left, 2 refused
+
+**AGENTS REACH GITHUB AS THE APP, AND NEVER AS THE OPERATOR.** This command
+makes that true for every git and gh call the account makes:
+
+- it places `github-app-token`, and `github-gate` which it loads, in
+  `~/.local/deploy/github-app`, extracted from the commit of the shipwright
+  checkout it runs from, never linked into that checkout;
+- it links `github-app-token` and `gh` in `~/.local/bin` to the placed copy,
+  so `gh` runs with a current App token, and `github-gate` to its placed copy,
+  so the `github-gate` commands this and `github-gate` print run as printed;
+- it configures git's credential helper for https://github.com as the placed
+  minter alone, clearing helpers configured before it;
+- it rewrites every GitHub SSH remote of every checkout under the Builder root
+  to HTTPS, since an SSH remote authenticates with a key and never asks the
+  credential helper. A remote counts as GitHub's when ssh, after
+  `~/.ssh/config`, would connect to github.com or ssh.github.com, so a port
+  or a host alias is caught too, and one it cannot rewrite stops the run;
+- it records the merge mode beside the App's configuration, as `merge-mode`;
+- with `--read-only owner/name`, given once for each repository, it records
+  those repositories in `read-only-repos` beside the App's configuration and
+  sets `credential.useHttpPath` for github.com, so git names the repository
+  and the minter answers for it from the read-only App that
+  `create-github-app --read-only` made. Given at all, the list replaces the
+  one recorded; without it the recorded list stands.
+
+**ENFORCED IS REPORTED ACTIVE ONLY WHEN THE ACCOUNT HOLDS NO OPERATOR
+CREDENTIAL IT CAN FIND.** It looks for:
+
+- a GitHub token variable in this shell's environment or set by a shell profile;
+- a ~/.netrc entry for github.com, or a `default` one, which git's https
+  transport sends without asking a credential helper;
+- a credential git would fall back to for github.com when the App's minter
+  cannot answer, asked of git itself in the home, so a keychain or a
+  credential manager is found;
+- a credential helper a checkout sees that the home does not, from its own
+  config, a worktree's or an `includeIf`, read from the config and never run,
+  since a checkout's config is anyone's to write;
+- a `url.<base>.insteadOf` or `pushInsteadOf` rule that rewrites a
+  github.com url or names github.com;
+- a login the real gh holds, asked with the App's token removed;
+- an SSH key GitHub accepts.
+
+Any of these, or an answer it could not get, leaves enforced inactive and
+exits 1, naming what it found. In instruction mode it reports them and exits 0.
+
+The GitHub ruleset is not this command's: it prints the `github-gate` command
+that prints the ruleset for the mode, for the operator to import.
+
+The App is created first, by hand: its id in `app-id` and its key in
+`app.pem`, mode 600, in the `github-app` directory under `~/.config/convivy`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.parse
+from pathlib import Path
+
+PROG = "connect-github"
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parent
+SHIPPED = ("bin/github-app-token", "bin/github-gate")
+MODES = ("enforced", "instruction")
+HELPER_KEY = "credential.https://github.com.helper"
+# With it, git tells the minter which repository it wants a credential for,
+# which is how a read-only repository gets the read-only App's token.
+USE_PATH_KEY = "credential.https://github.com.useHttpPath"
+# Checkouts are found this many directories below the Builder root at most:
+# a crew, a crew's project, and one nested level.
+CHECKOUT_DEPTH = 3
+# An SSH remote, in either of git's spellings: a url with an ssh scheme, or
+# scp-like `[user@]host:path`. Which host it reaches is then asked of ssh
+# itself, so an alias in ~/.ssh/config is resolved too.
+SSH_SCHEMES = ("ssh", "git+ssh", "ssh+git")
+SCP_LIKE = re.compile(r"^(?:[^@/:]+@)?([^:/]+):(?!//)(.*)$")
+GITHUB_SSH_HOSTS = ("github.com", "ssh.github.com")
+# GitHub's published SSH host keys, as https://api.github.com/meta lists them
+# under ssh_keys; their fingerprints are on GitHub's page "GitHub's SSH key
+# fingerprints". The SSH-key check verifies github.com against these, so an
+# account that has never connected to GitHub still gets a verified answer. If
+# GitHub rotates a key, the check fails closed, reporting the answer unknown.
+GITHUB_HOST_KEYS = (
+    ("ssh-ed25519", "AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"),
+    ("ecdsa-sha2-nistp256", ("AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxk"
+                             "ZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=")),
+    ("ssh-rsa", ("AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4"
+                 "Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgV"
+                 "smerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQy"
+                 "ytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVr"
+                 "uj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ"
+                 "7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6Cm"
+                 "K2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=")),
+)
+OWNER_REPO = re.compile(r"^/?([A-Za-z0-9-]+)/([A-Za-z0-9._-]+?)(?:\.git)?/?$", re.IGNORECASE)
+
+
+class Refused(Exception):
+    """Something the operator has to decide about. Never a stack trace."""
+
+
+def run(argv: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(argv, capture_output=True, text=True, check=False, **kw)
+
+
+# Where things live.
+
+def app_dir(home: Path) -> Path:
+    return home / ".config" / "convivy" / "github-app"
+
+
+def deploy_dir(home: Path) -> Path:
+    return home / ".local" / "deploy" / "github-app"
+
+
+def bin_dir(home: Path) -> Path:
+    return home / ".local" / "bin"
+
+
+def builder_root(given: str | None, home: Path) -> Path:
+    """`--root`, else what `builder-root` prints, asked the way install-jobs
+    asks it: the linked copy first, and only a single absolute path."""
+    if given:
+        return Path(given).expanduser()
+    for candidate in (bin_dir(home) / "builder-root", shutil.which("builder-root")):
+        if not candidate or not os.path.isfile(candidate):
+            continue
+        try:
+            done = run([str(candidate)], timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        root = done.stdout.strip()
+        if done.returncode == 0 and os.path.isabs(root) and "\n" not in root:
+            return Path(root)
+    raise Refused("cannot tell where the Builder root is: `builder-root` did not answer. "
+                  "Name it with --root.")
+
+
+# The mode and the App.
+
+def recorded_mode(home: Path) -> str | None:
+    try:
+        mode = (app_dir(home) / "merge-mode").read_text().strip()
+    except OSError:
+        return None
+    return mode if mode in MODES else None
+
+
+def read_only_app_dir(home: Path) -> Path:
+    return home / ".config" / "convivy" / "github-app-read-only"
+
+
+def read_only_list(home: Path) -> Path:
+    return app_dir(home) / "read-only-repos"
+
+
+def write_read_only(home: Path, repos: list[str]) -> None:
+    # Written to a temporary file and renamed, because the minter reads this list
+    # on every credential request: a truncated list would answer a read-only
+    # repository with the first App's token.
+    fd, tmp = tempfile.mkstemp(dir=app_dir(home), prefix=".read-only-repos.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write("".join(f"{r}\n" for r in repos))
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, read_only_list(home))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def recorded_read_only(home: Path) -> list[str]:
+    try:
+        text = read_only_list(home).read_text()
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        raise Refused(f"{read_only_list(home)} cannot be read ({e.strerror}).")
+    return sorted({line.strip().lower() for line in text.splitlines()
+                   if line.strip() and not line.lstrip().startswith("#")})
+
+
+def wanted_read_only(given: list[str] | None, home: Path) -> list[str]:
+    """--read-only replaces the list; without it the recorded list stands."""
+    if given is None:
+        return recorded_read_only(home)
+    for full in given:
+        if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", full):
+            raise Refused(f"--read-only takes owner/name, and {full!r} is not that.")
+    return sorted({full.lower().removesuffix(".git") for full in given})
+
+
+def require_read_only_app(home: Path) -> None:
+    app = read_only_app_dir(home)
+    missing = [name for name in ("app-id", "app.pem") if not (app / name).is_file()]
+    if missing:
+        raise Refused(f"--read-only needs the read-only GitHub App, and {', '.join(missing)} "
+                      f"is missing from {app}. Create it with create-github-app --read-only.")
+
+
+def require_app(home: Path) -> None:
+    app = app_dir(home)
+    missing = [name for name in ("app-id", "app.pem") if not (app / name).is_file()]
+    if missing:
+        raise Refused(f"the GitHub App is not configured: {', '.join(missing)} is missing from "
+                      f"{app}. Create the App, then put its numeric id in app-id and its "
+                      f"private key in app.pem, mode 600.")
+
+
+# Placement.
+
+def head_commit(repo: Path) -> str:
+    done = run(["git", "-C", str(repo), "rev-parse", "--verify", "HEAD^{commit}"])
+    if done.returncode != 0:
+        raise Refused(f"{repo} is not a git checkout with a commit, so there is nothing "
+                      f"to place from.")
+    return done.stdout.strip()
+
+
+def placed_commit(dest: Path) -> str | None:
+    try:
+        return (dest / "COMMIT").read_text().strip()
+    except OSError:
+        return None
+
+
+def place(repo: Path, dest: Path, commit: str) -> None:
+    """Extract the shipped files at `commit` and swap them in whole."""
+    done = subprocess.run(["git", "-C", str(repo), "archive", "--format=tar", commit, "--",
+                           *SHIPPED], capture_output=True, check=False)
+    if done.returncode != 0:
+        raise Refused(f"git archive of {', '.join(SHIPPED)} at {commit[:12]} failed: "
+                      f"{done.stderr.decode(errors='replace').strip()}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(dir=dest.parent, prefix=".github-app."))
+    try:
+        with tarfile.open(fileobj=io.BytesIO(done.stdout)) as tar:
+            members = tar.getmembers()
+            names = sorted(m.name for m in members if not m.isdir())
+            if names != sorted(SHIPPED) or any(not (m.isfile() or m.isdir()) for m in members):
+                raise Refused(f"the archive at {commit[:12]} holds {names}, not exactly "
+                              f"{list(SHIPPED)} as regular files.")
+            for member in members:
+                if member.isfile():
+                    target = stage / member.name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(tar.extractfile(member).read())
+                    target.chmod(0o755)
+        (stage / "COMMIT").write_text(commit + "\n")
+        old = None
+        if dest.exists():
+            old = dest.with_name(f".{dest.name}.old.{os.getpid()}")
+            dest.rename(old)
+        stage.rename(dest)
+        if old is not None:
+            shutil.rmtree(old, ignore_errors=True)
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage, ignore_errors=True)
+
+
+# Links.
+
+def link_state(link: Path, target: Path) -> str:
+    if link.is_symlink() and os.path.realpath(link) == os.path.realpath(target):
+        return "ok"
+    if not os.path.lexists(link):
+        return "absent"
+    return "foreign"
+
+
+def gh_on_path(home: Path) -> str | None:
+    found = shutil.which("gh")
+    return os.path.realpath(found) if found else None
+
+
+# git's credential helper.
+
+def helper_value(dest: Path) -> str:
+    return f"!{shlex.quote(str(dest / 'bin' / 'github-app-token'))} git-credential"
+
+
+def helpers() -> list[str]:
+    done = run(["git", "config", "--global", "--get-all", HELPER_KEY])
+    return done.stdout.splitlines() if done.returncode == 0 else []
+
+
+def use_http_path() -> bool:
+    done = run(["git", "config", "--global", "--bool", "--get", USE_PATH_KEY])
+    return done.stdout.strip() == "true"
+
+
+def set_helpers(value: str) -> None:
+    run(["git", "config", "--global", "--unset-all", HELPER_KEY])
+    for v in ("", value):
+        done = run(["git", "config", "--global", "--add", HELPER_KEY, v])
+        if done.returncode != 0:
+            raise Refused(f"git could not set {HELPER_KEY}: {done.stderr.strip()}")
+
+
+# Remotes.
+
+def checkouts(root: Path) -> list[Path]:
+    found = []
+    base = len(root.parts)
+    for dirpath, dirnames, _ in os.walk(root):
+        here = Path(dirpath)
+        if (here / ".git").exists():
+            found.append(here)
+        if len(here.parts) - base >= CHECKOUT_DEPTH:
+            dirnames[:] = []
+        else:
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith(".")
+                                 and d != "node_modules")
+    return found
+
+
+def ssh_host_and_path(url: str) -> tuple[str, str] | None:
+    """The host and path of an SSH remote, or None for any other kind."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme.lower() in SSH_SCHEMES:
+        return (parsed.hostname, parsed.path) if parsed.hostname else None
+    if "://" in url or url.startswith(("/", ".")):
+        return None
+    m = SCP_LIKE.match(url)
+    return (m.group(1), m.group(2)) if m else None
+
+
+def ssh_hostname(host: str, cache: dict[str, str]) -> str:
+    """Where ssh would really connect for `host`, after ~/.ssh/config."""
+    if host not in cache:
+        resolved = host
+        try:
+            done = run(["ssh", "-G", host], timeout=30)
+            for line in done.stdout.splitlines():
+                name, _, value = line.partition(" ")
+                if name == "hostname" and value:
+                    resolved = value.strip()
+                    break
+        except (OSError, subprocess.SubprocessError):
+            pass
+        cache[host] = resolved.lower()
+    return cache[host]
+
+
+def https_for(path: str) -> str | None:
+    m = OWNER_REPO.match(path)
+    return f"https://github.com/{m.group(1)}/{m.group(2)}.git" if m else None
+
+
+def ssh_remotes(checkout: Path, cache: dict[str, str]) -> list[tuple[str, str, str | None]]:
+    """(config key, ssh url, https url) for each distinct GitHub SSH url this
+    checkout uses. The https url is None when the path is not owner/repo, and
+    such a remote is left for the refusal to name."""
+    done = run(["git", "-C", str(checkout), "config", "--local", "--get-regexp",
+                r"^remote\..*\.(url|pushurl)$"])
+    out = []
+    for line in done.stdout.splitlines():
+        key, _, url = line.partition(" ")
+        parts = ssh_host_and_path(url)
+        if not parts or ssh_hostname(parts[0], cache) not in GITHUB_SSH_HOSTS:
+            continue
+        entry = (key, url, https_for(parts[1]))
+        if entry not in out:
+            out.append(entry)
+    return out
+
+
+def rewrite(checkout: Path, key: str, ssh: str, https: str) -> None:
+    done = run(["git", "-C", str(checkout), "config", "--local", "--replace-all", key, https,
+                f"^{re.escape(ssh)}$"])
+    if done.returncode != 0:
+        # Neither the url nor git's message is printed: both can carry the
+        # operator's url, and a url can carry a token.
+        raise Refused(f"{checkout}: git could not rewrite {key} (exit {done.returncode}).")
+
+
+# Operator credentials.
+
+def real_gh(home: Path, dest: Path) -> str | None:
+    minter = os.path.realpath(dest / "bin" / "github-app-token")
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = Path(entry or ".") / "gh"
+        if candidate.is_file() and os.access(candidate, os.X_OK) \
+                and os.path.realpath(candidate) != minter:
+            return str(candidate)
+    return None
+
+
+TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN")
+PROFILES = (".profile", ".bash_profile", ".bashrc", ".bash_login", ".zshenv", ".zprofile",
+            ".zshrc", ".zlogin", ".config/fish/config.fish")
+TOKEN_IN_PROFILE = re.compile(r"\b(?:GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN)\s*=")
+
+
+def app_token(home: Path) -> str | None:
+    try:
+        cached = json.loads((app_dir(home) / "token.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return cached.get("token") if isinstance(cached, dict) else None
+
+
+def token_variables(home: Path) -> list[str]:
+    """A GitHub token in this environment, or set by a shell profile, that is
+    not the App's own: every tool that reads the variable would use it."""
+    found = [f"{name} set in this shell's environment" for name in TOKEN_VARS
+             if os.environ.get(name) and os.environ[name] != app_token(home)]
+    for name in PROFILES:
+        try:
+            text = (home / name).read_text(errors="replace")
+        except OSError:
+            continue
+        if any(TOKEN_IN_PROFILE.search(line) and not line.lstrip().startswith("#")
+               for line in text.splitlines()):
+            found.append(f"a GitHub token variable set in {home / name}")
+    return found
+
+
+def netrc_entries(home: Path) -> list[str]:
+    """A ~/.netrc entry curl would send to github.com: git's https transport
+    reads it without asking any credential helper. `default` matches every
+    host. Only the presence is reported, never the entry."""
+    path = home / ".netrc"
+    try:
+        # curl matches the keywords and the host without regard to case.
+        words = path.read_text(errors="replace").lower().split()
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        return [f"unknown: {path} could not be read ({e})"]
+    for i, word in enumerate(words):
+        if word == "default" or (word == "machine" and i + 1 < len(words)
+                                 and words[i + 1] == "github.com"):
+            return [f"a {path} entry git would send to github.com"]
+    return []
+
+
+def fallback_credentials(home: Path) -> list[str]:
+    """Ask git, in the home, for a github.com credential with the App's
+    minter unable to answer. Whatever answers instead is a helper git falls
+    back to: a keychain, a credential manager or a store file, none of which
+    reading the config shows. Only the home: a checkout's own helper is
+    read by `checkout_helpers`, never run, since a checkout's config is
+    anyone's to write."""
+    empty = tempfile.mkdtemp(prefix="connect-github-probe.")
+    env = dict(os.environ, BUILDER_GITHUB_APP_DIR=empty, GIT_TERMINAL_PROMPT="0",
+               GIT_ASKPASS="false", SSH_ASKPASS="false", GCM_INTERACTIVE="never")
+    try:
+        done = run(["git", "-C", str(home), "credential", "fill"], env=env,
+                   input="protocol=https\nhost=github.com\n\n", timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        return [f"unknown: git credential fill could not be run in {home} ({e})"]
+    finally:
+        shutil.rmtree(empty, ignore_errors=True)
+    if done.returncode == 0 and "\npassword=" in "\n" + done.stdout:
+        return [(f"a credential helper git falls back to for github.com when the App cannot "
+                 f"answer, in {home}")]
+    return []
+
+
+def helper_lines(place: Path) -> set[str] | None:
+    """Every credential helper git sees in `place`, with the file that sets
+    it, read from the config and never run. None when git could not say."""
+    done = run(["git", "-C", str(place), "config", "--show-origin", "--get-regexp",
+                r"^credential\..*helper$"])
+    # 1 is git's answer for "no such key".
+    if done.returncode not in (0, 1):
+        return None
+    return {line for line in done.stdout.splitlines() if line.strip()}
+
+
+def printable_key(key: str) -> str:
+    """A git config key with the url in its middle replaced by `<url>`, as in
+    `url.<url>.insteadof` or `credential.<url>.helper`. The url is the operator's
+    and can carry a token in any part of it, so none of it is printed; the place
+    and the file printed beside the key say where to look."""
+    section, dot, rest = key.partition(".")
+    _, dot2, name = rest.rpartition(".")
+    if not dot or not dot2:
+        return key
+    return f"{section}.<url>.{name}"
+
+
+def checkout_helpers(home: Path, checkouts: list[Path]) -> list[str]:
+    """Credential helpers a checkout sees and the home does not: its own
+    config, a worktree's, or an `includeIf` that names it. The probe in the
+    home has already asked every helper the two share."""
+    shared = helper_lines(home)
+    if shared is None:
+        return [f"unknown: git could not list the credential helpers in {home}"]
+    found = []
+    for place in checkouts:
+        lines = helper_lines(place)
+        if lines is None:
+            found.append(f"unknown: git could not list the credential helpers in {place}")
+            continue
+        for line in sorted(lines - shared):
+            origin, _, rest = line.partition("\t")
+            key, _, value = rest.partition(" ")
+            if value.strip():
+                found.append(f"a credential helper set for {place}: {printable_key(key)}, "
+                             f"from {origin}")
+    return found
+
+
+# The form of every GitHub remote once SSH remotes are rewritten. A rule whose
+# value is a prefix of it applies, since git matches by prefix: `https://`
+# alone sends every GitHub fetch through another base.
+GITHUB_HTTPS = "https://github.com/"
+
+
+def url_rewrites(places: list[Path]) -> list[str]:
+    """`url.<base>.insteadOf` and `pushInsteadOf` rules that rewrite a
+    github.com url, or name github.com at all: one can send an https remote
+    over SSH or elsewhere, or carry a token inside the url itself."""
+    found = []
+    for place in places:
+        done = run(["git", "-C", str(place), "config", "--get-regexp",
+                    r"^url\..*\.(insteadof|pushinsteadof)$"])
+        for line in done.stdout.splitlines():
+            key, _, value = line.partition(" ")
+            # An empty value is a prefix of every url, and git applies it.
+            if "github.com" in line.lower() or GITHUB_HTTPS.startswith(value):
+                found.append(f"a url rewrite for github.com in {place}: {printable_key(key)}")
+    return sorted(set(found))
+
+
+def operator_credentials(home: Path, dest: Path, checkouts: list[Path]) -> list[str]:
+    """What on this account could act on GitHub as someone other than the App.
+    An answer that could not be had is listed too, as unknown. The git config
+    read is the home's and every checkout's."""
+    found = (token_variables(home) + netrc_entries(home) + fallback_credentials(home)
+             + checkout_helpers(home, checkouts) + url_rewrites([home, *checkouts]))
+    gh = real_gh(home, dest)
+    if gh:
+        env = {k: v for k, v in os.environ.items() if k not in TOKEN_VARS}
+        done = run([gh, "auth", "token", "--hostname", "github.com"], env=env, timeout=30)
+        if done.returncode == 0 and done.stdout.strip():
+            found.append(f"a gh login ({gh} auth token answers with a token)")
+    # An account that has never connected to GitHub has no host key for it,
+    # and ssh in batch mode then refuses before GitHub says anything about
+    # keys, so enforced could never be active on a fresh account (rehearsal of
+    # the single-account install). GitHub's published keys go in a throwaway
+    # file listed first, and the account's own known_hosts is read after it and
+    # never written. An unverified key would let anyone on the network answer
+    # "Permission denied" and have enforced reported active (security review).
+    try:
+        with tempfile.TemporaryDirectory() as scratch:
+            pinned = Path(scratch) / "known_hosts"
+            pinned.write_text("".join(f"github.com {kind} {key}\n" for kind, key in GITHUB_HOST_KEYS))
+            known = f'"{pinned}" "{home / ".ssh" / "known_hosts"}"'
+            done = run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                        "-o", "StrictHostKeyChecking=yes",
+                        "-o", f"UserKnownHostsFile={known}",
+                        "-l", "git", "github.com"], timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        found.append(f"unknown: ssh could not be run to ask GitHub about SSH keys ({e})")
+        return found
+    said = done.stderr + done.stdout
+    hi = re.search(r"Hi ([^!\s]+)! You've successfully authenticated", said)
+    if hi:
+        found.append(f"an SSH key GitHub accepts, as {hi.group(1)}")
+    elif "Permission denied" not in said:
+        found.append(f"unknown: ssh to GitHub did not say whether a key is accepted "
+                     f"({said.strip().splitlines()[-1] if said.strip() else 'no output'})")
+    return found
+
+
+# The run.
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog=PROG, description=__doc__.splitlines()[0])
+    parser.add_argument("--mode", choices=MODES,
+                        help="the merge mode: enforced requires the operator's approval on "
+                             "GitHub for a pull request an agent opened; instruction leaves no-merge to the agents' instructions")
+    parser.add_argument("--root", help="the Builder root (default: what builder-root prints)")
+    parser.add_argument("--check", action="store_true", help="report only, change nothing")
+    parser.add_argument("--read-only", action="append", metavar="OWNER/NAME",
+                        help="a repository git reaches through the read-only App (repeatable); "
+                             "given at all, it replaces the recorded list")
+    args = parser.parse_args(argv)
+    home = Path.home()
+    try:
+        return connect(args, home)
+    except Refused as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 2
+
+
+def connect(args: argparse.Namespace, home: Path) -> int:
+    mode = args.mode or recorded_mode(home)
+    if not mode:
+        raise Refused("name the merge mode with --mode enforced or --mode instruction. "
+                      "Enforced requires your approval on GitHub before a pull request an agent "
+                      "opened can merge; "
+                      "instruction leaves it to the agents' instructions.")
+    require_app(home)
+    read_only = wanted_read_only(args.read_only, home)
+    if read_only:
+        require_read_only_app(home)
+    root = builder_root(args.root, home)
+    if not root.is_dir():
+        raise Refused(f"the Builder root {root} is not a directory.")
+    dest = deploy_dir(home)
+    minter = dest / "bin" / "github-app-token"
+    links = {bin_dir(home) / "github-app-token": minter, bin_dir(home) / "gh": minter,
+             bin_dir(home) / "github-gate": dest / "bin" / "github-gate"}
+    foreign = [str(link) for link, target in links.items()
+               if link_state(link, target) == "foreign"]
+    if foreign:
+        raise Refused(f"{', '.join(foreign)} already exists and is not this command's link. "
+                      f"Move it aside; nothing was changed.")
+    commit = head_commit(REPO)
+    hosts: dict[str, str] = {}
+    remotes = [(c, *r) for c in checkouts(root) for r in ssh_remotes(c, hosts)]
+
+    todo = []
+    if placed_commit(dest) != commit:
+        todo.append(f"place {', '.join(SHIPPED)} at {commit[:12]} in {dest}")
+    todo += [f"link {link} to {target}" for link, target in links.items()
+             if link_state(link, target) != "ok"]
+    if helpers() != ["", helper_value(dest)]:
+        todo.append(f"set git's {HELPER_KEY} to the placed minter alone")
+    if not use_http_path():
+        todo.append(f"set git's {USE_PATH_KEY}, so the minter sees the repository")
+    if recorded_read_only(home) != read_only:
+        todo.append(f"record the read-only repositories as {', '.join(read_only) or 'none'}")
+    todo += [f"rewrite {c} {key} to {https}" for c, key, _, https in remotes if https]
+    todo += [f"rewrite {c} {key}: its url reaches GitHub over SSH and is not owner/repo, "
+             f"so it cannot be rewritten" for c, key, _, https in remotes if not https]
+    if recorded_mode(home) != mode:
+        todo.append(f"record the merge mode as {mode}")
+
+    if args.check:
+        for line in todo:
+            print(f"  todo  {line}")
+    else:
+        if placed_commit(dest) != commit:
+            place(REPO, dest, commit)
+        bin_dir(home).mkdir(parents=True, exist_ok=True)
+        for link, target in links.items():
+            if link_state(link, target) == "absent":
+                link.symlink_to(target)
+        if helpers() != ["", helper_value(dest)]:
+            set_helpers(helper_value(dest))
+        if not use_http_path():
+            done = run(["git", "config", "--global", USE_PATH_KEY, "true"])
+            if done.returncode != 0:
+                raise Refused(f"git could not set {USE_PATH_KEY}: {done.stderr.strip()}")
+        if recorded_read_only(home) != read_only:
+            if read_only:
+                write_read_only(home, read_only)
+            else:
+                read_only_list(home).unlink(missing_ok=True)
+        for c, key, ssh, https in remotes:
+            if https:
+                rewrite(c, key, ssh, https)
+        left = [(c, key, ssh) for c in checkouts(root) for key, ssh, _ in ssh_remotes(c, hosts)]
+        if left:
+            raise Refused("these remotes still use SSH, so pushes to them skip the App: "
+                          + "; ".join(f"{c} {key}" for c, key, _ in left))
+        if recorded_mode(home) != mode:
+            (app_dir(home) / "merge-mode").write_text(mode + "\n")
+        minted = run([str(minter)], timeout=60)
+        if minted.returncode != 0 or not minted.stdout.strip():
+            raise Refused(f"everything is in place, but the App would not mint a token: "
+                          f"{minted.stderr.strip()}")
+        if read_only:
+            asked = run([str(minter), "git-credential", "get"], timeout=60,
+                        input=f"protocol=https\nhost=github.com\npath={read_only[0]}.git\n\n")
+            if asked.returncode != 0 or "\npassword=" not in "\n" + asked.stdout:
+                raise Refused(f"everything is in place, but the read-only App would not mint "
+                              f"a token for {read_only[0]}: {asked.stderr.strip()}")
+        for line in todo:
+            print(f"  done  {line}")
+
+    on_path = gh_on_path(home)
+    if on_path != os.path.realpath(minter):
+        print(f"  WRONG `gh` on PATH is {on_path or 'nothing'}, not the link in {bin_dir(home)}. "
+              f"Put {bin_dir(home)} first on PATH.")
+    found = operator_credentials(home, dest, checkouts(root))
+    for item in found:
+        print(f"  found {item}")
+    operator = " --operator <your GitHub login>" if mode == "enforced" else ""
+    gate = (f"github-gate --ruleset --shape single --mode {mode}{operator} "
+            f"--require-check <check>")
+    if mode == "enforced":
+        if found or on_path != os.path.realpath(minter):
+            print(f"{PROG}: enforced is recorded but NOT active: the account can still act "
+                  f"on GitHub as someone other than the App. Remove what is listed above "
+                  f"and run {PROG} again.")
+            return 1
+        print(f"{PROG}: enforced is active. Import the ruleset `{gate}` prints, if you have "
+              f"not already.")
+    else:
+        print(f"{PROG}: instruction mode. Import the ruleset `{gate}` prints, if you have "
+              f"not already.")
+    if args.check and todo:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

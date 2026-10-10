@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""A current GitHub App installation token, for a single-account install whose
+agents reach GitHub as an App rather than as the operator.
+
+    github-app-token                     print a current token
+    github-app-token git-credential get  answer git's credential protocol
+    gh ...                               (linked as `gh`) run the real gh with GH_TOKEN set
+
+**The App is configured by three files** in the `github-app` directory under
+Builder's configuration directory, `~/.config/convivy`: `app-id` (the App's numeric id), `app.pem` (its private key, mode 600) and,
+when the App is installed on more than one account, `installation-id`. With a
+single installation the id is read from GitHub.
+
+**A token is minted once and reused until ten minutes before it expires.** The
+cache is `token.json` in the same directory, mode 600. GitHub gives an
+installation token one hour, so a session of any length gets a token that is
+still valid when it is used.
+
+**As a git credential helper** it answers `get` for https://github.com with the
+token as the password, ignores `store`, and drops the cached token on `erase`,
+which git sends when GitHub rejects a credential, so the next request mints a
+fresh one. Configure it with
+
+    git config --global credential.https://github.com.helper '!github-app-token git-credential'
+
+**A repository listed in `read-only-repos`** in the same directory, one
+`owner/name` a line, is answered from the read-only App in the
+`github-app-read-only` directory beside it, so its token can read and never
+write. git sends the repository only with `credential.useHttpPath`, which
+connect-github sets for github.com. A listed repository whose read-only App is
+missing is refused rather than answered with the first App's token. The list
+guards against an agent's mistake, not its intent: every agent can read both
+keys.
+
+**Linked as `gh`** ahead of the real gh on PATH, it sets `GH_TOKEN` and runs
+the first other `gh` on PATH. The link is plumbing, not a control: the App's
+key is the only GitHub credential on the machine, so running the real gh
+directly gains nothing.
+"""
+
+from __future__ import annotations
+
+import calendar
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import sys
+import tempfile
+import time
+
+PROG = "github-app-token"
+
+# Mint again when the cached token has less than this long left.
+REFRESH_MARGIN = 600
+
+
+def _load_sibling(module_name: str, filename: str):
+    # Resolved, so a link named `gh` elsewhere on PATH still finds the real
+    # directory. The same loader bin/install-privileged uses for github-gate.
+    here = pathlib.Path(__file__).resolve().parent
+    loader = importlib.machinery.SourceFileLoader(module_name, str(here / filename))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(module_name, loader))
+    # Registered first: dataclasses looks the module up by name while it executes.
+    sys.modules[module_name] = module
+    loader.exec_module(module)
+    return module
+
+
+# The JWT, the API request and the openssl path are github-gate's, so the two
+# commands cannot sign or call GitHub differently.
+gg = _load_sibling("github_gate", "github-gate")
+API = gg.API
+OPENSSL = gg.OPENSSL
+Refused = gg.Refused
+message = gg.message
+
+
+def github(method: str, url: str, bearer: str) -> tuple[int, object]:
+    return gg.github(method, url, bearer, None, user_agent=PROG)
+
+
+def config_dir() -> pathlib.Path:
+    # Overridable so the tests run against a temporary directory.
+    override = os.environ.get("BUILDER_GITHUB_APP_DIR")
+    if override:
+        return pathlib.Path(override)
+    return pathlib.Path.home() / ".config" / "convivy" / "github-app"
+
+
+def read_text(path: pathlib.Path, what: str) -> str:
+    try:
+        value = path.read_text().strip()
+    except FileNotFoundError:
+        raise Refused(f"{path} is missing. It holds {what}.")
+    except OSError as e:
+        raise Refused(f"{path} cannot be read ({e.strerror}). It holds {what}.")
+    if not value:
+        raise Refused(f"{path} is empty. It holds {what}.")
+    return value
+
+
+def key_path(cfg: pathlib.Path) -> pathlib.Path:
+    path = cfg / "app.pem"
+    try:
+        mode = path.stat().st_mode & 0o777
+    except FileNotFoundError:
+        raise Refused(f"{path} is missing. It holds the App's private key, which the "
+                      "App's settings page on GitHub generates as a .pem file.")
+    if mode & 0o077:
+        raise Refused(f"{path} grants other accounts access (mode {mode:o}). "
+                      f"Run: chmod 600 {path}")
+    if not os.access(path, os.R_OK):
+        raise Refused(f"{path} cannot be read by this account.")
+    return path
+
+
+def app_jwt(key: pathlib.Path, app_id: str, now: int) -> str:
+    return gg.app_jwt(str(key), app_id, now)
+
+
+def installation_id(cfg: pathlib.Path, jwt: str, request) -> str:
+    configured = cfg / "installation-id"
+    if configured.exists():
+        return read_text(configured, "the App installation's numeric id")
+    code, payload = request("GET", f"{API}/app/installations", jwt)
+    if code != 200 or not isinstance(payload, list):
+        raise Refused(f"GitHub would not list the App's installations ({code}): "
+                      f"{message(payload)}")
+    if len(payload) == 1:
+        return str(payload[0].get("id"))
+    if not payload:
+        raise Refused("The App is not installed anywhere. Install it on the account "
+                      "or organisation that holds your repositories.")
+    owners = ", ".join(f"{(i.get('account') or {}).get('login')} ({i.get('id')})"
+                       for i in payload)
+    raise Refused(f"The App is installed on more than one account: {owners}. Write the "
+                  f"one to use into {configured}.")
+
+
+def mint(cfg: pathlib.Path, now: int, request) -> dict:
+    app_id = read_text(cfg / "app-id", "the App's numeric id")
+    jwt = app_jwt(key_path(cfg), app_id, now)
+    inst = installation_id(cfg, jwt, request)
+    code, payload = request("POST", f"{API}/app/installations/{inst}/access_tokens", jwt)
+    token = payload.get("token") if code == 201 and isinstance(payload, dict) else None
+    expires = payload.get("expires_at") if isinstance(payload, dict) else None
+    if not token or not expires:
+        raise Refused(f"GitHub refused an installation token ({code}): {message(payload)}")
+    try:
+        expires_at = calendar.timegm(time.strptime(expires, "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        raise Refused(f"GitHub gave the token an expiry it did not format as UTC: {expires!r}")
+    # A repository listed as read-only must be out of this App's reach, or any
+    # caller of this token, gh included, could write to it. git alone routes by
+    # path; GitHub's own installation boundary holds for every caller.
+    listed = read_only_repos(cfg)
+    both = sorted(listed & installation_repos(token, request)) if listed else []
+    if both:
+        raise Refused(f"this App can reach {', '.join(both)}, which {cfg / READ_ONLY_LIST} "
+                      f"lists as read-only, so its token could write there. Remove "
+                      f"{'them' if len(both) > 1 else 'it'} from the App's installation on "
+                      f"GitHub, or from the list.")
+    return {"token": token, "expires_at": expires_at, "installation_id": inst,
+            "read_only": sorted(listed)}
+
+
+def installation_repos(token: str, request) -> set[str]:
+    """Every repository, as lowercase owner/name, an installation token reaches."""
+    found: set[str] = set()
+    page = 1
+    while True:
+        code, payload = request(
+            "GET", f"{API}/installation/repositories?per_page=100&page={page}", token)
+        repos = payload.get("repositories") if code == 200 and isinstance(payload, dict) else None
+        if not isinstance(repos, list):
+            raise Refused(f"GitHub would not list the repositories this App reaches ({code}): "
+                          f"{message(payload)}")
+        found |= {r["full_name"].lower() for r in repos
+                  if isinstance(r, dict) and isinstance(r.get("full_name"), str)}
+        if len(repos) < 100:
+            return found
+        page += 1
+
+
+# The cache.
+
+def cache_path(cfg: pathlib.Path) -> pathlib.Path:
+    return cfg / "token.json"
+
+
+def read_cache(cfg: pathlib.Path, now: int) -> str | None:
+    try:
+        cached = json.loads(cache_path(cfg).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(cached, dict):
+        return None
+    token, expires_at = cached.get("token"), cached.get("expires_at")
+    # A token was checked against the read-only list it was minted under, so a
+    # changed list sends it back through mint() and the check runs again.
+    if cached.get("read_only", []) != sorted(read_only_repos(cfg)):
+        return None
+    if isinstance(token, str) and token and isinstance(expires_at, int) \
+            and expires_at - now > REFRESH_MARGIN:
+        return token
+    return None
+
+
+def write_cache(cfg: pathlib.Path, entry: dict) -> None:
+    # Written to a temporary file and renamed, so a concurrent reader sees the
+    # old token or the new one and never half of either.
+    fd, tmp = tempfile.mkstemp(dir=cfg, prefix=".token.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(entry, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, cache_path(cfg))
+    except BaseException:
+        unlink_quietly(tmp)
+        raise
+
+
+def unlink_quietly(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def drop_cache(cfg: pathlib.Path) -> None:
+    unlink_quietly(str(cache_path(cfg)))
+
+
+def current_token(cfg: pathlib.Path | None = None, now: int | None = None,
+                  request=github) -> str:
+    cfg = cfg or config_dir()
+    now = int(time.time()) if now is None else now
+    cached = read_cache(cfg, now)
+    if cached:
+        return cached
+    entry = mint(cfg, now, request)
+    write_cache(cfg, entry)
+    return entry["token"]
+
+
+# The read-only App.
+
+READ_ONLY_LIST = "read-only-repos"
+
+
+def read_only_dir(cfg: pathlib.Path) -> pathlib.Path:
+    """The optional second App's directory, beside the first: where
+    create-github-app --read-only writes it."""
+    return cfg.parent / f"{cfg.name}-read-only"
+
+
+def read_only_repos(cfg: pathlib.Path) -> set[str]:
+    """The repositories, as lowercase owner/name, that git reaches through the
+    read-only App. connect-github --read-only writes the list."""
+    try:
+        text = (cfg / READ_ONLY_LIST).read_text()
+    except FileNotFoundError:
+        return set()
+    except OSError as e:
+        raise Refused(f"{cfg / READ_ONLY_LIST} cannot be read ({e.strerror}), so which "
+                      f"repositories are read-only is unknown.")
+    return {line.strip().lower() for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")}
+
+
+def repo_of(path: str) -> str:
+    """owner/name from the path git sends with credential.useHttpPath, such as
+    `owner/name.git` or `owner/name.git/info/refs`."""
+    parts = [p for p in path.split("/") if p]
+    if len(parts) < 2:
+        return ""
+    return f"{parts[0]}/{parts[1]}".lower().removesuffix(".git")
+
+
+def app_for(cfg: pathlib.Path, path: str) -> pathlib.Path:
+    """The App directory that answers for this path. A listed repository is
+    answered by the read-only App or not at all: never by the first App,
+    whose token can write."""
+    repo = repo_of(path)
+    if not repo or repo not in read_only_repos(cfg):
+        return cfg
+    ro = read_only_dir(cfg)
+    if not (ro / "app-id").is_file():
+        raise Refused(f"{repo} is listed in {cfg / READ_ONLY_LIST} as read-only, and the "
+                      f"read-only App is not configured in {ro}. Create it with "
+                      f"create-github-app --read-only.")
+    return ro
+
+
+# git's credential protocol.
+
+def git_credential(action: str, stdin, stdout, cfg: pathlib.Path | None = None,
+                   now: int | None = None, request=github) -> int:
+    fields = {}
+    for line in stdin.read().splitlines():
+        if not line:
+            break
+        name, _, value = line.partition("=")
+        fields[name] = value
+    if fields.get("protocol") != "https" or fields.get("host") != "github.com":
+        return 0
+    cfg = app_for(cfg or config_dir(), fields.get("path", ""))
+    if action == "erase":
+        drop_cache(cfg)
+        return 0
+    if action != "get":
+        return 0
+    token = current_token(cfg, now, request)
+    stdout.write(f"username=x-access-token\npassword={token}\n")
+    return 0
+
+
+# gh.
+
+def real_gh(self_path: pathlib.Path, path_env: str) -> str:
+    """The first `gh` on PATH that is not this command under another name."""
+    me = self_path.resolve()
+    for entry in path_env.split(os.pathsep):
+        candidate = pathlib.Path(entry or ".") / "gh"
+        if candidate.is_file() and os.access(candidate, os.X_OK) \
+                and candidate.resolve() != me:
+            return str(candidate)
+    raise Refused("No gh is on PATH apart from this link. Install the GitHub CLI.")
+
+
+def run_gh(argv: list[str]) -> int:
+    env = dict(os.environ, GH_TOKEN=current_token())
+    gh = real_gh(pathlib.Path(__file__), env.get("PATH", ""))
+    os.execve(gh, [gh, *argv], env)
+    return 127  # not reached
+
+
+def main(argv: list[str], invoked_as: str) -> int:
+    try:
+        if invoked_as == "gh":
+            return run_gh(argv)
+        if not argv:
+            print(current_token())
+            return 0
+        if argv[0] == "git-credential" and len(argv) == 2:
+            return git_credential(argv[1], sys.stdin, sys.stdout)
+        print(f"usage: {PROG} [git-credential get|store|erase]", file=sys.stderr)
+        return 2
+    except Refused as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:], pathlib.Path(sys.argv[0]).name))

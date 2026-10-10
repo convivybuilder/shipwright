@@ -1,0 +1,42 @@
+profile: platform/default
+
+# The profile a crew is given when it has none of its own: knowledge-ctx falls
+# back to it, and says so on stderr. It decides which documents a crew's
+# session starts with: the four starter agents, the skills, and the decisions
+# and runbooks recorded under `platform`.
+#
+# This file is yours to edit. To give one crew a different set, copy it to
+# projects/<crew>/profiles/daytime.yaml, change the first line to
+# `profile: <crew>/daytime`, and add include rules for documents you write under
+# your own projects. Name the copy daytime.yaml: knowledge-ctx does not count a
+# crew's own default.yaml as a profile, and falls back to this file.
+
+include:
+  # `planning-orchestrator` is the crew's own interactive session: `co` with no
+  # argument launches `claude --agent planning-orchestrator`, so a profile
+  # without it leaves the crew unlaunchable as that agent. The other three are
+  # the agents that session dispatches.
+  - kind: agent
+    project: [platform]
+    audience_contains:
+      - planning-orchestrator
+      - coder
+      - reviewer
+      - security-reviewer
+
+  # The starter set ships no skills, so this rule matches nothing at first. The
+  # Library refuses to dispatch an agent whose skill rule matches nothing,
+  # unless the agent's definition says `takes_none_of: [skill]`, which each
+  # starter agent does. A skill you write that lists one of them in its
+  # audience is still given to it.
+  - kind: skill
+    project: [platform]
+    status: current
+
+  - kind: decision
+    project: [platform]
+    status: current
+
+  - kind: runbook
+    project: [platform]
+    status: current

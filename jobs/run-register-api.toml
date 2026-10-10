@@ -1,0 +1,26 @@
+name = "run-register-api"
+description = "Serves the run register, which is how a dispatched run reports what it did and how a session asks after one. The Library reads it before it records a review, so without it no review can be posted, and a fresh install starts it."
+label = "com.convivy.run-register-api"
+command = [
+  "{deploy}/agent-platform/.venv/bin/python3",
+  "{deploy}/agent-platform/bin/run-register-api",
+]
+platforms = ["macos", "linux"]
+scope = "user"
+enabled-by-default = true
+working-directory = "{deploy}/agent-platform"
+
+[log]
+stdout = "{state}/run-register-api.log"
+stderr = "{state}/run-register-api.err.log"
+
+[environment]
+HOME = "{home}"
+PATH = "{bin}:/usr/bin:/bin"
+
+[schedule]
+at-load = true
+
+[restart]
+policy = "always"
+delay-seconds = 10

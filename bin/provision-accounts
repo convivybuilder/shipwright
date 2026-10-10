@@ -1,0 +1,723 @@
+#!/usr/bin/env python3
+"""Create the two accounts Builder runs as, and prove they have the right shape.
+
+    sudo bin/provision-accounts                 create what is missing
+    sudo bin/provision-accounts --dry-run       say what would happen, change nothing
+    sudo bin/provision-accounts --check         report only; exit 1 on any failing row
+    sudo bin/provision-accounts --remove [--purge-homes]
+
+**Builder runs as `agents`, and its reviews run as `reviewers`.** Neither may
+hold anything of the operator's: no admin rights, no `staff` membership, and a
+home the other service account cannot read. The operator joins both accounts'
+groups, which is how they read session output without sudo, and `agents` joins
+the group that macOS's Remote Login admits, which is how the operator reaches
+sessions over ssh.
+
+**An account of the wrong shape is refused, never corrected.** A primary group
+of `staff`, an admin membership, or a home readable by others means something
+else made that account, and changing it silently could break whatever did. The
+refusal prints the command that fixes it. What this adds to an account that is
+otherwise right, the operator's membership, the ssh membership and the hidden
+flag, it adds and names in its report.
+
+**Every check below runs again after a change**, and the run fails on any row
+that reads like the failing state. Each membership row is asked of the
+directory service rather than read from what this command did, because what
+this command did is what is being checked.
+
+**On macOS the accounts are not role accounts.** `sysadminctl -roleAccount`
+requires a name starting with `_` and a user ID from 450 to 499, which its own
+help text says. The accounts keep the names the rest of Builder uses and take
+an ID from 401 to 449 instead, and the hidden flag keeps them off the login
+window.
+
+Needs root, so the administrator password is asked once, by sudo.
+"""
+
+from __future__ import annotations
+
+import argparse
+import grp
+import os
+import pwd
+import secrets
+import shutil
+import stat
+import subprocess
+import sys
+from dataclasses import dataclass, field
+
+PROG = "provision-accounts"
+
+SERVICE_ACCOUNTS = ("agents", "reviewers")
+# The one service account the operator reaches over ssh.
+SSH_ACCOUNT = "agents"
+HOME_MODE = 0o750
+
+# User and group IDs for a new macOS account. Below 500, so macOS treats it as
+# a service account; below 450, because 450 to 499 is the role-account range.
+MAC_ID_RANGE = range(401, 450)
+
+
+class Refused(Exception):
+    """Something the operator has to decide about. Never a stack trace."""
+
+
+@dataclass
+class Account:
+    name: str
+    uid: int
+    gid: int
+    home: str
+
+
+@dataclass
+class Row:
+    """One line of the verification table."""
+
+    what: str
+    ok: bool
+    # What brings a failing row to the passing state, or "" when nothing here
+    # can, and whether this command applies it itself.
+    fix: str = ""
+    addable: bool = False
+
+
+@dataclass
+class Report:
+    rows: list[Row] = field(default_factory=list)
+
+    def add(self, what: str, ok: bool, fix: str = "", addable: bool = False) -> None:
+        self.rows.append(Row(what, ok, fix, addable))
+
+    @property
+    def wrong(self) -> list[Row]:
+        return [r for r in self.rows if not r.ok and not r.addable]
+
+    @property
+    def to_add(self) -> list[Row]:
+        return [r for r in self.rows if not r.ok and r.addable]
+
+
+def user_record(name: str) -> str:
+    """The account's record in the local directory node, as dscl names it.
+
+    A directory-service path rather than a filesystem one: the home is
+    whatever this record's NFSHomeDirectory says, read through `pwd`.
+    """
+    return f"/Users/{name}"
+
+
+def run(argv: list[str], stdin: str = "") -> subprocess.CompletedProcess:
+    """Run a command. Its standard input is `stdin`, never the terminal."""
+    return subprocess.run(argv, input=stdin, capture_output=True, text=True, check=False)
+
+
+class System:
+    """The directory service and the account commands for one platform.
+
+    Reads go through `pwd`, `grp` and `os.stat`, which ask the same directory
+    service `dscl` and `getent` do. Tests replace this class.
+    """
+
+    platform = ""
+    admin_groups: tuple[str, ...] = ()
+    staff_group = "staff"
+    ssh_group: str | None = None
+
+    def __init__(self, runner=run):
+        self.run = runner
+
+    def account(self, name: str) -> Account | None:
+        try:
+            entry = pwd.getpwnam(name)
+        except KeyError:
+            return None
+        return Account(name, entry.pw_uid, entry.pw_gid, entry.pw_dir)
+
+    def group_name(self, gid: int) -> str | None:
+        try:
+            return grp.getgrgid(gid).gr_name
+        except KeyError:
+            return None
+
+    def group_exists(self, name: str) -> bool:
+        try:
+            grp.getgrnam(name)
+        except KeyError:
+            return False
+        return True
+
+    def groups_of(self, user: str) -> set[str]:
+        done = self.run(["/usr/bin/id", "-Gn", user])
+        if done.returncode != 0:
+            raise Refused(f"`id -Gn {user}` failed: {done.stderr.strip()}")
+        return set(done.stdout.split())
+
+    def is_member(self, user: str, group: str) -> bool:
+        return group in self.groups_of(user)
+
+    def home_stat(self, path: str) -> os.stat_result | None:
+        try:
+            return os.lstat(path)
+        except FileNotFoundError:
+            return None
+
+    def home_is_empty(self, path: str) -> bool:
+        try:
+            return not os.listdir(path)
+        except FileNotFoundError:
+            return True
+
+    def can_list(self, user: str, path: str) -> bool:
+        """Whether `user` can list `path`, asked by running `ls` as that user.
+
+        A refusal counts only when `ls` itself says "Permission denied". Any
+        other failure means the probe did not run, a sudo that will not switch
+        user for one, and reading that as a refusal would pass the isolation
+        row on a machine where nothing was checked (security review).
+        """
+        # LC_ALL=C because sudo keeps the caller's locale by default, and `ls`
+        # translates "Permission denied" into it.
+        argv = ["/usr/bin/sudo", "-n", "-u", user, "/usr/bin/env", "LC_ALL=C", "/bin/ls", path]
+        done = self.run(argv)
+        if done.returncode == 0:
+            return True
+        if "Permission denied" in done.stderr:
+            return False
+        raise Refused(
+            f"`{' '.join(argv)}` failed without `ls` refusing, so the isolation "
+            f"check did not run: {(done.stderr or done.stdout).strip()[-400:]}"
+        )
+
+    def hidden(self, name: str) -> bool | None:
+        """None where the platform has no such flag."""
+        return None
+
+    def refuses_empty_password(self, name: str) -> bool | None:
+        """Whether logging in as `name` with an empty password fails.
+
+        None where this command admits nobody to Remote Login.
+        """
+        return None
+
+    def make_home(self, account: Account) -> None:
+        # Not a mkdir -p: the parent is the platform's home root, and a missing
+        # one is not this command's to create.
+        if self.home_stat(account.home) is None:
+            os.mkdir(account.home, HOME_MODE)
+        # Owner and mode are set through a descriptor opened without following
+        # a symlink. Set by path, a symlink planted where the home goes would
+        # hand its target to the new account (security review).
+        try:
+            fd = os.open(account.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            raise Refused(
+                f"{account.home} is not a plain directory (a symlink or a file is "
+                f"there), so it cannot be {account.name}'s home. Move it aside and "
+                f"run this again."
+            )
+        try:
+            os.fchown(fd, account.uid, account.gid)
+            os.fchmod(fd, HOME_MODE)
+        finally:
+            os.close(fd)
+
+    def remove_home(self, path: str) -> None:
+        """Delete a removed account's home, never what a symlink points at."""
+        st = self.home_stat(path)
+        if st is None:
+            return
+        if stat.S_ISDIR(st.st_mode):
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+
+    def check(self, done: subprocess.CompletedProcess, argv: list[str]) -> None:
+        if done.returncode != 0:
+            raise Refused(
+                f"`{' '.join(argv)}` failed:\n{(done.stderr or done.stdout).strip()[-400:]}"
+            )
+
+    def call(self, argv: list[str], stdin: str = "") -> None:
+        self.check(self.run(argv, stdin=stdin), argv)
+
+    # Platform commands, overridden below.
+    def create_account(self, name: str) -> None:
+        raise NotImplementedError
+
+    def add_member(self, user: str, group: str) -> None:
+        raise NotImplementedError
+
+    def remove_member(self, user: str, group: str) -> None:
+        raise NotImplementedError
+
+    def hide(self, name: str) -> None:
+        raise NotImplementedError
+
+    def remove_account(self, name: str) -> None:
+        raise NotImplementedError
+
+
+class MacSystem(System):
+    platform = "macos"
+    admin_groups = ("admin", "wheel", "_developer")
+    ssh_group = "com.apple.access_ssh"
+
+    def is_member(self, user: str, group: str) -> bool:
+        # dsmemberutil resolves nested groups, which `id -Gn` does not for
+        # com.apple.access_ssh (it nests `admin`), so it answers the question
+        # Remote Login asks.
+        argv = ["/usr/bin/dsmemberutil", "checkmembership", "-U", user, "-G", group]
+        done = self.run(argv)
+        if "is not a member" in done.stdout:
+            return False
+        if "is a member" in done.stdout:
+            return True
+        raise Refused(f"`{' '.join(argv)}` gave no answer: {(done.stderr or done.stdout).strip()}")
+
+    def hidden(self, name: str) -> bool | None:
+        done = self.run(["/usr/bin/dscl", ".", "-read", user_record(name), "IsHidden"])
+        return done.returncode == 0 and done.stdout.split()[-1:] in (["1"], ["YES"])
+
+    def refuses_empty_password(self, name: str) -> bool | None:
+        # Asked of the directory service, because whether sshd's
+        # keyboard-interactive login through PAM honours PermitEmptyPasswords
+        # has not been measured. dscl gives eDSAuthFailed for a nonexistent
+        # user too, so this is only asked of an account that exists.
+        argv = ["/usr/bin/dscl", ".", "-authonly", name, ""]
+        done = self.run(argv)
+        if done.returncode == 0:
+            return False
+        if "eDSAuthFailed" in done.stdout + done.stderr:
+            return True
+        raise Refused(
+            f"`dscl . -authonly {name} ''` failed without refusing the password, so "
+            f"whether {name} accepts an empty one is unknown: "
+            f"{(done.stderr or done.stdout).strip()[-400:]}"
+        )
+
+    def free_id(self) -> int:
+        used_uids = {e.pw_uid for e in pwd.getpwall()}
+        used_gids = {e.gr_gid for e in grp.getgrall()}
+        for candidate in MAC_ID_RANGE:
+            if candidate not in used_uids and candidate not in used_gids:
+                return candidate
+        raise Refused(
+            f"every ID from {MAC_ID_RANGE.start} to {MAC_ID_RANGE.stop - 1} is taken "
+            f"by a user or a group, so there is none to give a new account. Nothing "
+            f"was created."
+        )
+
+    def create_account(self, name: str) -> None:
+        ident = self.free_id()
+        # The group first, so the account is created with it as its primary
+        # group rather than with `staff`.
+        self.call(["/usr/sbin/dseditgroup", "-o", "create", "-i", str(ident), name])
+        # The password goes in on standard input through `-password -`. On a
+        # command line, `ps` would show it to every local user, and while
+        # agents still run as the operator one could `su` into the account.
+        # Created with none and given one afterwards, the account would accept
+        # an empty password for that window (security review, both). It is
+        # reached by ssh key or through sudo, so nobody needs to know it.
+        # sysadminctl prompts with getpass on a terminal and reads a line of
+        # standard input without one, which is what run() always gives it.
+        self.call([
+            "/usr/sbin/sysadminctl", "-addUser", name,
+            "-fullName", f"Builder {name}",
+            "-UID", str(ident), "-GID", str(ident),
+            "-password", "-",
+        ], stdin=f"{secrets.token_urlsafe(32)}\n")
+        self.close_empty_password(name)
+
+    def close_empty_password(self, name: str) -> None:
+        """Leave `name` refusing an empty password, with none on a command line.
+
+        sysadminctl reading its password from standard input is inferred
+        from what it imports rather than documented, so the directory
+        service is asked rather than assumed.
+        """
+        if self.refuses_empty_password(name):
+            return
+        # dscl's interactive mode reads its commands from standard input,
+        # which `ps` does not show. Its exit status is not what is trusted:
+        # the directory service is asked again.
+        self.run(["/usr/bin/dscl", "."],
+                 stdin=f"passwd {user_record(name)} {secrets.token_urlsafe(32)}\nquit\n")
+        if not self.refuses_empty_password(name):
+            raise Refused(
+                f"{name} was created accepting an empty password, and setting one "
+                f"did not take. Run: sudo passwd {name} (it prompts), then run this again."
+            )
+
+    def add_member(self, user: str, group: str) -> None:
+        self.call(["/usr/sbin/dseditgroup", "-o", "edit", "-a", user, "-t", "user", group])
+
+    def remove_member(self, user: str, group: str) -> None:
+        self.call(["/usr/sbin/dseditgroup", "-o", "edit", "-d", user, "-t", "user", group])
+
+    def hide(self, name: str) -> None:
+        self.call(["/usr/bin/dscl", ".", "-create", user_record(name), "IsHidden", "1"])
+
+    def remove_account(self, name: str) -> None:
+        self.call(["/usr/sbin/sysadminctl", "-deleteUser", name])
+        if self.group_exists(name):
+            self.call(["/usr/sbin/dseditgroup", "-o", "delete", name])
+
+
+class LinuxSystem(System):
+    platform = "linux"
+    admin_groups = ("sudo", "wheel", "admin")
+
+    def create_account(self, name: str) -> None:
+        self.call([
+            "/usr/sbin/useradd", "--system", "--create-home", "--user-group",
+            "--shell", "/bin/bash", name,
+        ])
+
+    def add_member(self, user: str, group: str) -> None:
+        self.call(["/usr/sbin/usermod", "-aG", group, user])
+
+    def remove_member(self, user: str, group: str) -> None:
+        self.call(["/usr/bin/gpasswd", "-d", user, group])
+
+    def remove_account(self, name: str) -> None:
+        self.call(["/usr/sbin/userdel", "--remove", name])
+        if self.group_exists(name):
+            self.call(["/usr/sbin/groupdel", name])
+
+
+def system_for_platform() -> System:
+    if sys.platform == "darwin":
+        return MacSystem()
+    if sys.platform.startswith("linux"):
+        return LinuxSystem()
+    raise Refused(f"{sys.platform} is neither macos nor linux. Nothing was changed.")
+
+
+def inspect(system: System, operator: str) -> tuple[Report, list[str]]:
+    """The verification table, and the accounts that do not exist yet.
+
+    Computed before anything changes, so `--dry-run`, `--check` and the real
+    run answer the same question and a refusal names every problem at once.
+    """
+    report = Report()
+    missing: list[str] = []
+    accounts: dict[str, Account] = {}
+
+    for name in SERVICE_ACCOUNTS:
+        account = system.account(name)
+        if account is None:
+            report.add(f"{name} exists", False, "this command creates it", addable=True)
+            missing.append(name)
+            continue
+        accounts[name] = account
+        report.add(f"{name} exists", True)
+
+        primary = system.group_name(account.gid)
+        report.add(
+            f"{name}'s primary group is {name} (it is {primary})",
+            primary == name,
+            f"make {name}'s primary group a group named {name} (on macOS: "
+            f"dseditgroup -o create {name}, then dscl . -create {user_record(name)} "
+            f"PrimaryGroupID <its gid>)",
+        )
+        groups = system.groups_of(name)
+        report.add(
+            f"{name} is not in {system.staff_group}",
+            system.staff_group not in groups,
+            f"remove {name} from {system.staff_group}",
+        )
+        for admin in system.admin_groups:
+            if not system.group_exists(admin):
+                continue
+            member = system.is_member(name, admin)
+            report.add(f"{name} is not a member of {admin}", not member,
+                       f"remove {name} from {admin}")
+
+        st = system.home_stat(account.home)
+        if st is None:
+            report.add(f"{name}'s home {account.home} exists", False,
+                       "this command creates it", addable=True)
+        else:
+            mode = stat.S_IMODE(st.st_mode)
+            report.add(
+                f"{name}'s home {account.home} is a directory",
+                stat.S_ISDIR(st.st_mode),
+                f"move aside whatever is at {account.home}",
+            )
+            report.add(
+                f"{name}'s home is owned by {name}:{name}",
+                st.st_uid == account.uid and st.st_gid == account.gid,
+                f"chown {name}:{name} {account.home}",
+            )
+            report.add(
+                f"{name}'s home reads drwxr-x--- (it reads {stat.filemode(st.st_mode)})",
+                mode == HOME_MODE,
+                f"chmod 750 {account.home}",
+            )
+
+        if system.group_exists(name):
+            report.add(
+                f"{operator} is a member of {name}",
+                system.is_member(operator, name),
+                "this command adds it", addable=True,
+            )
+
+        hidden = system.hidden(name)
+        if hidden is not None:
+            report.add(f"{name} is hidden", hidden, "this command sets it", addable=True)
+
+        if name == SSH_ACCOUNT:
+            refuses = system.refuses_empty_password(name)
+            if refuses is not None:
+                report.add(f"{name} refuses an empty password", refuses,
+                           f"sudo passwd {name} (it prompts), then run this again")
+
+    if system.ssh_group is not None:
+        if not system.group_exists(system.ssh_group):
+            raise Refused(
+                f"there is no {system.ssh_group} group, so Remote Login is either "
+                f"off or open to every user, and either way it cannot admit "
+                f"{SSH_ACCOUNT} alone. In System Settings, General, Sharing, turn "
+                f"Remote Login on with access for \"Only these users\", then run "
+                f"this again. Nothing was changed."
+            )
+        for name, account in accounts.items():
+            member = system.is_member(name, system.ssh_group)
+            if name == SSH_ACCOUNT:
+                report.add(f"{name} is a member of {system.ssh_group}", member,
+                           "this command adds it", addable=True)
+            else:
+                report.add(f"{name} is not a member of {system.ssh_group}", not member,
+                           f"dseditgroup -o edit -d {name} -t user {system.ssh_group}")
+
+    # Isolation, asked by running `ls` as the account, so the row is about what
+    # the account can do rather than what the modes say it should.
+    operator_account = system.account(operator)
+    if SSH_ACCOUNT in accounts:
+        others = [(n, a.home) for n, a in accounts.items() if n != SSH_ACCOUNT]
+        if operator_account is not None:
+            others.append((operator, operator_account.home))
+        for other, path in others:
+            if system.home_stat(path) is None:
+                continue
+            report.add(
+                f"as {SSH_ACCOUNT}, listing {other}'s home is refused",
+                not system.can_list(SSH_ACCOUNT, path),
+                f"{other}'s home {path} lets {SSH_ACCOUNT} in; nothing here changes "
+                f"another account's home",
+            )
+
+    return report, missing
+
+
+def controls(system: System, operator: str) -> Report:
+    """Rows that must pass on any machine, so a failing check is believed.
+
+    Each asks the same question as a row above, of a case whose answer is
+    known. If the membership query or the `ls` probe were broken, these would
+    fail with it rather than letting every service-account row read as passing.
+    """
+    report = Report()
+    operator_account = system.account(operator)
+    primary = system.group_name(operator_account.gid) if operator_account else None
+    if primary is not None:
+        report.add(f"control: {operator} is a member of {primary}",
+                   system.is_member(operator, primary))
+    # The plan's own control on macOS, where the operator is an administrator.
+    if system.platform == "macos":
+        report.add(f"control: {operator} is a member of admin",
+                   system.is_member(operator, "admin"))
+    if operator_account is not None:
+        report.add(f"control: as {operator}, listing {operator}'s home succeeds",
+                   system.can_list(operator, operator_account.home))
+    agents = system.account(SSH_ACCOUNT)
+    if agents is not None and system.home_stat(agents.home) is not None:
+        # The same sudo path the isolation rows use, with an answer known to
+        # be yes, so a refusal there is the home's mode and not the probe.
+        report.add(f"control: as {SSH_ACCOUNT}, listing {SSH_ACCOUNT}'s home succeeds",
+                   system.can_list(SSH_ACCOUNT, agents.home))
+        report.add(f"control: as {operator}, listing {SSH_ACCOUNT}'s home succeeds "
+                   f"through the group",
+                   system.can_list(operator, agents.home))
+    return report
+
+
+def print_table(title: str, *reports: Report) -> None:
+    print(title)
+    for report in reports:
+        for row in report.rows:
+            mark = "ok" if row.ok else ("add" if row.addable else "WRONG")
+            print(f"  {mark:<6} {row.what}")
+
+
+def refuse_wrong(report: Report) -> None:
+    if report.wrong:
+        lines = "\n".join(f"  {r.what}\n    fix: {r.fix}" for r in report.wrong)
+        raise Refused(
+            f"an existing account has the wrong shape, and this command does not "
+            f"change an account it did not make:\n{lines}\nNothing was changed."
+        )
+
+
+def provision(system: System, operator: str) -> list[str]:
+    """Create what is missing and add what is addable. Returns what changed."""
+    report, missing = inspect(system, operator)
+    refuse_wrong(report)
+    changed: list[str] = []
+
+    for name in missing:
+        system.create_account(name)
+        changed.append(f"created {name}")
+
+    for name in SERVICE_ACCOUNTS:
+        account = system.account(name)
+        if account is None:
+            raise Refused(f"{name} was created and the directory service does not have it.")
+        st = system.home_stat(account.home)
+        if name in missing or st is None:
+            system.make_home(account)
+            changed.append(f"set {name}'s home {account.home} to drwxr-x---")
+        if not system.is_member(operator, name):
+            system.add_member(operator, name)
+            changed.append(f"added {operator} to {name}")
+        if system.hidden(name) is False:
+            system.hide(name)
+            changed.append(f"hid {name}")
+
+    if system.ssh_group is not None and not system.is_member(SSH_ACCOUNT, system.ssh_group):
+        # Asked again here, after any creation, so Remote Login never admits
+        # an account that an empty password would open.
+        if system.refuses_empty_password(SSH_ACCOUNT) is False:
+            raise Refused(
+                f"{SSH_ACCOUNT} accepts an empty password, so it is not added to "
+                f"{system.ssh_group}. Run: sudo passwd {SSH_ACCOUNT} (it prompts), "
+                f"then run this again."
+            )
+        system.add_member(SSH_ACCOUNT, system.ssh_group)
+        changed.append(f"added {SSH_ACCOUNT} to {system.ssh_group}")
+
+    return changed
+
+
+def remove(system: System, purge_homes: bool) -> list[str]:
+    changed: list[str] = []
+    present = [n for n in SERVICE_ACCOUNTS if system.account(n) is not None]
+    # A home the account does not own is not this command's to delete: an
+    # account of that name whose home points at the shared folder or the
+    # operator's home would otherwise have that path deleted as root
+    # (security review). Asked of every home before anything is removed.
+    foreign = []
+    for name in present:
+        account = system.account(name)
+        st = system.home_stat(account.home)
+        if st is not None and st.st_uid != account.uid:
+            foreign.append(f"{account.home} (home of {name}, owned by uid {st.st_uid})")
+    if foreign:
+        raise Refused(
+            f"these homes are not owned by their accounts, so something else made "
+            f"them and this command does not delete them: {', '.join(foreign)}. "
+            f"Point each account at its own home, or remove it by hand. Nothing "
+            f"was removed."
+        )
+    full = [n for n in present if not system.home_is_empty(system.account(n).home)]
+    if full and not purge_homes:
+        raise Refused(
+            f"these homes are not empty: "
+            f"{', '.join(system.account(n).home for n in full)}. Pass --purge-homes "
+            f"to delete them with their accounts. Nothing was removed."
+        )
+    for name in present:
+        home = system.account(name).home
+        if system.ssh_group and system.group_exists(system.ssh_group) \
+                and system.is_member(name, system.ssh_group):
+            system.remove_member(name, system.ssh_group)
+        system.remove_account(name)
+        # Deleted here rather than left to the platform's command, whose
+        # default is not the same on every platform, so --purge-homes means
+        # the home is gone and a later provision starts from nothing.
+        system.remove_home(home)
+        changed.append(f"removed {name} and its home {home}")
+    return changed
+
+
+def resolve_operator(given: str | None) -> str:
+    operator = given or os.environ.get("SUDO_USER")
+    if not operator:
+        raise Refused(
+            "no operator named. Run this through sudo from the operator's own "
+            "login, or pass --operator <login>. Nothing was changed."
+        )
+    if operator in SERVICE_ACCOUNTS or operator == "root":
+        raise Refused(f"{operator} cannot be the operator. Nothing was changed.")
+    try:
+        pwd.getpwnam(operator)
+    except KeyError:
+        raise Refused(f"there is no account named {operator}. Nothing was changed.")
+    return operator
+
+
+def main(argv: list[str], system: System | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG, description="Create the agents and reviewers accounts Builder runs as."
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="say what would happen, change nothing")
+    mode.add_argument("--check", action="store_true", help="report only; exit 1 on any failing row")
+    mode.add_argument("--remove", action="store_true", help="delete both accounts and their groups")
+    parser.add_argument("--purge-homes", action="store_true",
+                        help="with --remove, delete homes that are not empty")
+    parser.add_argument("--operator", help="the operator's login (default: the user who ran sudo)")
+    args = parser.parse_args(argv)
+
+    try:
+        if args.purge_homes and not args.remove:
+            raise Refused("--purge-homes only means something with --remove.")
+        system = system or system_for_platform()
+        # Every mode, --check and --dry-run included: the isolation rows run
+        # `ls` as another account through sudo, and without root that fails
+        # for every path, which reads exactly like a refused listing.
+        if os.geteuid() != 0:
+            raise Refused(f"this needs root. Run: sudo {sys.argv[0]} {' '.join(argv)}".rstrip())
+
+        if args.remove:
+            changed = remove(system, args.purge_homes)
+            print("\n".join(changed) or "nothing to remove")
+            return 0
+
+        operator = resolve_operator(args.operator)
+        report, _ = inspect(system, operator)
+        if args.check or args.dry_run:
+            control = controls(system, operator)
+            print_table(f"{PROG}: {system.platform}, operator {operator}", report, control)
+            if args.dry_run:
+                refuse_wrong(report)
+                for row in report.to_add:
+                    print(f"would: {row.what}")
+                return 0
+            return 1 if any(not r.ok for r in report.rows + control.rows) else 0
+
+        changed = provision(system, operator)
+        # Asked again rather than assumed: the table printed after a change is
+        # what the directory service now says.
+        after, _ = inspect(system, operator)
+        control = controls(system, operator)
+        print_table(f"{PROG}: {system.platform}, operator {operator}", after, control)
+        print()
+        print("\n".join(changed) or "nothing to do: both accounts already had the right shape")
+        failing = [r for r in after.rows + control.rows if not r.ok]
+        if failing:
+            print(f"\n{PROG}: {len(failing)} row(s) still fail after the change:", file=sys.stderr)
+            for row in failing:
+                print(f"  {row.what}", file=sys.stderr)
+            return 1
+        return 0
+
+    except Refused as exc:
+        print(f"{PROG}: refusing: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

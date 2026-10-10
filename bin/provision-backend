@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""Install what Builder's backend needs from the platform, and prove it works.
+
+    bin/provision-backend                 install what is missing
+    bin/provision-backend --dry-run       say what would happen, change nothing
+    bin/provision-backend --check         report only; exit 1 if anything is missing
+    bin/provision-backend --no-install    never sudo; exit 2 naming how to install what is missing
+
+**This is the provisioning half of standing the backend up**, and it is
+deliberately only that half. A clean Ubuntu 22.04 machine is missing `zsh`,
+`lsof`, `tmux`, `git`, `curl`, a Python new enough to read a job
+declaration, that Python's venv support, and the `getfacl` the Library's
+start-up guard reads ACLs with — measured by running Builder's backend
+repositories in a container, not by reading them. Those are one installer's work and they are
+this crew's to do. What it does NOT do is fix code that names one machine, or
+make the Library's ownership guard portable: those belong to the crews that
+own them.
+
+**EVERY PROGRAM IS VERIFIED BY RUNNING IT, NEVER BY TRUSTING THE PACKAGE
+MANAGER.** That is not a general principle applied for its own sake; it is
+this specific trap, found in a container before a line of this was written:
+
+    apt-get install python3.14      # on Ubuntu 22.04
+    → installs postgresql-plpython3-14, PL/Python for PostgreSQL 14,
+      matched on the name, and EXITS 0
+
+There is no Python 3.14 in 22.04's repositories at all — `apt-cache search
+--names-only '^python3\\.[0-9]+$'` returns 3.10 and 3.11 and nothing else. An
+installer that believed apt's exit code would report success having installed
+a PostgreSQL extension, and the interpreter it claimed to provide would still
+be absent. A failure that reports success is the worst shape available, so
+each step here ends by executing the thing it installed and checking what came
+back.
+
+**The same rule decides what "present" means.** `python3.11` is not checked by
+its version string but by `import tomllib`, because reading a job declaration
+is the entire reason it is wanted. On 22.04 the package installs as
+`3.11.0rc1` — a release candidate — and the import succeeds, which is the fact
+that matters.
+
+**It refuses rather than half-installing, says what it did, and a second run
+changes nothing.** Those properties are `bin/install-payload`'s and
+`bin/install-jobs`'s already; this reuses their shape rather than inventing a
+third.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+
+PROG = "provision-backend"
+
+
+class Refused(Exception):
+    """Something the operator has to decide about. Never a stack trace."""
+
+
+def detect_platform() -> str:
+    if sys.platform == "darwin":
+        return "macos"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    raise Refused(
+        f"{sys.platform} is neither macos nor linux, and Builder's backend "
+        f"supports those two. Nothing was installed."
+    )
+
+
+# What Builder's backend reaches for, why, and how to know it is really there.
+#
+# `proof` is a command that must succeed once the program is installed. It is
+# the whole point of this table: the package manager's exit code is not
+# evidence, and for `python3.11` the proof is the import that makes the
+# interpreter worth having rather than its version number.
+NEEDS = (
+    {
+        "program": "zsh",
+        "why": "bin/co and the autopull scripts are zsh",
+        "apt": "zsh",
+        "brew": "zsh",
+        "proof": ["zsh", "-c", "exit 0"],
+    },
+    {
+        "program": "lsof",
+        "why": "the session walk reads open file descriptors with it",
+        "apt": "lsof",
+        "brew": "lsof",
+        "proof": ["lsof", "-v"],
+    },
+    {
+        "program": "tmux",
+        "why": "every crew session is a tmux session",
+        "apt": "tmux",
+        "brew": "tmux",
+        "proof": ["tmux", "-V"],
+    },
+    {
+        "program": "git",
+        "why": "the autopull scripts and the knowledge sync run git",
+        "apt": "git",
+        "brew": "git",
+        "proof": ["git", "--version"],
+    },
+    {
+        "program": "curl",
+        "why": "the gateway and registration probes use it",
+        "apt": "curl",
+        "brew": "curl",
+        "proof": ["curl", "--version"],
+    },
+    {
+        "program": "python3.11",
+        "why": "job declarations are TOML, and tomllib arrived in 3.11",
+        "apt": "python3.11",
+        "brew": "python@3.11",
+        # NOT a version check. `import tomllib` is the capability the
+        # interpreter is wanted for, and 22.04's package is a release
+        # candidate whose version string invites an argument this avoids.
+        "proof": ["python3.11", "-c", "import tomllib"],
+    },
+    {
+        # Debian and Ubuntu split `venv`'s pip bootstrap into its own package,
+        # so `python3.11` imports tomllib and still cannot build the venv every
+        # deploy area needs: `install-backend` failed on exactly that in a
+        # debian:bookworm rehearsal, after this command had reported every
+        # requirement present. Listed after `python3.11`, which it needs.
+        "program": "venv",
+        "binary": "python3.11",
+        "why": "install-backend builds a venv with pip in every deploy area",
+        "apt": "python3.11-venv",
+        # Homebrew's interpreter carries ensurepip, so on macOS this proof
+        # passes once python3.11 is present and the package is never installed.
+        "brew": "python@3.11",
+        # The proof builds a real venv WITH pip, because pip's bootstrap is the
+        # part that is missing: `-m venv --without-pip` succeeds on a machine
+        # where install-backend then fails.
+        #
+        # `symlinks=True` BECAUSE install-backend runs `python -m venv`, which
+        # links the interpreter, while `EnvBuilder()` copies it. A copied
+        # interpreter from a relocatable build, such as one `uv python install`
+        # gives an account that cannot use the machine's Homebrew, fails pip's
+        # bootstrap, so the copying proof refused a Python that install-backend
+        # builds every venv with.
+        "proof": [
+            "python3.11", "-c",
+            "import shutil, tempfile, venv\n"
+            "d = tempfile.mkdtemp()\n"
+            "try:\n"
+            "    venv.EnvBuilder(with_pip=True, symlinks=True).create(d)\n"
+            "finally:\n"
+            "    shutil.rmtree(d, ignore_errors=True)\n",
+        ],
+        # The script above is several lines, and a refusal quoting it inline
+        # prints broken backticks around raw newlines. This is what it names.
+        "shows": "python3.11 -m venv (with pip) in a temporary directory",
+    },
+    {
+        # The Library's start-up guard refuses to serve a component it cannot
+        # vouch for, and on Linux it reads each component's ACL with `getfacl`,
+        # from the `acl` package, which a stock Debian or Ubuntu lacks. Without
+        # it the Library refuses at start-up and names the package.
+        #
+        # LINUX ONLY, WHICH IS WHY THERE IS NO `brew` KEY. On macOS the guard
+        # reads ACLs with `ls -le`, which the system carries; `plan()` leaves
+        # out any requirement with no package for the platform.
+        "program": "getfacl",
+        "why": "the Library's start-up guard reads each component's ACL with it",
+        "apt": "acl",
+        # The guard's own call, and the check it applies to the answer: an
+        # ACL listing with a line starting `other::`. A `getfacl` that runs and
+        # prints nothing this recognises is refused there, so it is not
+        # "present" here.
+        "proof": ["getfacl", "--absolute-names", "--omit-header", "/"],
+        "expects": "other::",
+        "shows": "getfacl --absolute-names --omit-header / (listing other::)",
+    },
+)
+
+
+def run(argv: list[str], **kwargs) -> subprocess.CompletedProcess:
+    return subprocess.run(argv, capture_output=True, text=True, check=False, **kwargs)
+
+
+def works(need: dict) -> bool:
+    """Whether this program is present AND does the thing it is wanted for.
+
+    Two tests, and the second is the one that catches the trap in the module
+    docstring: a program can be on PATH, or a package can have installed
+    cleanly, while the capability is absent.
+    """
+    if shutil.which(need.get("binary", need["program"])) is None:
+        return False
+    try:
+        done = run(need["proof"], timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    # `expects` is a line the proof's output must contain, checked here rather
+    # than by a shell pipeline in the proof, so each proof resolves one program
+    # on PATH rather than a shell and a filter as well (security review).
+    if "expects" in need:
+        return done.returncode == 0 and any(
+            line.startswith(need["expects"]) for line in done.stdout.splitlines()
+        )
+    return done.returncode == 0
+
+
+def installer_for(platform: str) -> tuple[str, list[str]]:
+    """(package-manager name, the argv prefix that installs) or a refusal."""
+    if platform == "linux":
+        if shutil.which("apt-get") is None:
+            raise Refused(
+                "this Linux machine has no apt-get, and that is the only Linux "
+                "package manager this knows. Install the programs listed above "
+                "by hand and run again with --check to confirm. Nothing was "
+                "installed."
+            )
+        if os.geteuid() != 0 and shutil.which("sudo") is None:
+            raise Refused(
+                "installing packages needs root and there is no sudo here. "
+                "Re-run as root. Nothing was installed."
+            )
+        prefix = [] if os.geteuid() == 0 else ["sudo"]
+        return "apt-get", [*prefix, "apt-get", "install", "-y"]
+    if shutil.which("brew") is None:
+        raise Refused(
+            "this Mac has no Homebrew, and that is how Builder provisions on "
+            "macOS. Install Homebrew, or install the programs listed above by "
+            "hand and run again with --check. Nothing was installed."
+        )
+    return "brew", ["brew", "install"]
+
+
+def plan(platform: str) -> list[dict]:
+    """What each requirement is, and whether anything needs doing.
+
+    Computed before anything is changed, so `--dry-run` and the real run
+    answer the same question and a refusal names the whole picture rather than
+    the first thing that failed.
+    """
+    key = "apt" if platform == "linux" else "brew"
+    return [
+        {
+            "program": need["program"],
+            "package": need[key],
+            "why": need["why"],
+            "proof": need["proof"],
+            "shows": need.get("shows", " ".join(need["proof"])),
+            "state": "present" if works(need) else "missing",
+            "need": need,
+        }
+        for need in NEEDS
+        if key in need
+    ]
+
+
+def refresh_index(install: list[str], manager: str) -> None:
+    if manager != "apt-get":
+        return
+    # Without this, `apt-get install` on a container whose lists were stripped
+    # at build time fails with "Unable to locate package" for a package that
+    # is plainly there.
+    done = run([*install[:-3], "apt-get", "update"] if install[0] == "sudo"
+               else ["apt-get", "update"])
+    if done.returncode != 0:
+        raise Refused(
+            f"apt-get update failed, so nothing can be installed reliably:\n"
+            f"{done.stderr.strip()[-400:]}"
+        )
+
+
+def install_one(item: dict, install: list[str]) -> None:
+    """Install one package and then PROVE the program works, or refuse.
+
+    The proof is the point. `apt-get install python3.14` on Ubuntu 22.04 exits
+    0 having installed PL/Python for PostgreSQL, because apt matched the name.
+    Believing the exit code there means reporting a success that left the
+    interpreter absent.
+    """
+    done = run([*install, item["package"]], env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"})
+    if done.returncode != 0:
+        raise Refused(
+            f"installing {item['package']} for {item['program']} failed:\n"
+            f"{(done.stderr or done.stdout).strip()[-400:]}"
+        )
+    if not works(item["need"]):
+        raise Refused(
+            f"{item['package']} installed without error, and {item['program']} "
+            f"still does not work: `{item.get('shows', ' '.join(item['proof']))}` did not succeed. "
+            f"This is the case the package manager's exit code cannot see — on "
+            f"Ubuntu 22.04, `apt-get install python3.14` installs PostgreSQL's "
+            f"PL/Python and exits 0. Nothing further was attempted."
+        )
+
+
+def report(items: list[dict], platform: str, changed: list[str]) -> None:
+    print(f"{PROG}: {platform}")
+    for item in items:
+        mark = "installed" if item["program"] in changed else item["state"]
+        print(f"  {mark:<10} {item['program']:<12} {item['why']}")
+    print()
+    if changed:
+        print(f"installed {len(changed)}: {', '.join(changed)}")
+    elif all(item["state"] == "present" for item in items):
+        print("nothing to do — every requirement was already present")
+
+
+def outstanding() -> list[str]:
+    """What this command cannot do, named with the exact thing the operator needs.
+
+    Named on stdout rather than left as prose in a comment, because the
+    installer this replaces ended with a list of manual steps in its closing
+    text and that is where they stayed.
+    """
+    return [
+        (
+            "Ubuntu 22.04's `python3` is 3.10, and installing 3.11 alongside "
+            "does NOT change what `/usr/bin/env python3` resolves to. The "
+            "declaration tools carry `#!/usr/bin/env python3` and refuse under "
+            "3.10, so invoke them explicitly:"
+        ),
+        "    python3.11 bin/install-jobs --help",
+        "    python3.11 tools/jobs-lint check <directory>",
+        "",
+        (
+            "Their shebangs are deliberately not `python3.11`: that would fail "
+            "on a machine whose only interpreter is `python3` at 3.12 or later, "
+            "trading one platform's problem for another's. And nothing here "
+            "repoints the system `python3`, because on Ubuntu that is what apt "
+            "runs under."
+        ),
+        "",
+        (
+            "The LLM gateway refuses to start without its credentials file, and "
+            "that refusal is deliberate rather than something to work around: "
+            "the file holds provider keys issued to you, which no install can "
+            "generate. Create it yourself:"
+        ),
+        "    install -m 600 /dev/null ~/.config/convivy/llm-gateway.env",
+        "    # then add KEY=value lines; see agent-platform gateway/README",
+        "",
+        (
+            "Supervision is installed separately, from job declarations, by the "
+            "command that already does it:"
+        ),
+        "    bin/install-jobs --help",
+        "",
+        "Code that names one machine is each owning crew's to convert, and this does not touch it.",
+    ]
+
+
+def install_command(item: dict, platform: str) -> str:
+    """The command that installs `item` here, for the operator to run."""
+    if platform == "linux":
+        return f"apt-get install {item['package']}   (as root)"
+    return f"brew install {item['package']}"
+
+
+def refuse_missing(missing: list[dict], platform: str) -> Refused:
+    """The --no-install refusal: every missing program and how to install it.
+
+    This mode is the single-account install's, which runs as the operator's
+    own account and may have no administrator at all, so it names the
+    commands rather than running them, and never reaches for sudo or a
+    package manager.
+    """
+    width = max(len(item["program"]) for item in missing)
+    lines = "\n".join(
+        f"  {item['program']:<{width}}  {install_command(item, platform)}"
+        for item in missing
+    )
+    return Refused(
+        f"{len(missing)} program(s) Builder needs are missing, and --no-install "
+        f"installs nothing itself. Install them, or ask whoever administers this "
+        f"machine to, then run again:\n{lines}\nNothing was installed."
+    )
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG, description="Install what Builder's backend needs from the platform."
+    )
+    parser.add_argument(
+        "--no-install",
+        action="store_true",
+        help="never use sudo or a package manager: check every program and name "
+             "how to install what is missing (the single-account install)",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="say what would happen, change nothing"
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="report only, and exit 1 if anything is missing",
+    )
+    args = parser.parse_args(argv)
+    if args.no_install and (args.check or args.dry_run):
+        parser.error("--no-install changes nothing already; give it alone")
+
+    try:
+        platform = detect_platform()
+        items = plan(platform)
+        missing = [item for item in items if item["state"] == "missing"]
+
+        if args.no_install:
+            report(items, platform, changed=[])
+            if missing:
+                raise refuse_missing(missing, platform)
+            return 0
+
+        if args.check or args.dry_run:
+            report(items, platform, changed=[])
+            if missing:
+                verb = "would install" if args.dry_run else "missing"
+                print(f"\n{verb}: {', '.join(i['package'] for i in missing)}")
+            print()
+            for line in outstanding():
+                print(line)
+            return 1 if (missing and args.check) else 0
+
+        changed: list[str] = []
+        if missing:
+            manager, install = installer_for(platform)
+            refresh_index(install, manager)
+            for item in missing:
+                install_one(item, install)
+                changed.append(item["program"])
+
+        # Re-planned rather than assumed. The report says what IS, which is the
+        # only thing worth printing after a run that claims to have changed the
+        # machine.
+        report(plan(platform), platform, changed)
+        print()
+        for line in outstanding():
+            print(line)
+        return 0
+
+    except Refused as exc:
+        print(f"{PROG}: refusing — {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

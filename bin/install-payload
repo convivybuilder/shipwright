@@ -1,0 +1,1155 @@
+#!/bin/sh
+# install-payload — put the shipping payload on a machine, the way an install will.
+#
+# WHY THIS EXISTS. Skills placed by hand drift from their source, and the drift
+# lands in the copy nobody runs: the one in use is correct, so nothing prompts
+# anyone to look at the other. An install has to be a mechanism rather than a
+# habit, or that happens on every machine it reaches.
+#
+# WHY `git archive` AND NEVER `cp -r`. A copy of the working tree ignores
+# .gitignore and sweeps whatever is sitting there into the deploy area. Editor
+# state, per-session scratch and build caches all live in a working tree and none
+# of them belong on an adopter's machine. `git archive` reads tracked blobs at a
+# ref and nothing else, so an ignored file cannot reach a deploy area even when
+# it is sitting right there.
+#
+# WHY THERE IS NO PURITY CHECK AT INSTALL. The check keeps its authors' own
+# specifics out of what ships, and it is their tool: it does not ship, because
+# its pattern list names what it guards. It runs on every change in the
+# repository it belongs to and over the whole tree before a release is
+# published, so what an adopter installs has already passed it. What this
+# script still refuses at install is what would make the install unsafe here:
+# a symlink anywhere in the staged payload, checked before the swap so a
+# refused tree is discarded while whatever is already deployed stays untouched.
+#
+# WHY SYMLINKS INTO A DEPLOY AREA AND NEVER INTO A CHECKOUT. A checkout moves.
+# Anything symlinked into one serves whatever branch was last left there, which
+# means a routine `git checkout` silently changes what every session runs. A
+# deploy area extracted from a ref cannot move under anyone.
+set -eu
+
+# **THE INHERITED ENVIRONMENT IS CLEARED BEFORE ANY TOOL RUNS, AND THIS IS THE
+# LIST OF WHY.** Seven ways a variable the invoking shell carried turns a routine
+# call in this script into code running as the operator. Every one was reproduced
+# against this script before it was closed, and every one was found only after
+# the previous had been (security review). They are collected here so the
+# code below can stay short, and they are unnumbered because they were not found
+# in the order they are best read.
+#
+#   `GIT_TEMPLATE_DIR`, `init.templateDir`
+#       `git init` copies hooks from a template directory the environment names,
+#       and the commit and push below then run them. Closed by `--template=`
+#       pointed at an empty directory.
+#
+#   `core.hooksPath` in an ambient global config
+#       Fires even when no hook was ever copied. Closed by pinning that setting
+#       in each repository's own config, which outranks a global one, at
+#       `/dev/null`, which nothing can later turn into a hooks directory. **A
+#       `-c` on the pushing command does not reach the receiving side of a local
+#       push**, which is why the pin is written into the repository.
+#
+#   `GIT_CONFIG_COUNT` and its numbered pairs
+#       Enter at the precedence of a command-line `-c`, above a repository's own
+#       config, so they beat that pin. Closed by clearing them.
+#
+#   `GIT_EXEC_PATH`
+#       Names where git finds its own transport helpers, so a planted
+#       `git-receive-pack` runs on the push with no hook involved and the hooks
+#       pin cannot touch it. Closed by clearing it.
+#
+#   `HOME`, `XDG_CONFIG_HOME`
+#       Git reads its global config from there, and `core.fsmonitor` in one names
+#       a command git RUNS on `add` and `commit`. Closed by handing git the
+#       account's real home, read from the password database.
+#
+#   `PYTHONPATH`
+#       CPython imports `sitecustomize` at interpreter startup, before any code
+#       here runs, including the call that resolves that real home. Closed by
+#       running every `python3` in isolated mode.
+#
+#   `TAR_OPTIONS`
+#       GNU tar prepends it to its own command line, so
+#       `--use-compress-program=<anything>` makes the extraction below exec it.
+#       Reproduced against GNU tar on the distribution this repository's CI runs,
+#       where the extraction still exited 0. macOS ships bsdtar, which ignores
+#       it, and nothing here says an adopter or a runner only ever has bsdtar.
+#
+# **THE `GIT_` NAMES ARE CLEARED AS A NAMESPACE RATHER THAN A LIST**, because a
+# list is only as complete as what somebody thought of. The first version named
+# eleven variables and a review then demonstrated a twelfth, which is the entry
+# above for `GIT_EXEC_PATH`. Only names are read from `env`, and only names
+# matching `GIT_` followed by word characters, so a value carrying a newline can
+# at worst unset a variable that was never set. They are captured before the loop
+# because `for x in $(cmd)` does not trip `set -e` when the substitution fails.
+unset TAR_OPTIONS 2>/dev/null || true
+GIT_ENV_NAMES=$(env | sed -n 's/^\(GIT_[A-Za-z0-9_]*\)=.*/\1/p') \
+  || { echo "install-payload: could not read the environment" >&2; exit 1; }
+for git_env in $GIT_ENV_NAMES; do
+  unset "$git_env" 2>/dev/null || true
+done
+unset git_env GIT_ENV_NAMES 2>/dev/null || true
+
+# **`PATH` IS DELIBERATELY NOT PINNED, AND THIS IS THE ARGUMENT RATHER THAN AN
+# OVERSIGHT.** Every tool here is called by bare name, so a directory planted
+# earlier in `PATH` with a false `git` or `python3` runs as the operator, and a
+# review demonstrated it and asked for a fixed minimal `PATH`.
+#
+# The difference from the entries above is what the attacker already holds. Each
+# of those turns an ordinary-looking environment into execution HERE and nowhere
+# else, so closing it takes something away. Whoever can set `PATH` for this script
+# has set it for the shell that ran it and for every command the operator issues
+# afterwards, so their false `git` fires on the next `git status` whatever this
+# script does. Pinning would also have to name where `git` and `python3` actually
+# are, which across the machines this targets is `/opt/homebrew/bin`,
+# `/usr/local/bin`, `/usr/bin`, or wherever a version manager put them, so the
+# cost is an installer that fails on a legitimate machine against a threat it
+# does not remove. The operator holds this decision.
+
+PROG=$(basename "$0")
+REPO=""
+REF="main"
+# **THESE TWO READ THE INHERITED `$HOME` ON PURPOSE**, before the reassignment
+# below: they are where this script writes on behalf of whoever invoked it, which
+# is a different question from which account git should believe it is.
+DEPLOY_DIR="${BUILDER_DEPLOY_DIR:-$HOME/.local/deploy/builder-payload}"
+SKILLS_DIR="${BUILDER_SKILLS_DIR:-$HOME/.claude/skills}"
+# **THE ACCOUNT'S HOME COMES FROM THE PASSWORD DATABASE, NEVER FROM `$HOME`**, for
+# the reason the session agent's `_real_account_home` gives: `$HOME` is whatever
+# the invoking environment carries (sudo without -H, a wrapper, a forwarded
+# environment), and an installer that read it would resolve `CREWS_ROOT=~`, or
+# pick a settings file, differently from the agent that enforces the root.
+REAL_HOME=$(python3 -I -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)') \
+  || { echo "$PROG: cannot read this account's home from the password database" >&2; exit 1; }
+# Every git below reads its global config from this home rather than the one the
+# environment carried, which is the `HOME` entry in the list above.
+HOME="$REAL_HOME"
+export HOME
+unset XDG_CONFIG_HOME 2>/dev/null || true
+
+ROOT=""
+DEFAULT_ROOT="$REAL_HOME/builder"
+STEWARD_DIR=""
+MACHINE_FILE="$HOME/.claude/CLAUDE.md"
+# The product's settings directory, under the account's real home for the reason
+# given above: the installer must pick the same settings file the agent does.
+PRODUCT_CONFIG_DIR="$REAL_HOME/.config/convivy"
+CONFIG="${BUILDER_SESSION_AGENT_ENV:-$PRODUCT_CONFIG_DIR/session-agent.env}"
+ALLOW_NON_MAIN=0
+FORCE=0
+DRY_RUN=0
+ACTION="install"
+
+usage() {
+  cat >&2 <<'EOF'
+usage: install-payload [--ref=<git-ref>] [--repo=<path>] [--deploy=<dir>]
+                       [--skills=<dir>] [--root=<dir>] [--steward-dir=<dir>]
+                       [--machine-file=<file>]
+                       [--config=<file>] [--allow-non-main] [--force]
+                       [--dry-run] [--status]
+
+  --ref=<git-ref>    Ref to install from (default: main). Anything other than
+                     main is refused unless --allow-non-main is given, because
+                     a deploy area serving a branch is the fault this script
+                     exists to prevent.
+  --repo=<path>      The shipwright checkout to read the ref from. Defaults to
+                     the repository containing this script.
+  --deploy=<dir>     Where the payload is extracted to. Default
+                     ~/.local/deploy/builder-payload, or $BUILDER_DEPLOY_DIR.
+  --skills=<dir>     Where skills are linked from. Default ~/.claude/skills,
+                     or $BUILDER_SKILLS_DIR.
+  --root=<dir>       Where this machine's projects live. Used when the machine
+                     has no CREWS_ROOT yet, and refused when it contradicts one
+                     it already has. Default: the machine's existing CREWS_ROOT,
+                     else ~/builder. The root gets a marker, <root>/.builder-root,
+                     naming its resolved path.
+  --steward-dir=<dir>
+                     Where the steward's charter goes, as CLAUDE.md. Default
+                     <root>/steward. An existing CLAUDE.md there is never
+                     overwritten.
+  --machine-file=<file>
+                     The machine-wide instruction file every session reads.
+                     Default ~/.claude/CLAUDE.md. An existing one is never
+                     overwritten; the steward offers what to do with it.
+  --config=<file>    The session agent's settings file, where CREWS_ROOT lives.
+                     Default ~/.config/convivy/session-agent.env, or
+                     $BUILDER_SESSION_AGENT_ENV.
+  --allow-non-main   Permit a ref other than main. Recorded in the stamp.
+  --force            Replace a live skill path that is not already this
+                     script's own symlink. Without it, such a path is refused
+                     by name and nothing else on the run is changed.
+  --dry-run          Say what would happen and change nothing.
+  --status           Print what is deployed and where each live path points.
+
+Exit codes: 0 success, 1 refused or failed, 2 usage.
+EOF
+}
+
+die() { echo "$PROG: $*" >&2; exit 1; }
+
+for arg in "$@"; do
+  case "$arg" in
+    --ref=*) REF=${arg#--ref=} ;;
+    --repo=*) REPO=${arg#--repo=} ;;
+    --deploy=*) DEPLOY_DIR=${arg#--deploy=} ;;
+    --skills=*) SKILLS_DIR=${arg#--skills=} ;;
+    --root=*) ROOT=${arg#--root=} ;;
+    --steward-dir=*) STEWARD_DIR=${arg#--steward-dir=} ;;
+    --machine-file=*) MACHINE_FILE=${arg#--machine-file=} ;;
+    --config=*) CONFIG=${arg#--config=} ;;
+    --allow-non-main) ALLOW_NON_MAIN=1 ;;
+    --force) FORCE=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    --status) ACTION="status" ;;
+    -h|--help) usage; exit 2 ;;
+    *) usage; exit 2 ;;
+  esac
+done
+
+if [ -z "$REPO" ]; then
+  REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+fi
+# A worktree's `.git` is a file naming its repository, not a directory, and a
+# checkout made that way is as much a checkout as the primary one.
+[ -d "$REPO/.git" ] || [ -f "$REPO/.git" ] || die "not a git checkout: $REPO"
+
+# Absolute only. A relative --deploy=deploy run from a directory that already
+# holds an unrelated `deploy/` is the same destructive case as a mistyped
+# absolute path, and `deploy` is an ordinary name for exactly that kind of
+# directory. Refusing the relative form removes the class rather than the
+# instance.
+case "$DEPLOY_DIR" in /*) ;; *) die "--deploy must be an absolute path: $DEPLOY_DIR" ;; esac
+case "$SKILLS_DIR" in /*) ;; *) die "--skills must be an absolute path: $SKILLS_DIR" ;; esac
+case "$CONFIG" in /*) ;; *) die "--config must be an absolute path: $CONFIG" ;; esac
+case "$ROOT" in ""|/*) ;; *) die "--root must be an absolute path: $ROOT" ;; esac
+case "$STEWARD_DIR" in ""|/*) ;; *) die "--steward-dir must be an absolute path: $STEWARD_DIR" ;; esac
+case "$MACHINE_FILE" in /*) ;; *) die "--machine-file must be an absolute path: $MACHINE_FILE" ;; esac
+
+STAMP="$DEPLOY_DIR/.installed"
+
+if [ "$ACTION" = "status" ]; then
+  if [ -f "$STAMP" ]; then
+    echo "deployed:"
+    sed 's/^/  /' "$STAMP"
+  else
+    echo "deployed: nothing at $DEPLOY_DIR"
+  fi
+  echo "live paths under $SKILLS_DIR:"
+  if [ -d "$SKILLS_DIR" ]; then
+    for p in "$SKILLS_DIR"/*; do
+      [ -e "$p" ] || [ -L "$p" ] || continue
+      name=$(basename "$p")
+      if [ -L "$p" ]; then
+        echo "  $name -> $(readlink "$p")"
+      else
+        echo "  $name  (a real directory, not linked by this script)"
+      fi
+    done
+  else
+    echo "  (no such directory)"
+  fi
+  exit 0
+fi
+
+# A ref other than main is the fault this script exists to prevent, so it is
+# refused rather than warned about, and the override is recorded in the stamp
+# where a later reader will see what was deployed and on whose say-so.
+if [ "$REF" != "main" ] && [ "$ALLOW_NON_MAIN" -eq 0 ]; then
+  die "refusing to install from '$REF': pass --allow-non-main to override"
+fi
+
+COMMIT=$(git -C "$REPO" rev-parse --verify "$REF^{commit}" 2>/dev/null) \
+  || die "no such ref in $REPO: $REF"
+
+# **WHERE THIS MACHINE'S PROJECTS LIVE, DECIDED BEFORE ANYTHING IS CHANGED**
+# Everything Builder owns lives under one root, `~/builder` unless the install
+# chooses another. The session agent refuses to create a crew directory
+# outside its CREWS_ROOT, Deck asks each host for that root, and the steward is a
+# project under it, so one value answers all three.
+#
+# A machine that already has a root keeps it. `--root` on such a machine is
+# accepted only when it says the same thing; anything else would move where
+# every existing crew is expected to be, which is a migration rather than an
+# install, so it is refused here with nothing changed.
+#
+# The file is read the way the session agent reads it (session_lifecycle.py,
+# `_configured_crews_root_raw`): the first `CREWS_ROOT=` line, surrounding
+# quotes tolerated, a leading `~` meaning home. Never sourced.
+configured_root() {
+  [ -f "$CONFIG" ] || return 0
+  v=$(sed -n 's/^[[:space:]]*CREWS_ROOT[[:space:]]*=[[:space:]]*//p' "$CONFIG" | head -n 1 | sed 's/[[:space:]]*$//')
+  case "$v" in \"*\") v=${v#\"}; v=${v%\"} ;; \'*\') v=${v#\'}; v=${v%\'} ;; esac
+  case "$v" in "~") v=$REAL_HOME ;; "~/"*) v="$REAL_HOME/${v#??}" ;; esac
+  printf '%s' "$v"
+}
+CONFIGURED=$(configured_root)
+# A present but empty or relative value is one the session agent will not use,
+# and appending a second line would not fix it, because the first line wins.
+if [ -f "$CONFIG" ] && grep -q '^[[:space:]]*CREWS_ROOT[[:space:]]*=' "$CONFIG"; then
+  case "$CONFIGURED" in
+    /*) ;;
+    *) die "$CONFIG sets CREWS_ROOT to '$CONFIGURED', which is not an absolute path: fix it before installing; nothing has been changed" ;;
+  esac
+fi
+WRITE_CONFIG=0
+if [ -n "$ROOT" ]; then
+  if [ -n "$CONFIGURED" ] && [ "${CONFIGURED%/}" != "${ROOT%/}" ]; then
+    die "this machine's root is already $CONFIGURED (CREWS_ROOT in $CONFIG); --root=$ROOT would move it, and moving a machine's root is a migration rather than an install: nothing has been changed"
+  fi
+else
+  ROOT=${CONFIGURED:-$DEFAULT_ROOT}
+fi
+if [ -z "$CONFIGURED" ]; then
+  WRITE_CONFIG=1
+fi
+case "$ROOT" in /*) ;; *) die "the root must be an absolute path: $ROOT" ;; esac
+
+# **THE ROOT IS RESOLVED BEFORE IT IS JUDGED, AND FOR TWENTY-ODD ROUNDS IT WAS
+# NOT.** The width checks below compared the string an operator typed, so
+# `--root=<home>/builder/..` passed both of them untouched and then resolved to
+# the account's home, which is the exact case they say they refuse. The same held
+# for a `CREWS_ROOT` line in the config file. That cost one marker file a level
+# too high until this script began creating repositories, and it now decides
+# where two of them are initialised, which is what turned an untidiness into a
+# finding (security review).
+#
+# `Path.resolve()` is the same call the platform's resolver makes, and it
+# normalises a path that does not exist yet, which a fresh root never does.
+RESOLVED_ROOT=$(python3 -I -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve())' "$ROOT") \
+  || die "could not resolve the root $ROOT"
+
+# **A ROOT TOO WIDE TO CONTAIN ANYTHING IS REFUSED HERE, AS THE AGENT REFUSES IT.**
+# The session agent treats `/`, the account's home and any ancestor of home as
+# no floor at all and falls back to its default (`_creatable_root`). Its own
+# docstring calls `CREWS_ROOT=~` an ordinary thing for an operator to write, so
+# `--root=~` is a real input, and accepting it would place the steward under a
+# root the agent will never use.
+root_trimmed=${RESOLVED_ROOT%/}
+home_trimmed=${REAL_HOME%/}
+if [ -z "$root_trimmed" ] || [ "$root_trimmed" = "$home_trimmed" ]; then
+  die "the root cannot be $ROOT: the session agent treats the filesystem root and the account's home as too wide to contain anything; choose a directory under the home, such as $home_trimmed/builder"
+fi
+case "$home_trimmed/" in
+  "$root_trimmed"/*) die "the root cannot be $ROOT: it contains the account's home, which the session agent treats as too wide to contain anything; choose a directory under the home, such as $home_trimmed/builder" ;;
+esac
+# **AN UPDATE KEEPS THE STEWARD WHERE THE LAST INSTALL PUT IT.** With no
+# --steward-dir, the install record names the directory; `<root>/steward` is the
+# default only when there is no record to read. Defaulting on an update placed a
+# second charter, and the update seed's builder-updates, in a new directory on a
+# machine whose steward lived elsewhere.
+if [ -n "$STEWARD_DIR" ]; then
+  STEWARD_SOURCE="--steward-dir"
+else
+  RECORDED_STEWARD=""
+  if [ -f "$STAMP" ]; then
+    RECORDED_STEWARD=$(sed -n 's/^steward_dir: //p' "$STAMP" | head -n 1)
+  fi
+  case "$RECORDED_STEWARD" in
+    /*)
+      STEWARD_DIR=$RECORDED_STEWARD
+      STEWARD_SOURCE="the install record at $STAMP"
+      ;;
+    *)
+      STEWARD_DIR="$ROOT/steward"
+      STEWARD_SOURCE="the default under the root"
+      ;;
+  esac
+fi
+
+# **THE KNOWLEDGE REPOSITORY AND ITS LOCAL REMOTE**, which the install produces
+# so that a solo adopter who is not building a codebase gets a working
+# Reference Room with no GitHub account.
+#
+# `<root>/knowledge` is not a path this script chose. `lib/knowledge/indexer.py`
+# resolves the tree as `builder_root.root() / "knowledge"` and its documents as
+# `<that>/projects`, and `root()` reads the same `CREWS_ROOT` this script writes,
+# so the two agree by construction rather than by coincidence.
+#
+# **THE BARE REPOSITORY IS THE POINT, AND A WORKING TREE ALONE WOULD NOT DO.**
+# Every knowledge write runs through the scribe worktree, which fetches `origin`
+# and hard-resets to `origin/main` BEFORE it applies anything. With no remote
+# configured that fetch fails with "'origin' does not appear to be a git
+# repository" and the write is refused before it starts, so an install that
+# creates a tree and stops hands an adopter a Reference Room they cannot write a
+# single document into. A bare repository on the same disk satisfies every call
+# on that path; none of them names GitHub or reaches the network.
+KB_DIR="$ROOT/knowledge"
+KB_REMOTES_DIR="$ROOT/.remotes"
+KB_REMOTE="$KB_REMOTES_DIR/knowledge.git"
+
+# **A SYMLINK ON EITHER PATH IS REFUSED BY NAME**, the way this script already
+# refuses a symlinked marker and a symlinked payload. Without it, a link planted
+# at `.remotes` sends `git init --bare` through it and the repository lands
+# wherever the link points, outside the root every other write here is confined
+# to (security review).
+for kb_path in "$KB_DIR" "$KB_REMOTES_DIR"; do
+  [ -L "$kb_path" ] && die "$kb_path is a symlink, and this install will not write through one: move it aside and run again; nothing has been changed"
+done
+
+# What this run would do, decided here so the dry run and the real run answer
+# from one place rather than from two conditions that can drift apart.
+KB_ACTION="create"
+if [ -e "$KB_DIR" ]; then
+  if [ -d "$KB_DIR/.git" ] || [ -f "$KB_DIR/.git" ]; then
+    KB_ACTION="keep"
+    # **A REPOSITORY THAT CANNOT REACH ITS REMOTE IS NOT ONE TO KEEP QUIETLY.**
+    # Every knowledge write fetches `origin` first, so a tree whose remote is
+    # unset or gone is a Reference Room that refuses every write, and reporting
+    # "left it alone" over that state tells an adopter it is fine. The first
+    # symptom otherwise is a git error from the scribe, days later, about a
+    # repository nobody remembers configuring (security review and reviewer).
+    kb_origin=$(git -C "$KB_DIR" remote get-url origin 2>/dev/null) || kb_origin=""
+    if [ -z "$kb_origin" ]; then
+      die "$KB_DIR is a git repository with no 'origin' remote, so every knowledge write would be refused: give it one, or move it aside and run again; nothing has been changed"
+    fi
+    # A hosted remote's reachability is not this script's to judge, so only a
+    # local path is checked for existence. **git names a hosted remote in two
+    # notations, and both have to be recognized.** The first version knew only
+    # `scheme://`, so the SSH shorthand `git@github.com:org/repo.git` fell through
+    # as a local path, was reported as not existing, and refused the install on a
+    # machine whose knowledge repository has used that remote for months. The
+    # shorthand is the rule git itself applies: a colon with no slash before it.
+    case "$kb_origin" in
+      *://*) kb_origin_local=false ;;
+      *:*) case "${kb_origin%%:*}" in
+             */*) kb_origin_local=true ;;   # a slash before the colon: a path that contains a colon
+             *) kb_origin_local=false ;;    # host:path, the SSH shorthand
+           esac ;;
+      *) kb_origin_local=true ;;
+    esac
+    if $kb_origin_local && [ ! -d "$kb_origin" ]; then
+      die "$KB_DIR has its 'origin' at $kb_origin, which does not exist, so every knowledge write would be refused: restore it, re-point origin, or move the repository aside and run again; nothing has been changed"
+    fi
+  else
+    # Never `git init` over somebody's directory: a tree here that is not a
+    # repository is either an adopter's own files or a half-finished state, and
+    # both want a person rather than this script.
+    die "$KB_DIR exists and is not a git repository, so this install will not touch it: move it aside and run again; nothing has been changed"
+  fi
+fi
+
+# **THE ROOT MARKER**, the first condition for trusting a root.
+# `<root>/.builder-root` holds one line, the root's resolved
+# path, and the platform's resolver refuses to read knowledge from a root whose
+# marker is missing or names another path. A moved or copied tree still carries
+# its old path, so it fails, and that is what the marker is for.
+#
+# Resolved with `Path.resolve()`, the same call the resolver compares with, so
+# a root behind a symlink or written with a trailing slash still matches itself.
+# `RESOLVED_ROOT` is computed above, where the width checks now read it too.
+MARKER="$ROOT/.builder-root"
+WRITE_MARKER=0
+if [ -L "$MARKER" ]; then
+  # Writing through a link would put the marker wherever it points.
+  die "$MARKER is a symlink, and a root marker must be an ordinary file: nothing has been changed"
+elif [ -e "$MARKER" ]; then
+  recorded=$(head -n 1 "$MARKER")
+  if [ "$recorded" != "$RESOLVED_ROOT" ]; then
+    die "$MARKER names $recorded, not this root ($RESOLVED_ROOT): a tree carrying another root's marker was moved or copied, and installing into it would make it pass as the real root: nothing has been changed"
+  fi
+else
+  WRITE_MARKER=1
+fi
+
+# **THE STARTER SET IN A KEPT REPOSITORY IS BROUGHT UP TO THIS RELEASE, ONE
+# DOCUMENT AT A TIME, AND NEVER OVER THE ADOPTER'S OWN EDIT.** Each seeded path is
+# compared three ways: the version Builder last shipped there (its baseline, read
+# from the last starter-set commit touching it), the version the repository holds
+# now, and the version this release ships. An unchanged document is replaced, a
+# new one is added, and one the adopter edited, deleted or wrote first is left as
+# it is and handed to the steward with Builder's new version and the difference.
+# A document an earlier release shipped and this one does not is left alone.
+#
+# **THE BASELINE NEEDS BOTH THE IDENTITY AND THE MESSAGE.** A knowledge write on a
+# machine with no git identity commits as the same `Builder <builder@localhost>`
+# this script uses, but its message starts `docs:`, so only the pair names a
+# commit this script made.
+#
+# **THE UPDATE IS COMMITTED IN THE ORIGIN ITSELF, AND ONLY WHEN THAT ORIGIN IS
+# LOCAL.** A hosted origin has its own review flow, which a push to its `main`
+# from here would go around. In the local one, the commit is built with plumbing
+# against a private index and moved in with `update-ref <new> <old>`, which fails
+# rather than overwrites when a knowledge write landed in between. The served tree
+# is left to `agentctl kb sync`, which fast-forwards and reindexes as one step; a
+# fast-forward made here would move the tree without reindexing it.
+#
+# Arguments: plan|apply, the seed directory, the origin, the commit, the steward's
+# hand-off folder, and this script's name for the lines it prints. `plan` reads
+# and prints; `apply` writes.
+update_seed() {
+  python3 -I - "$@" <<'PY'
+import difflib, os, pathlib, shutil, stat, subprocess, sys, tempfile
+
+mode, seed, origin, commit, handoff, prog = sys.argv[1:7]
+seed, handoff = pathlib.Path(seed), pathlib.Path(handoff)
+MARKER = ".builder-updates"
+
+def say(line):
+    print(f"{prog}: {line}")
+
+def git(*args, data=None, env=None):
+    # **`core.hooksPath` IS PINNED ON EVERY CALL**, since these run in the origin
+    # itself rather than pushing to it, so a `-c` reaches the only side there is.
+    return subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-C", origin, *args],
+                          input=data, env=env, capture_output=True)
+
+def out(*args, **kw):
+    r = git(*args, **kw)
+    if r.returncode != 0:
+        sys.exit(f"git {args[0]} failed in {origin}: {r.stderr.decode(errors='replace').strip()}")
+    return r.stdout.decode().strip()
+
+def blob(ref, rel):
+    r = git("cat-file", "blob", f"{ref}:{rel}")
+    return r.stdout if r.returncode == 0 else None
+
+head = out("rev-parse", "--verify", "refs/heads/main^{commit}")
+
+adds, replaces, handed = [], [], []
+for src in sorted(seed.rglob("*")):
+    if not src.is_file():
+        continue
+    rel = src.relative_to(seed).as_posix()
+    new = src.read_bytes().replace(b"@RELEASE@", commit.encode())
+    current = blob(head, rel)
+    if current == new:
+        continue
+    shipped = out("log", "-1", "--format=%H", "--author=<builder@localhost>",
+                  "--grep=^The starter set", head, "--", rel)
+    base = blob(shipped, rel) if shipped else None
+    if current is None and base is None:
+        adds.append((rel, new))
+    elif current is not None and current == base:
+        replaces.append((rel, new))
+    else:
+        handed.append((rel, new, base, current))
+
+if mode == "plan":
+    for rel, _ in adds:
+        print(f"  would add {rel} to the knowledge repository")
+    for rel, _ in replaces:
+        print(f"  would replace {rel}, which is as Builder shipped it, with this release's version")
+    for rel, *_ in handed:
+        print(f"  would leave {rel}, which differs from what Builder shipped, and hand this release's version to the steward")
+    if not (adds or replaces or handed):
+        print("  the starter set in the knowledge repository is already this release's")
+    sys.exit(0)
+
+# **THE HAND-OFF FOLDER IS REPLACED ONLY WHEN IT CARRIES THIS SCRIPT'S MARKER**,
+# since replacing it is a recursive delete of a path in the operator's steward
+# directory. Checked before the commit, so a refusal changes nothing.
+if os.path.lexists(handoff):
+    if stat.S_ISLNK(os.lstat(handoff).st_mode) or not (handoff / MARKER).is_file():
+        sys.exit(f"{handoff} exists and was not written by this install, so it will not be "
+                 f"replaced: move it aside and run again; the knowledge repository is unchanged")
+
+writes = adds + replaces
+if writes:
+    tmp = tempfile.mkdtemp()
+    try:
+        env = {**os.environ, "GIT_INDEX_FILE": os.path.join(tmp, "index")}
+        out("read-tree", head, env=env)
+        for rel, data in writes:
+            sha = out("hash-object", "-w", "--stdin", data=data)
+            out("update-index", "--add", "--cacheinfo", f"100644,{sha},{rel}", env=env)
+        tree = out("write-tree", env=env)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    made = out("-c", "user.email=builder@localhost", "-c", "user.name=Builder",
+               "commit-tree", tree, "-p", head, "-m", f"The starter set, updated to Builder {commit}")
+    moved = git("update-ref", "refs/heads/main", made, head)
+    if moved.returncode != 0:
+        sys.exit("the knowledge repository's main moved while this install was updating it, "
+                 "and nothing was committed: run the install again")
+    for rel, _ in adds:
+        say(f"added {rel} to the knowledge repository")
+    for rel, _ in replaces:
+        say(f"replaced {rel}, which was as Builder shipped it, with this release's version")
+
+if os.path.lexists(handoff):
+    shutil.rmtree(handoff)
+if handed:
+    handoff.mkdir(parents=True)
+    (handoff / MARKER).write_text(f"{commit}\n")
+    # **THE CHOICES ARE WRITTEN HERE AS WELL AS IN THE CHARTER**, because an
+    # update never overwrites an installed charter, so the steward that reads this
+    # folder is usually one installed by an earlier release, whose charter does
+    # not mention it.
+    lines = [f"# Builder {commit}: documents you changed\n\n",
+             "This release changed these documents in your Reference Room, and you had changed them "
+             "too, so the install left yours in place. Beside each is Builder's new version and a "
+             "`.diff`. Ask the steward to replace, keep or merge each one.\n\n",
+             "Steward: offer the operator three choices for each document and let them pick. "
+             "**Replace** copies Builder's version over theirs. **Keep** changes nothing, and the "
+             "next update offers the document again. **Merge** writes one document keeping every "
+             "change of theirs and taking Builder's change, shown to the operator and written only "
+             "once they agree. Write a choice in the knowledge repository: commit only that file, "
+             "read `git diff origin/main`, `git push origin main`, then `agentctl kb sync`. Leave "
+             "this folder; the next install replaces it.\n\n"]
+    for rel, new, base, current in handed:
+        target = handoff / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(new)
+        before, label = (base, "as Builder shipped it before") if base is not None else (current or b"", "yours")
+        diff = difflib.unified_diff(before.decode(errors="replace").splitlines(keepends=True),
+                                    new.decode(errors="replace").splitlines(keepends=True),
+                                    f"a/{rel} ({label})", f"b/{rel} (Builder {commit})")
+        pathlib.Path(f"{target}.diff").write_text("".join(diff))
+        state = "deleted" if current is None else ("written before Builder shipped one" if base is None else "edited")
+        lines.append(f"- `{rel}`: you {state} it; the diff is Builder's change"
+                     f"{'' if base is not None else ', against yours'}.\n")
+        say(f"left {rel}, which differs from what Builder shipped, and handed this release's version to the steward at {target}")
+    (handoff / "README.md").write_text("".join(lines))
+if writes:
+    say("the served knowledge tree takes these at the next `agentctl kb sync`, which the "
+          "knowledge-autopull job runs every ten minutes; run it now to see them at once")
+elif not handed:
+    say("the starter set in the knowledge repository is already this release's")
+PY
+}
+
+# Where the origin of a kept repository is, for `update_seed`: a relative path
+# resolves against the repository, as git resolves it.
+kb_origin_path() {
+  case "$kb_origin" in /*) printf '%s' "$kb_origin" ;; *) printf '%s/%s' "$KB_DIR" "$kb_origin" ;; esac
+}
+
+STAGE=$(mktemp -d "${TMPDIR:-/tmp}/install-payload.XXXXXX")
+NEW=""
+OLD=""
+KB_NEW=""
+# The swap directories are reclaimed by the trap too. Without that, a run killed
+# between the two `mv`s leaves a .old.$$ nothing ever collects: the next run mints
+# a fresh $$ and never looks for a previous one, so an update mechanism meant to
+# be re-run leaks a full copy of the payload every time it is interrupted.
+cleanup() {
+  rm -rf "$STAGE"
+  [ -n "$NEW" ] && rm -rf "$NEW"
+  [ -n "$OLD" ] && [ -d "$OLD" ] && rm -rf "$OLD"
+  # The half-built knowledge repository goes the same way, and this is what makes
+  # a Ctrl-C during creation leave nothing behind rather than a repository with
+  # no remote that every later run reports as fine.
+  [ -n "$KB_NEW" ] && rm -rf "$KB_NEW"
+  return 0
+}
+trap cleanup EXIT INT TERM
+
+# Tracked blobs at the ref, and nothing else. An ignored or untracked file
+# sitting in the working tree cannot reach the stage through this.
+#
+# **ONLY `payload` IS EXTRACTED, AND THAT IS A SECURITY BOUNDARY RATHER THAN
+# TIDINESS.** An earlier version wrote our own checker into $STAGE/tools, and
+# extracting the whole ref let it commit `tools/` — or the checker's own path —
+# as a symlink pointing anywhere the operator can write. `cp` follows a symlink
+# destination and overwrites the target rather than replacing the link, so that
+# was an arbitrary file write handed to any ref an operator installs. Nothing is
+# written into the stage now, which closes it a second time; extracting one path
+# means the ref cannot put anything at `tools/` in the first place.
+git -C "$REPO" archive --format=tar "$COMMIT" payload | (cd "$STAGE" && tar xf -) \
+  || die "no payload tree at $REF, or could not export it from $REPO"
+
+# And `payload` itself must not be a link, or everything below reads whatever it
+# points at instead of the tree being installed.
+[ -L "$STAGE/payload" ] && die "payload is a symlink at $REF: refusing to install it"
+[ -d "$STAGE/payload" ] || die "no payload tree at $REF"
+
+# **NO SYMLINK ANYWHERE IN THE STAGED PAYLOAD.** The purity check refused one
+# when it ran here; it no longer runs at install, so this refusal stands on its
+# own. The whole payload is copied into the deploy area below, and a link there
+# would serve whatever it points at on this machine as if it had shipped.
+LINKS=$(find "$STAGE/payload" -type l -print 2>/dev/null) \
+  || die "could not read the staged payload to check it for symlinks"
+if [ -n "$LINKS" ]; then
+  echo "$PROG: the payload at $REF carries symlinks, which are never installed:" >&2
+  echo "$LINKS" | sed "s#^$STAGE/##" >&2
+  die "refusing to install a payload with symlinks in it"
+fi
+
+# Every skill that would be linked is checked BEFORE anything is moved, so a
+# refusal on the last one does not leave the first three already swapped. A
+# partial install is the state nobody can reason about.
+# **THE DEPLOY DIRECTORY IS CHECKED THE SAME WAY A LIVE SKILL PATH IS, and the
+# absence of this was the asymmetry that made the script dangerous.** A skill
+# path is refused unless it is already this script's own symlink; the deploy
+# directory was swapped aside and then removed whatever it contained. It is
+# operator-supplied through --deploy and BUILDER_DEPLOY_DIR, and its default sits
+# one segment under a directory people keep real things in. A --deploy that lands
+# a segment short is a typo rather than a contrived input, and it would have
+# moved that directory aside and deleted it.
+#
+# Our own stamp is what makes a directory ours. Absent is fine, since that is a
+# first install.
+if [ -e "$DEPLOY_DIR" ] && [ ! -f "$STAMP" ] && [ "$FORCE" -eq 0 ]; then
+  die "$DEPLOY_DIR exists and carries no install stamp, so it was not put there by this script: pass --force to replace it; nothing has been changed"
+fi
+
+# A symlink under payload/ is refused above, so the loops below should never
+# meet one. They refuse it themselves anyway: `[ -d ]` follows
+# a link, so `payload/skills/x -> /` would read as a directory here, and the only
+# thing standing between that and a link into an operator's skills directory
+# would be a rule living in another file continuing to say what it says now.
+BLOCKED=""
+for src in "$STAGE"/payload/skills/*; do
+  [ -L "$src" ] && die "payload/skills/$(basename "$src") is a symlink: refusing to install it"
+  [ -d "$src" ] || continue
+  name=$(basename "$src")
+  live="$SKILLS_DIR/$name"
+  [ -e "$live" ] || [ -L "$live" ] || continue
+  if [ -L "$live" ] && [ "$(readlink "$live")" = "$DEPLOY_DIR/skills/$name" ]; then
+    continue
+  fi
+  BLOCKED="$BLOCKED $name"
+done
+
+if [ -n "$BLOCKED" ] && [ "$FORCE" -eq 0 ]; then
+  echo "$PROG: these live paths are not this script's own symlink:" >&2
+  for name in $BLOCKED; do
+    live="$SKILLS_DIR/$name"
+    if [ -L "$live" ]; then
+      echo "  $name -> $(readlink "$live")" >&2
+    else
+      echo "  $name  (a real directory — the hand-placed copy this replaces)" >&2
+    fi
+  done
+  die "pass --force to replace them; nothing has been changed"
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "would deploy $REF ($COMMIT) to $DEPLOY_DIR"
+  for src in "$STAGE"/payload/skills/*; do
+    [ -d "$src" ] || continue
+    echo "  would link $SKILLS_DIR/$(basename "$src") -> $DEPLOY_DIR/skills/$(basename "$src")"
+  done
+  echo "  would use $ROOT as this machine's root"
+  if [ "$WRITE_CONFIG" -eq 1 ]; then
+    echo "  would set CREWS_ROOT=$ROOT in $CONFIG"
+  fi
+  if [ "$WRITE_MARKER" -eq 1 ]; then
+    echo "  would write $MARKER naming $RESOLVED_ROOT"
+  else
+    echo "  $MARKER already names this root"
+  fi
+  if [ "$KB_ACTION" = "create" ]; then
+    echo "  would create the knowledge repository at $KB_DIR with its remote at $KB_REMOTE, holding the starter set"
+  elif $kb_origin_local; then
+    echo "  $KB_DIR is already a git repository; this install would keep it and bring its starter set up to this release:"
+    update_seed plan "$STAGE/payload/knowledge-seed" "$(kb_origin_path)" "$COMMIT" "$STEWARD_DIR/builder-updates" "$PROG" \
+      || die "could not read the knowledge repository's origin at $kb_origin"
+  else
+    echo "  $KB_DIR is already a git repository whose origin is hosted at $kb_origin, and this install would leave it alone"
+  fi
+  echo "  would use $STEWARD_DIR as the steward's directory, from $STEWARD_SOURCE"
+  if [ -f "$STAGE/payload/steward/CHARTER.md" ]; then
+    if [ -e "$STEWARD_DIR/CLAUDE.md" ] || [ -L "$STEWARD_DIR/CLAUDE.md" ]; then
+      echo "  would leave $STEWARD_DIR/CLAUDE.md untouched"
+    else
+      echo "  would place the steward charter at $STEWARD_DIR/CLAUDE.md"
+    fi
+  fi
+  if [ -f "$STAGE/payload/knowledge-seed/machine/CLAUDE.md" ]; then
+    if [ -e "$MACHINE_FILE" ] || [ -L "$MACHINE_FILE" ]; then
+      echo "  would leave $MACHINE_FILE untouched"
+    else
+      echo "  would place the machine-wide instruction file at $MACHINE_FILE"
+    fi
+  fi
+  exit 0
+fi
+
+# Stage complete, then swap: the old area is moved aside and removed only after
+# the new one is in place, so an interrupted run never leaves a mix of two refs.
+mkdir -p "$(dirname "$DEPLOY_DIR")"
+NEW="$DEPLOY_DIR.new.$$"
+rm -rf "$NEW"
+mkdir -p "$NEW"
+cp -R "$STAGE/payload/." "$NEW/"
+
+{
+  echo "commit: $COMMIT"
+  echo "ref: $REF"
+  echo "installed_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "root: $ROOT"
+  echo "steward_dir: $STEWARD_DIR"
+  [ "$ALLOW_NON_MAIN" -eq 1 ] && echo "allow_non_main: true"
+  [ "$FORCE" -eq 1 ] && echo "force: true"
+} > "$NEW/.installed"
+
+# **THE DEPLOY SWAP MOVES THE SAME WAY THE KNOWLEDGE REPOSITORY DOES, AND FOR THE
+# REASON THIS SCRIPT ALREADY WROTE DOWN ONE SCREEN LOWER.** `mv` onto a symlink
+# pointing at a directory moves the source INSIDE it and exits 0. A review
+# reproduced what that costs here: with a link planted at the deploy directory,
+# the freshly staged payload landed in the attacker's directory, the deploy path
+# was left as a permanent link into it, every skill link dangled, and the script
+# printed that it had installed (security review).
+#
+# `rename(2)` refuses a symlinked destination instead of descending into it. Both
+# moves also happen inside ONE interpreter, which closes the gap between them:
+# the old version left the deploy path absent between two separate `mv`
+# processes, which is the window the review's shim won.
+#
+# **THE GUARANTEE IS `rename(2)`, NOT THE `lstat` BESIDE IT**, and a review
+# corrected this comment on that point. The check below is itself a check and
+# then an act, so it could in principle be raced; what cannot be raced is the
+# kernel treating a symlink as a non-directory entry and refusing a directory
+# over it with ENOTDIR, whatever the link resolves to. The `lstat` is there to
+# produce a sentence an operator can read instead of a traceback.
+OLD="$DEPLOY_DIR.old.$$"
+# Taken before the swap, so a process started after it is not reported as
+# holding the version the swap replaced. See tools/stale_holders.py.
+SWAPPED_AT=$(date +%s)
+SWAP_RC=0
+python3 -I - "$DEPLOY_DIR" "$NEW" "$OLD" <<'PY' || SWAP_RC=$?
+import os, stat, sys
+deploy, new, old = sys.argv[1], sys.argv[2], sys.argv[3]
+rescued = False
+if os.path.lexists(deploy):
+    if stat.S_ISLNK(os.lstat(deploy).st_mode):
+        sys.exit(f"{deploy} is a symlink, and this install will not write through one")
+    os.rename(deploy, old)
+    rescued = True
+# **THE PREVIOUS DEPLOYMENT GOES BACK IF THE SECOND MOVE FAILS.** Between the two
+# renames there is no deployment at all, and the old code left it that way: the
+# shell's cleanup trap then deleted both the rescued copy and the staged one, so
+# a disk filling up at this instant removed the working install and said only
+# "could not put the payload in place", which reads as nothing having changed. A
+# review found it while answering a question about partial failure, and it was
+# in the `mv` version too (security review).
+try:
+    os.rename(new, deploy)
+except OSError as failed:
+    if rescued:
+        try:
+            os.rename(old, deploy)
+            sys.exit(f"could not install the new payload ({failed.strerror}); "
+                     f"the previous one is back in place at {deploy}")
+        except OSError as worse:
+            # **EXIT 3 MEANS THE RESCUED COPY IS STILL AT `old`, AND THE SHELL
+            # HAS TO BE TOLD.** The cleanup trap removes `$OLD` on any exit, so
+            # the first version of this branch printed where the previous
+            # deployment was and then let the trap delete it a moment later. The
+            # message was false by the time an operator could read it, on the one
+            # path this branch exists to make legible (security review).
+            print(f"could not install the new payload ({failed.strerror}) and "
+                  f"could not restore the previous one ({worse.strerror}); "
+                  f"the previous deployment is at {old}", file=sys.stderr)
+            sys.exit(3)
+    # Nothing was rescued, so there is nothing to protect and nothing to name.
+    # A sentence still beats the traceback a bare `raise` would print, which is
+    # this block's own stated standard applied to its last exit.
+    sys.exit(f"could not install the new payload ({failed.strerror})")
+if stat.S_ISLNK(os.lstat(deploy).st_mode) or not os.path.isdir(deploy):
+    sys.exit(f"{deploy} is not a directory after the move")
+PY
+if [ "$SWAP_RC" -ne 0 ]; then
+  # **CLEARING `$OLD` IS WHAT MAKES THE MESSAGE ABOVE TRUE.** The trap removes
+  # whatever `$OLD` names, so on the one path where the rescued deployment is
+  # still sitting there, the shell has to stop pointing at it. Any other failure
+  # leaves `$OLD` alone, because the restore succeeded and there is nothing at
+  # that path to keep.
+  [ "$SWAP_RC" -eq 3 ] && OLD=""
+  die "could not put the payload in place at $DEPLOY_DIR"
+fi
+NEW=""
+# **WHO STILL HOLDS WHAT THIS REPLACED, ASKED BEFORE `$OLD` GOES.** The payload
+# is text rather than a program, so a process holding it is rare, but the answer
+# is looked for rather than assumed, and printed either way. It is read from
+# `tools/stale_holders.py` beside this script, and it reports without restarting
+# anything.
+if [ -n "$OLD" ] && [ -d "$OLD" ]; then
+  HOLDERS=$(CDPATH= cd -- "$(dirname -- "$0")/../tools" 2>/dev/null && pwd)/stale_holders.py
+  if [ -f "$HOLDERS" ]; then
+    echo "$PROG: what is still running the payload this replaced:"
+    python3 -I "$HOLDERS" "$OLD" "$DEPLOY_DIR" "$SWAPPED_AT" payload || true
+  else
+    echo "$PROG: no stale_holders.py beside this installer, so nothing checked what still runs the payload this replaced"
+  fi
+  # The layer the scan cannot see. A skill is text a session reads when it
+  # loads the skill, so no process holds its file, but a session that loaded one
+  # before this install has that text in its conversation and keeps it.
+  echo "$PROG: a session that loaded one of these skills before this install keeps the text it loaded until it loads the skill again"
+fi
+[ -n "$OLD" ] && rm -rf "$OLD" && OLD=""
+
+mkdir -p "$SKILLS_DIR"
+for src in "$DEPLOY_DIR"/skills/*; do
+  [ -L "$src" ] && die "$DEPLOY_DIR/skills/$(basename "$src") is a symlink: refusing to link it"
+  [ -d "$src" ] || continue
+  name=$(basename "$src")
+  live="$SKILLS_DIR/$name"
+  # **THE LIVE PATH IS RE-CHECKED HERE, NOT ONLY IN THE REFUSAL LOOP ABOVE.**
+  # That loop confirms each live path is absent or already this script's own
+  # link, and then the archive extraction, the symlink check and the whole deploy
+  # swap run before this `rm -rf` does. The knowledge paths in this same file
+  # re-check at the point of use for exactly that reason; this loop did not,
+  # which a review noticed while reading the one part no round had examined
+  # (security review). A path that became something else in the meantime is
+  # refused rather than removed.
+  #
+  # `--force` still means what it meant: it is how an operator replaces a live
+  # path this script did not put there, and the refusal loop above already
+  # accepted the run on that basis. So the recheck applies to the run that was
+  # NOT forced, where the only thing that should be at this path is what the
+  # earlier loop saw.
+  if [ "$FORCE" -eq 0 ] && { [ -e "$live" ] || [ -L "$live" ]; }; then
+    [ -L "$live" ] || die "$live is no longer a symlink, so this install will not remove it: it changed while the install was running"
+    case "$(readlink "$live")" in
+      "$DEPLOY_DIR/skills/$name") ;;
+      *) die "$live now points at $(readlink "$live"), which this install did not put there: it changed while the install was running" ;;
+    esac
+  fi
+  rm -rf "$live"
+  ln -s "$DEPLOY_DIR/skills/$name" "$live"
+  echo "$PROG: linked $name -> $DEPLOY_DIR/skills/$name"
+done
+
+# The root has to exist: the session agent treats a CREWS_ROOT that names no
+# directory as unusable and falls back to its compiled-in default, so writing
+# the setting without the directory would quietly put the next crew elsewhere.
+mkdir -p "$ROOT"
+if [ "$WRITE_MARKER" -eq 1 ]; then
+  printf '%s\n' "$RESOLVED_ROOT" > "$MARKER"
+  echo "$PROG: wrote $MARKER naming $RESOLVED_ROOT"
+fi
+if [ "$WRITE_CONFIG" -eq 1 ]; then
+  mkdir -p "$(dirname "$CONFIG")"
+  # Appended rather than rewritten, since the file may hold other lines. A last
+  # line with no newline would otherwise swallow the new one.
+  if [ -s "$CONFIG" ] && [ -n "$(tail -c 1 "$CONFIG")" ]; then
+    echo >> "$CONFIG"
+  fi
+  {
+    echo "# Written by install-payload at $COMMIT: where this machine's projects live."
+    echo "CREWS_ROOT=$ROOT"
+  } >> "$CONFIG"
+  echo "$PROG: set CREWS_ROOT=$ROOT in $CONFIG"
+fi
+
+# The knowledge repository, created once and never touched again.
+#
+# **THE BRANCH IS SET WITHOUT `git init -b`, WHICH GIT LEARNED ONLY IN 2.28.**
+# `symbolic-ref` has always been there and says the same thing, so an adopter on
+# an older git gets a repository on `main` rather than a confusing failure or a
+# repository on `master` that the scribe's `origin/main` will never find.
+#
+# **THE COMMIT IDENTITY IS PASSED PER COMMAND AND NEVER CONFIGURED.** An adopter
+# who has never used git has no `user.email`, and `git commit` refuses without
+# one. Writing it into their global config would be this script deciding who they
+# are on their own machine; `-c` supplies it for this one commit and leaves
+# nothing behind.
+#
+# **AND THE FIRST COMMIT IS PUSHED, BECAUSE A REMOTE WITH NO `main` IS NOT
+# ENOUGH.** The scribe fetches `origin main` and resets to `origin/main`, so both
+# the remote branch and the remote-tracking ref have to exist before the first
+# write, not after it.
+#
+# **THE TREE IS BUILT BESIDE ITS FINAL PATH AND MOVED THERE LAST**, so the
+# existence of `<root>/knowledge/.git` means a finished repository rather than an
+# attempt. The first version decided "leave it alone" on that path existing, and
+# a review reproduced what that cost: a Ctrl-C partway through creation, or any
+# failing step, left a repository with no remote, which every later run then
+# reported as kept and fine. There was no repair short of deleting it by hand,
+# and the first symptom was the scribe failing days later with a git error about
+# a repository nobody remembered configuring (reviewer).
+#
+# **NO HOOK MAY RUN, AND IT TOOK THREE DOORS TO GET THERE.** Each was reproduced
+# against this script's own sequence before it was closed, and each was found
+# only because the one before it was (security review).
+#
+# `git init` copies hooks from a template directory that `GIT_TEMPLATE_DIR` or
+# `init.templateDir` can name, and the commit and push below would then run them
+# as the operator. `--template=` pointed at an empty directory closes that.
+#
+# `core.hooksPath` in an ambient global config fires even when no hook was ever
+# copied, so each repository pins that setting in its OWN config, which outranks
+# a global one. **A `-c` on the pushing command does not reach the receiving side
+# of a local push**, which is why the pin is written into the repository rather
+# than passed per command.
+#
+# `GIT_CONFIG_COUNT` and its numbered pairs outrank even that, since they enter
+# at the precedence of `-c`. They are cleared at the top of this script, where
+# every other git call is covered by the same line.
+#
+# **THE PIN NAMES `/dev/null`**, which no later write can turn into a hooks
+# directory. Pointing it at a path inside the repository that does not exist yet
+# leaves a permanent config line waiting for somebody to create that directory.
+if [ "$KB_ACTION" = "keep" ] && $kb_origin_local; then
+  echo "$PROG: kept the knowledge repository at $KB_DIR; bringing its starter set up to $COMMIT"
+  update_seed apply "$STAGE/payload/knowledge-seed" "$(kb_origin_path)" "$COMMIT" "$STEWARD_DIR/builder-updates" "$PROG" \
+    || die "could not update the starter set in the knowledge repository"
+elif [ "$KB_ACTION" = "keep" ]; then
+  echo "$PROG: left the knowledge repository at $KB_DIR alone: its origin is hosted at $kb_origin, and this install updates the starter set only in a local one"
+else
+  KB_TEMPLATE="$STAGE/empty-git-template"
+  mkdir -p "$KB_TEMPLATE"
+  KB_NEW="$KB_DIR.new.$$"
+  rm -rf "$KB_NEW"
+  # **THE DIRECTORY IS MADE WITHOUT FOLLOWING A LINK, AND `mkdir -p` WOULD HAVE.**
+  # The early refusal above is a point-in-time check, and everything between it
+  # and here is real work, so a link planted at `.remotes` in that window used to
+  # pass straight through `mkdir -p` and put the bare repository wherever it
+  # pointed. `os.mkdir` fails when the path exists at all, and `lstat` then says
+  # whether what is there is a directory or a link, which `test -d` cannot
+  # distinguish (security review).
+  python3 -I - "$KB_REMOTES_DIR" <<'PY' || die "could not create the knowledge remote's directory"
+import os, stat, sys
+path = sys.argv[1]
+try:
+    os.mkdir(path)
+except FileExistsError:
+    mode = os.lstat(path).st_mode
+    if stat.S_ISLNK(mode):
+        sys.exit(f"{path} is a symlink, and this install will not write through one")
+    if not stat.S_ISDIR(mode):
+        sys.exit(f"{path} exists and is not a directory")
+PY
+  [ -L "$KB_REMOTE" ] && die "$KB_REMOTE is a symlink, and this install will not write through one"
+  # The bare repository is created at its final path, and creating one twice is
+  # harmless: `git init` on an existing repository reinitialises it and keeps
+  # every object and ref, so an interrupted run that got this far costs nothing.
+  git init --quiet --bare --template="$KB_TEMPLATE" "$KB_REMOTE" \
+    || die "could not create the knowledge remote at $KB_REMOTE"
+  # **THE PIN NAMES `/dev/null`, WHICH CAN NEVER BECOME A HOOKS DIRECTORY.** An
+  # earlier version pointed it at a path inside the repository that did not exist
+  # yet, and a review noted the obvious end of that: anything which later creates
+  # that directory turns a permanent config line into live hook execution. A
+  # character device cannot be made into one (security review).
+  git -C "$KB_REMOTE" config core.hooksPath /dev/null \
+    || die "could not disable hooks in $KB_REMOTE"
+  git -C "$KB_REMOTE" symbolic-ref HEAD refs/heads/main \
+    || die "could not set the default branch of $KB_REMOTE to main"
+  git init --quiet --template="$KB_TEMPLATE" "$KB_NEW" \
+    || die "could not create the knowledge repository at $KB_NEW"
+  git -C "$KB_NEW" config core.hooksPath /dev/null \
+    || die "could not disable hooks in the knowledge repository"
+  git -C "$KB_NEW" symbolic-ref HEAD refs/heads/main \
+    || die "could not set the default branch of the knowledge repository to main"
+  git -C "$KB_NEW" remote add origin "$KB_REMOTE" \
+    || die "could not point the knowledge repository at its remote $KB_REMOTE"
+  # `projects/` is where the indexer reads documents from, so the shape is there
+  # before the first document is written rather than implied by the first one.
+  mkdir -p "$KB_NEW/projects"
+  : > "$KB_NEW/projects/.gitkeep"
+  git -C "$KB_NEW" add projects/.gitkeep \
+    || die "could not stage the knowledge repository's first commit"
+  # **THE FIRST COMMIT IS BYTE-FOR-BYTE THE SAME ON EVERY RUN, AND THAT IS WHAT
+  # MAKES A RETRY CONVERGE.** The bare repository is created at its final path, so
+  # a run that pushes and then fails leaves the branch there while the working
+  # tree never arrives. With a wall-clock timestamp the next run would build a
+  # different root commit, and pushing it would be rejected as a non-fast-forward
+  # for ever, with git's own "Updates were rejected" hint rather than anything
+  # this script says. A fixed identity and a fixed date give the identical commit
+  # every time, so that push is "Everything up-to-date" (reviewer).
+  #
+  # The date is arbitrary and constant on purpose. It is the date this repository
+  # began rather than the moment an adopter installed, which is a fact their own
+  # first document will carry anyway.
+  GIT_COMMITTER_DATE="2020-01-01T00:00:00Z" git -C "$KB_NEW" \
+    -c user.email=builder@localhost -c user.name=Builder \
+    commit --quiet --date="2020-01-01T00:00:00Z" \
+    -m "The Reference Room starts here" \
+    || die "could not make the knowledge repository's first commit"
+  # **THE STARTER SET IS THE SECOND COMMIT, SO THE FIRST STAYS FIXED.** Its
+  # documents are the four starter agents, their instruction blocks and the
+  # default profile a crew falls back to, and without them `co` in a new crew
+  # has no agent to start. Each records the release it shipped in: the payload
+  # holds `@RELEASE@` and this stamps the commit being installed. The same
+  # fixed identity and date as the first commit make this one depend only on
+  # that commit, so a retry of the same install converges on it too. A retry
+  # from a DIFFERENT commit, after an earlier attempt pushed and then failed,
+  # builds a different second commit, and git refuses that push as a
+  # non-fast-forward; moving the bare remote aside clears it (reviewer).
+  python3 -I - "$STAGE/payload/knowledge-seed" "$KB_NEW" "$COMMIT" <<'PY' \
+    || die "could not copy the starter set into the knowledge repository"
+import pathlib, shutil, sys
+seed, dest, commit = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
+for src in sorted(seed.rglob("*")):
+    if not src.is_file():
+        continue
+    out = dest / src.relative_to(seed)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, out)
+    text = out.read_text(encoding="utf-8")
+    if "@RELEASE@" in text:
+        out.write_text(text.replace("@RELEASE@", commit), encoding="utf-8")
+PY
+  git -C "$KB_NEW" add -A \
+    || die "could not stage the starter set"
+  GIT_COMMITTER_DATE="2020-01-01T00:00:00Z" git -C "$KB_NEW" \
+    -c user.email=builder@localhost -c user.name=Builder \
+    commit --quiet --date="2020-01-01T00:00:00Z" \
+    -m "The starter set, from Builder $COMMIT" \
+    || die "could not commit the starter set to the knowledge repository"
+  git -C "$KB_NEW" push --quiet origin main \
+    || die "could not push the knowledge repository's first commits to $KB_REMOTE"
+  git -C "$KB_NEW" fetch --quiet origin main \
+    || die "could not fetch origin/main in the knowledge repository"
+  # **THE MOVE IS `os.rename`, NOT `mv`, AND THE DIFFERENCE IS THE FINDING.**
+  # `mv` onto a symlink that points at a directory moves the source INSIDE it and
+  # exits 0, so a link planted at the final path in the window since the early
+  # check would have taken the whole repository into somebody else's directory
+  # while this script printed that it had created one. `rename(2)` does not
+  # follow a symlink at its destination: it fails there rather than descending,
+  # verified both ways. The check before and the lstat after are what turn the
+  # remaining race into a refusal rather than a silent success (security
+  # review).
+  python3 -I - "$KB_NEW" "$KB_DIR" <<'PY' || die "could not move the knowledge repository into place at $KB_DIR"
+import os, stat, sys
+src, dst = sys.argv[1], sys.argv[2]
+if os.path.lexists(dst):
+    sys.exit(f"{dst} appeared while the knowledge repository was being built")
+os.rename(src, dst)
+mode = os.lstat(dst).st_mode
+if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+    sys.exit(f"{dst} is not a directory after the move")
+PY
+  echo "$PROG: created the knowledge repository at $KB_DIR, with its remote at $KB_REMOTE, and seeded it with the starter set"
+  echo "$PROG: it needs no account anywhere; connecting it to a hosted remote later is a change of origin"
+fi
+
+# **THE CHARTER IS COPIED ONCE AND NEVER LINKED OR OVERWRITTEN.** The charter
+# says it is the operator's from install and that the operator edits it in
+# place. A link into the deploy area would make every edit an edit to something
+# the next release replaces, so the steward gets an ordinary writable copy, and
+# a later install only says when the shipped charter has moved on from it.
+CHARTER="$DEPLOY_DIR/steward/CHARTER.md"
+if [ -f "$CHARTER" ]; then
+  target="$STEWARD_DIR/CLAUDE.md"
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    if [ ! -L "$target" ] && cmp -s "$CHARTER" "$target"; then
+      echo "$PROG: the steward charter at $target matches the one shipped at $COMMIT"
+    else
+      echo "$PROG: left $target untouched: it differs from the charter shipped at $COMMIT ($CHARTER), and an installed charter is never overwritten"
+    fi
+  else
+    mkdir -p "$STEWARD_DIR"
+    cp "$CHARTER" "$target"
+    chmod u+w "$target"
+    echo "$PROG: placed the steward charter at $target; start a session in $STEWARD_DIR to meet the steward"
+  fi
+fi
+
+# **THE MACHINE-WIDE FILE IS PLACED THE SAME WAY, AND ITS REFUSAL SENDS THE
+# OPERATOR TO THE STEWARD.** Every session on the machine reads it at start, so
+# replacing an existing one would swap the standing instructions of every agent
+# without a word. An existing file is left exactly as it is and named; the
+# steward's charter says how to offer replacing it, dropping Builder's, or
+# merging the two. It is copied rather than linked for the charter's reason:
+# the operator edits it in place, and a link would point that edit at a file the
+# next release replaces.
+MACHINE_SOURCE="$DEPLOY_DIR/knowledge-seed/machine/CLAUDE.md"
+if [ -f "$MACHINE_SOURCE" ]; then
+  if [ -e "$MACHINE_FILE" ] || [ -L "$MACHINE_FILE" ]; then
+    if [ ! -L "$MACHINE_FILE" ] && cmp -s "$MACHINE_SOURCE" "$MACHINE_FILE"; then
+      echo "$PROG: the machine-wide instruction file at $MACHINE_FILE matches the one shipped at $COMMIT"
+    else
+      echo "$PROG: left $MACHINE_FILE untouched: it differs from the machine-wide instruction file shipped at $COMMIT ($MACHINE_SOURCE), and an existing one is never overwritten"
+      echo "$PROG: ask the steward to replace it, keep it and drop Builder's, or merge the two; the steward's charter says how"
+    fi
+  else
+    mkdir -p "$(dirname "$MACHINE_FILE")"
+    cp "$MACHINE_SOURCE" "$MACHINE_FILE"
+    chmod u+w "$MACHINE_FILE"
+    echo "$PROG: placed the machine-wide instruction file at $MACHINE_FILE; every session started from now on reads it"
+  fi
+fi
+
+echo "$PROG: installed $REF at $COMMIT"

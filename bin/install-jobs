@@ -1,0 +1,1240 @@
+#!/usr/bin/env python3
+"""install-jobs — put Builder's backend jobs on a machine, for either supervisor.
+
+Reads a directory of job declarations, resolves each one against this machine's
+layout, and writes a launchd property list on macOS or a systemd service and
+timer on Linux. `tools/jobs/FORMAT.md` is the format; this is the thing that
+installs it.
+
+WHY THE INTERPRETER LINE IS `/usr/bin/env python3` AND THE VERSION IS CHECKED
+BELOW. A declaration is TOML, and `tomllib` arrived in Python 3.11. Ubuntu
+22.04, a platform the backend is committed to run on, ships 3.10, so the stock
+interpreter cannot read a declaration at all: it fails with
+`ModuleNotFoundError: No module named 'tomllib'`, which says nothing about
+what is actually wrong. A hardcoded `/opt/homebrew/bin/python3.11` is how ten
+scripts in `agent-platform/bin` became unrunnable on Linux, so that is not the
+fix either. `env` finds whatever python3 is on the path, and the check below
+turns the confusing import error into a sentence naming the version needed.
+
+WHY INSTALLING AND ACTIVATING ARE SEPARATE, AND ONLY ONE IS THE DEFAULT.
+Copying a unit file does not run it: launchd needs `launchctl bootstrap` and
+systemd needs `systemctl enable --now`. A hardcoded list of labels to activate
+goes stale: a job added after the list was last edited is installed, never
+mentioned again, and never runs. Nothing errors and nothing looks wrong.
+
+So this reports activation state from the DECLARATIONS, which cannot go stale
+because it is the same file the job comes from, and activates only when asked
+with `--activate`. Reporting is the half that fixes the silent gap; starting a
+job is the half that makes something begin posting, spawning or writing on its
+own schedule, and that stays an explicit decision.
+
+WHY A LIVE UNIT THAT DIFFERS IS REFUSED RATHER THAN OVERWRITTEN. Someone tunes
+a live unit by hand, and an installer that overwrites it reverts that silently
+with an exit status of 0, and a hand-tuned setting may exist nowhere in git.
+A difference is printed and skipped; `--force` is the "my template is right" path.
+
+WHY A DIFFERENCE IS JUDGED AGAINST THIS INSTALLER'S OWN RECORD. Comparing only
+the live unit with the current declaration cannot tell a hand edit from a unit
+an earlier release wrote, so every declaration change read as a hand edit. In
+the 2026-10-01 rehearsal the Library's unit, written two days earlier, lacked
+the variables a later `library.toml` added; the newer stand-up skipped it, and
+the Library failed with `LIBRARY_VECTORS_DB is not set`. So each run records
+the sha256 of every unit it writes or finds already matching, in
+`{state}/install-jobs/units.json`. A live unit that matches the record is this
+installer's own and is replaced. One that matches neither the record nor the
+declaration is a hand edit and is refused as before.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import difflib
+import errno
+import hashlib
+import json
+import os
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+
+def python_too_old(version=None, executable: str | None = None) -> str | None:
+    """The message to die with under an interpreter that cannot read TOML.
+
+    A FUNCTION RATHER THAN A BARE `if`, SO THE GUARD CAN BE TESTED WHERE IT
+    MATTERS. The machine this has to be right on is Ubuntu 22.04, and CI runs
+    3.11, so an inline check could only ever be confirmed by hand in a
+    container — which I did once, and which proves nothing about the next
+    change. Passing the version in means the 3.10 case is a check that runs on
+    every pull request.
+    """
+    version = version or sys.version_info
+    if version >= (3, 11):
+        return None
+    return (
+        f"install-jobs needs Python 3.11 or newer for tomllib, and this is "
+        f"{version[0]}.{version[1]} at {executable or sys.executable}. "
+        f"Ubuntu 22.04 ships 3.10, so install 3.11 and run this under it — a job "
+        f"declaration is TOML and cannot be read without it."
+    )
+
+
+_too_old = python_too_old()
+if _too_old:
+    sys.exit(_too_old)
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "tools"))
+
+from jobs import accounts, declaration, placeholders, render_launchd, render_systemd
+
+PROG = "install-jobs"
+
+
+class Refused(Exception):
+    """Something the operator has to decide about. Never a stack trace."""
+
+
+def detect_platform() -> str:
+    if sys.platform == "darwin":
+        return "macos"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    raise Refused(
+        f"{sys.platform} is neither macos nor linux, and Builder's backend "
+        f"supports those two. Nothing was installed."
+    )
+
+
+def builder_root(bin_dir: str) -> str | None:
+    """The Builder root, as `builder-root` prints it, or None if it cannot say.
+
+    **ASKED, NOT ASSUMED.** Every other Builder tool finds the root through
+    `builder-root` (company decision 0008). This one used to default to
+    `~/Convivy`, which is this machine's root and no adopter's: on a clean
+    install whose root is `~/builder`, a job naming `{root}/knowledge` rendered
+    as a folder that did not exist and failed on its first run. The linked copy
+    in `bin_dir` is asked first, since `stand-up-backend` links it before this
+    runs and a fresh shell may not have that directory on PATH yet.
+
+    **NEVER EXECUTED AS ROOT.** Both places it is looked for can be written by
+    an account other than root: `bin_dir` follows `--home`, and PATH is
+    inherited. Running what either holds would hand that account root, so a
+    root run answers None and must be given `--root`.
+
+    Output is taken only as a single absolute path, since it is rendered into
+    unit files where a relative path or a second line would change what runs.
+    """
+    if os.geteuid() == 0:
+        return None
+    for candidate in (os.path.join(bin_dir, "builder-root"), shutil.which("builder-root")):
+        if not candidate or not os.path.isfile(candidate):
+            continue
+        try:
+            result = subprocess.run([candidate], capture_output=True, text=True,
+                                    check=False, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        root = result.stdout.strip()
+        if result.returncode == 0 and os.path.isabs(root) and "\n" not in root:
+            return root
+    return None
+
+
+def machine_from(args: argparse.Namespace) -> placeholders.Machine:
+    """This machine's layout, as the placeholders resolve against.
+
+    `root` is empty when `--root` is not given and `builder-root` cannot answer.
+    `main` refuses before rendering if a declaration then uses `{root}`, rather
+    than rendering a path under a root nobody named.
+    """
+    home = args.home or os.path.expanduser("~")
+    bin_dir = args.bin or f"{home}/.local/bin"
+    return placeholders.Machine.for_home(
+        home,
+        root=args.root or builder_root(bin_dir) or "",
+        python=args.python or sys.executable,
+        deploy=args.deploy,
+        state=args.state,
+        bin=bin_dir,
+    )
+
+
+def destinations(
+    job: declaration.Job, platform: str, home: str, system_dir: str | None = None
+) -> dict[str, str]:
+    """Absolute path to file contents, for every file this job installs.
+
+    `system_dir` OVERRIDES WHERE A SYSTEM-SCOPE JOB LANDS, AND THAT IS A
+    TESTABILITY REQUIREMENT RATHER THAN A CONVENIENCE. A user-scope job follows
+    `--home`, so pointing that at a temporary directory sandboxes it completely.
+    A system-scope job does not: its destination is `/Library/LaunchDaemons` or
+    `/etc/systemd/system` whatever `--home` says. So a test suite running as
+    root — a container, by default — would write a real LaunchDaemon onto the
+    machine running the tests, which this suite claimed it could never do until
+    a Linux run proved otherwise. With this, every destination is redirectable
+    and the claim is true.
+    """
+    if platform == "macos":
+        if job.scope == "system" and system_dir:
+            path = f"{system_dir}/{job.label}.plist"
+        else:
+            path = render_launchd.install_path(job, home)
+        return {path: render_launchd.render(job).decode()}
+    if job.scope == "system" and system_dir:
+        directory = system_dir
+    else:
+        directory = render_systemd.unit_directory(job, home)
+    return {
+        f"{directory}/{name}": text for name, text in render_systemd.render(job).items()
+    }
+
+
+def load_jobs(jobs_dir: Path, platform: str) -> list[declaration.Job]:
+    if not jobs_dir.is_dir():
+        raise Refused(f"no such directory: {jobs_dir}")
+    try:
+        jobs = declaration.load_directory(jobs_dir)
+    except declaration.DeclarationError as exc:
+        raise Refused(
+            f"{exc}\n\nNothing was installed. A declaration that will not parse is "
+            f"fixed before anything reaches this machine."
+        ) from exc
+    if not jobs:
+        # A clean report over an empty directory reads as "all jobs installed"
+        # to whoever ran this to confirm an install landed.
+        raise Refused(f"no job declarations in {jobs_dir}")
+    return [job for job in jobs if job.runs_on(platform)]
+
+
+def find_programs(job: declaration.Job) -> dict[str, str]:
+    """The path of each program the job names, from this process's PATH.
+
+    THIS PROCESS'S PATH IS THE RIGHT ONE, AND THE JOB'S IS NOT. The operator
+    runs the installer from a shell that finds their tools; launchd starts a
+    job with a PATH that holds no Homebrew prefix at all. So the lookup happens
+    here and the job gets the absolute path. A program that is not found stops
+    the install before anything is written, since a job whose argv names
+    nothing starts, fails, and looks from outside like a job that ran.
+    """
+    found = {}
+    for name in job.programs:
+        path = shutil.which(name)
+        if path is None:
+            raise Refused(
+                f"{job.label} needs {name}, which is not on PATH. Install it, or run "
+                f"this from a shell whose PATH finds it. Nothing was installed."
+            )
+        found[name] = os.path.abspath(path)
+        print(f"  {job.label}: {{{name}}} is {found[name]}")
+    return found
+
+
+def resolve(
+    jobs: list[declaration.Job],
+    machine: placeholders.Machine,
+    directory: accounts.Directory = accounts.lookup,
+):
+    """Each job with its placeholders resolved.
+
+    A job that names an `account` resolves against that account's home, as the
+    directory service reports it, rather than against the home of whoever runs
+    this. `--deploy`, `--state` and `--bin` describe the running account, so
+    they do not carry over; `--root` and `--python` do.
+    """
+    resolved = []
+    for job in jobs:
+        programs = find_programs(job)
+        try:
+            target = machine
+            if job.account is not None:
+                account = accounts.require(job.account, job.source, directory)
+                target = machine.for_account(account.home)
+            resolved.append(placeholders.resolve(job, target, programs))
+        except (
+            placeholders.PlaceholderError,
+            declaration.DeclarationError,
+            accounts.AccountMissing,
+        ) as exc:
+            raise Refused(f"{exc}\n\nNothing was installed.") from exc
+    return resolved
+
+
+def systemd_unit(job: declaration.Job) -> str:
+    """The unit whose state answers "is this job working".
+
+    For a scheduled job that is the TIMER: its service is a oneshot that sits
+    inactive between firings, so asking the service would report every healthy
+    scheduled job as down. For a long-running job it is the service itself.
+    """
+    return (
+        f"{job.label}.timer" if render_systemd.needs_timer(job) else f"{job.label}.service"
+    )
+
+
+def launchd_state(listing: str, label: str) -> bool:
+    """Read `launchctl list` output for one label.
+
+    A PURE FUNCTION SO THE PARSING IS TESTED, since the alternative is a real
+    launchd and there is none in CI. The columns are PID, last exit status,
+    label.
+
+    PRESENCE ALONE IS NOT HEALTH, which is the same mistake as asking systemd
+    `is-enabled`: a job that is loaded but whose last run failed sits in this
+    listing with no PID and a non-zero status. A scheduled job between firings
+    also has no PID, and that one IS healthy, so the two are told apart by the
+    status column rather than by presence.
+    """
+    for line in listing.splitlines():
+        fields = line.split("\t")
+        if len(fields) < 3 or fields[2] != label:
+            continue
+        pid, status = fields[0].strip(), fields[1].strip()
+        if pid not in ("-", ""):
+            return True
+        return status in ("0", "-", "")
+    return False
+
+
+def systemd_state(output: str) -> bool | None:
+    """Read `systemctl is-active` output.
+
+    A PURE FUNCTION FOR THE SAME REASON AS `launchd_state`: there is no systemd
+    in CI, so the decision is tested by handing it the strings systemd prints.
+
+    ONLY `active` COUNTS. `enabled` must never be read as running — that is the
+    answer `is-enabled` gives, it survives a crash, a failed start and a plain
+    `systemctl stop`, and treating it as health is the bug both reviewers found
+    in the first version of this file. Empty output is not an answer about the
+    unit at all, so it is unknown rather than stopped.
+    """
+    state = output.strip()
+    if not state:
+        return None
+    return state == "active"
+
+
+def is_active(job: declaration.Job, platform: str) -> bool | None:
+    """Whether the supervisor is currently running this job.
+
+    None means the question could not be asked — no supervisor command on this
+    machine — which is reported as unknown rather than as inactive. Reporting a
+    job inactive because the check could not run is how an install ends up
+    activating something that was already running.
+
+    THIS ASKS `is-active`, NOT `is-enabled`, AND THE DIFFERENCE IS THE WHOLE
+    POINT OF THE REPORT. `is-enabled` answers "will this start at boot", which
+    stays `enabled` through a crash, a failed start, and a plain `systemctl
+    stop`. Both reviewers caught the first version asking that: a job could be
+    down while this tool called it healthy, which is precisely the silent gap
+    the activation report exists to close, reintroduced one layer over.
+
+    A unit that is enabled but not active is reported as not running, which is
+    what an operator needs to see.
+
+    The sentence that used to end this paragraph said `enable --now` is the
+    same command either way and is idempotent — true of systemd, and this
+    docstring covers launchd too, where `bootout` then `bootstrap` restarts a
+    job that was already running. The same commit that wrote it corrected
+    exactly that claim two functions down, in `activation`, and left it
+    standing here. What the restart costs is that function's business; this one
+    only reads state.
+    """
+    if platform == "macos":
+        if not shutil.which("launchctl"):
+            return None
+        result = subprocess.run(
+            ["launchctl", "list"], capture_output=True, text=True, check=False
+        )
+        if result.returncode != 0:
+            return None
+        return launchd_state(result.stdout, job.label)
+    if not shutil.which("systemctl"):
+        return None
+    scope = [] if job.scope == "system" else ["--user"]
+    result = subprocess.run(
+        ["systemctl", *scope, "is-active", systemd_unit(job)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return systemd_state(result.stdout)
+
+
+def activate(
+    job: declaration.Job, platform: str, home: str, system_dir: str | None = None
+) -> list[str]:
+    """The commands that start this job. Returned rather than run, so a caller
+    can print them for a dry run and execute the identical list otherwise."""
+    if platform == "macos":
+        # Quoted even though the label is fenced by declaration.LABEL and these
+        # values are operator-typed flags today. The security review's point
+        # stands: nothing stops a future wrapper deriving --home or
+        # --system-dir from somewhere less trusted and feeding it into a
+        # root-privileged shell. Quoting a value that never needed it renders
+        # identically, so the printed text still equals the executed text.
+        domain = f"gui/{os.getuid()}" if job.scope == "user" else "system"
+        path = next(iter(destinations(job, platform, home, system_dir)))
+        target = shlex.quote(f"{domain}/{job.label}")
+        return [
+            f"launchctl bootout {target} 2>/dev/null || true",
+            f"launchctl bootstrap {shlex.quote(domain)} {shlex.quote(path)}",
+        ]
+    scope = "--user " if job.scope != "system" else ""
+    unit = shlex.quote(systemd_unit(job))
+    return [
+        f"systemctl {scope}daemon-reload",
+        f"systemctl {scope}enable --now {unit}",
+    ]
+
+
+def reload(
+    job: declaration.Job, platform: str, home: str, system_dir: str | None = None
+) -> list[str]:
+    """The commands that make a running job pick up files this run replaced.
+
+    **A REPLACED FILE CHANGES NOTHING THAT IS ALREADY RUNNING.** systemd keeps the
+    definition it loaded until `daemon-reload`, and launchd keeps a loaded plist
+    until it is booted out. On a clean machine a replaced unit was on disk while
+    `systemctl --user start` ran the old command and warned that the unit had
+    changed on disk, and the run had said every job was running. `activate()`
+    carries the reload, but it is only reached for a job that is not running.
+
+    `try-restart` restarts the unit only if it is running. For a scheduled job
+    that unit is the timer, which reschedules it; the service itself runs the
+    new definition at its next firing, since the reload has already happened.
+    """
+    if platform == "macos":
+        return activate(job, platform, home, system_dir)
+    scope = "--user " if job.scope != "system" else ""
+    unit = shlex.quote(systemd_unit(job))
+    return [
+        f"systemctl {scope}daemon-reload",
+        f"systemctl {scope}try-restart {unit}",
+    ]
+
+
+def digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def record_path(machine: placeholders.Machine) -> Path:
+    return Path(machine.state) / "install-jobs" / "units.json"
+
+
+class Untrusted(Exception):
+    """A root run met a directory on the way to the record that another
+    account owns or can write."""
+
+
+def open_record_directory(path: Path, create: bool) -> int | None:
+    """A descriptor for the record's directory, or None when it is absent.
+
+    AS ROOT, ONLY WHERE NO OTHER ACCOUNT CAN WRITE ANY DIRECTORY ON THE WAY.
+    A record another account can plant would let it mark a hand-edited unit as
+    this installer's own, and a root run would then replace that unit without
+    `--force` (security review). So every directory from `/` to the record must
+    be root-owned and not group- or world-writable, or this raises `Untrusted`.
+    That also keeps a root run from making the record's directory inside an
+    account's home, which would lock the account out, the reason
+    `ensure_log_directories` gives for its own.
+
+    THE CHECK AND THE OPEN ARE ONE WALK (security review, round 2). Checking
+    path strings and then opening the record by path let a symlink on the way
+    pass the check pointing somewhere safe and be swapped before the open. So
+    symlinks above the record's directory are resolved once, and the resolved
+    chain is then opened one directory at a time from `/` with `O_NOFOLLOW`,
+    each checked by `fstat` on the descriptor that the next step opens from. A
+    symlink swapped in after the resolution fails that walk with ELOOP rather
+    than being followed. The record's own directory is never resolved, so a
+    symlink there is refused as before.
+
+    With `create`, missing directories are made at mode 700 as the walk
+    reaches them; without it, a missing one returns None.
+    """
+    probe, missing = path.parent.parent, []
+    while not os.path.lexists(probe):
+        missing.append(probe.name)
+        probe = probe.parent
+    names = [*Path(os.path.realpath(probe)).parts[1:], *reversed(missing), path.parent.name]
+    root = os.geteuid() == 0
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+    def trusted(handle: int) -> None:
+        info = os.fstat(handle)
+        if root and (info.st_uid != 0 or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+            raise Untrusted()
+
+    handle = os.open("/", flags)
+    try:
+        trusted(handle)
+        for name in names:
+            try:
+                child = os.open(name, flags, dir_fd=handle)
+            except FileNotFoundError:
+                if not create:
+                    return None
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(name, 0o700, dir_fd=handle)
+                child = os.open(name, flags, dir_fd=handle)
+            except NotADirectoryError as exc:
+                # macOS answers ENOTDIR, not ELOOP, for a symlink opened with
+                # O_DIRECTORY|O_NOFOLLOW, which would hide the symlink refusal
+                # behind "could not be read" (security review, round 3).
+                if stat.S_ISLNK(os.stat(name, dir_fd=handle, follow_symlinks=False).st_mode):
+                    raise OSError(errno.ELOOP, os.strerror(errno.ELOOP)) from exc
+                raise
+            os.close(handle)
+            handle = child
+            trusted(handle)
+        opened, handle = handle, -1
+        return opened
+    finally:
+        if handle != -1:
+            os.close(handle)
+
+
+def load_record(path: Path) -> dict[str, str] | None:
+    """Unit path to the sha256 of what this installer last wrote there.
+
+    None when a root run may keep no record at `path` (`open_record_directory`).
+    An unreadable or malformed record reads as empty, so every differing unit
+    is refused as a hand edit: losing the record costs a `--force`, never a
+    hand edit.
+
+    THE RECORD GUARDS AN OPERATOR'S OWN EDIT, NOT A SAME-ACCOUNT ADVERSARY.
+    Anything running as this account can rewrite the record so that a later
+    routine install replaces a hand-edited unit without a word. That is
+    accepted because anything running as this account can already rewrite the
+    unit itself; library#158 reached the same boundary for its plist.
+    """
+    directory = None
+    try:
+        directory = open_record_directory(path, create=False)
+        if directory is None:
+            return {}
+        # Opened with O_NOFOLLOW rather than checked and then opened, so a
+        # symlink planted between the two is not followed either.
+        handle = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+    except Untrusted:
+        return None
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise Refused(
+                f"refusing to read {path}: it or its directory is a symlink, and the "
+                f"record is never read or written through one. Nothing was installed."
+            ) from exc
+        print(f"  {path} could not be read ({exc.strerror}); every unit that "
+              f"differs is treated as hand-edited this run.")
+        return {}
+    finally:
+        if directory is not None:
+            os.close(directory)
+    try:
+        with os.fdopen(handle, encoding="utf-8") as stream:
+            units = json.load(stream).get("units", {})
+    except (OSError, ValueError, AttributeError) as exc:
+        print(f"  {path} could not be read ({exc}); every unit that differs is "
+              f"treated as hand-edited this run.")
+        return {}
+    if not isinstance(units, dict):
+        return {}
+    return {str(k): str(v) for k, v in units.items()}
+
+
+def save_record(path: Path, units: dict[str, str]) -> None:
+    """Replace the record atomically, through the walk `load_record` uses.
+
+    NEVER RAISES. It runs after the units are written, so a failure here must
+    not stop the run before replaced jobs are reloaded, nor say that nothing
+    was installed (review). It costs a later `--force`, and says so.
+    """
+    temporary = f".{path.name}.{os.getpid()}"
+    directory = None
+    try:
+        directory = open_record_directory(path, create=True)
+        handle = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+            dir_fd=directory,
+        )
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump({"units": dict(sorted(units.items()))}, stream, indent=2)
+            stream.write("\n")
+        os.replace(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory)
+    except (OSError, Untrusted) as exc:
+        if directory is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary, dir_fd=directory)
+        reason = exc.strerror if isinstance(exc, OSError) else (
+            "another account owns or can write a directory on the way to it")
+        print(f"  could not record the installed units at {path}: {reason}. "
+              f"A later install may refuse a unit this one wrote.")
+    finally:
+        if directory is not None:
+            os.close(directory)
+
+
+def plan(
+    jobs,
+    platform: str,
+    home: str,
+    system_dir: str | None = None,
+    record: dict[str, str] | None = None,
+) -> list[dict]:
+    """What each job's files would do: write, replace, skip, or already match.
+
+    A live unit that differs from its declaration is `outdated` when it is
+    byte-for-byte what `record` says this installer last wrote there, and
+    `differs`, a hand edit, otherwise.
+
+    A DESTINATION THAT IS A SYMLINK IS NEITHER READ NOR WRITTEN, IT IS REFUSED.
+    Both halves of that were reproduced against this file before the fence went
+    in, and neither needed a flag:
+
+    - **Disclosure.** A symlink at the destination pointing at a file the
+      installing user can read made `read_text` return that file's contents,
+      which the run then printed as a unified diff. Under `--dry-run`, which
+      promises to change nothing and is the safest-looking way to use this.
+      Planting `<label>.plist -> /etc/shadow` in a directory the attacker can
+      write and waiting for a root install turns a dry run into a disclosure.
+    - **Write-through.** A DANGLING symlink made `exists()` false, so the
+      destination was classified as a fresh install and written — creating the
+      symlink's target, with this installer's content, wherever it pointed. No
+      `--force` and no root: it reproduces at user scope on an ordinary run.
+
+    So `is_symlink` is checked with `lstat` semantics BEFORE anything opens the
+    path, and the write below additionally passes `O_NOFOLLOW` so a symlink
+    planted between this check and that write cannot be followed either.
+
+    WHAT THIS DOES NOT COVER, stated rather than implied: `O_NOFOLLOW` applies
+    to the final component only, so a symlinked PARENT directory is still
+    followed. Defending that needs the whole path walked with `O_NOFOLLOW` on
+    each component, and the destination directories are root-owned by default —
+    the exposure arrives with `--system-dir`, which points this somewhere the
+    operator chose. Point it somewhere only the installing user can write.
+    """
+    record = record or {}
+    entries = []
+    for job in jobs:
+        for path_text, wanted in destinations(job, platform, home, system_dir).items():
+            path = Path(path_text)
+            if path.is_symlink():
+                state = "symlink"
+                live = None
+            elif not path.exists():
+                state = "install"
+                live = None
+            else:
+                raw = path.read_bytes()
+                live = raw.decode("utf-8", errors="replace")
+                if live == wanted:
+                    state = "unchanged"
+                elif record.get(str(path)) == digest(raw):
+                    state = "outdated"
+                else:
+                    state = "differs"
+            entries.append(
+                {
+                    "job": job,
+                    "path": path,
+                    "wanted": wanted,
+                    "live": live,
+                    "state": state,
+                }
+            )
+    return entries
+
+
+def write_without_following(path: Path, text: str) -> None:
+    """Write, refusing to follow a symlink at the final component.
+
+    `O_NOFOLLOW` makes the open fail with ELOOP rather than write through a
+    symlink planted between `plan`'s check and this call. `plan` already
+    refuses a symlink it can see; this closes the race, so the guarantee does
+    not depend on nothing changing in between.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    try:
+        handle = os.open(path, flags, 0o644)
+    except OSError as exc:
+        # ELOOP IS THE SYMLINK CASE AND NOTHING ELSE IS. An earlier version
+        # attributed every OSError here to a symlink, so a permissions problem,
+        # a full disk or a read-only filesystem all sent the operator hunting
+        # for a symlink that was not there. The refusal is correct either way;
+        # it was the reason that was wrong.
+        if exc.errno == errno.ELOOP:
+            raise Refused(
+                f"refusing to write {path}: it is a symlink. A symlink at a "
+                f"destination is never followed, because writing through one "
+                f"puts this installer's content wherever it points."
+            ) from exc
+        raise Refused(f"could not write {path}: {exc.strerror}") from exc
+    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        stream.write(text)
+
+
+def ensure_log_directories(jobs) -> None:
+    """Create the directory each job's log file goes in.
+
+    A SUPERVISOR OPENS THE LOG BEFORE IT RUNS THE PROGRAM, AND NEITHER CREATES
+    ITS DIRECTORY. On a fresh Debian account `~/.local/state` does not exist, so
+    in the first `--activate` run on a clean machine every unit failed at
+    `status=209/STDOUT` before its program started, and the log that would have
+    said why was the thing that could not be opened. macOS hides this, because
+    `~/Library/Logs` exists on every account.
+
+    Run on every real install, not only when a unit is written, so a machine
+    whose units are already in place and whose state directory has since gone
+    is repaired by a re-run. Run before any unit is written, so a refusal here
+    leaves the machine as it was.
+
+    A SYMLINK IS REFUSED WHERE THIS WOULD CREATE A DIRECTORY, OR AT THE LOG
+    DIRECTORY ITSELF. `Path.mkdir(parents=True, exist_ok=True)` accepts a
+    symlink to an existing directory at any of those places without a word, so
+    the supervisor's logs, written as root for a system-scope job, would land
+    wherever it points (security review). So missing components are made one at
+    a time with `os.mkdir`, which fails rather than following anything, and each
+    is then read back with `lstat`. Ancestors that already exist are trusted,
+    the same boundary `write_without_following` states: they include `/var` on
+    macOS, which is itself a symlink.
+
+    AS ROOT, ONLY SYSTEM-SCOPE JOBS' DIRECTORIES ARE MADE. A run is root because
+    some job is system-scope, and creating a user-scope job's log directory then
+    would leave it owned by root and mode 700 inside the account's home, locking
+    the account out of its own logs (security review). Those are named instead,
+    for the account to create by running this as itself.
+
+    A system-scope job that names an `account` is treated the same way, for
+    the same reason: its logs sit in that account's home. `provision-accounts`
+    creates that account's directories.
+    """
+    root = os.geteuid() == 0
+    left: list[str] = []
+    left_for_accounts: list[str] = []
+    for job in jobs:
+        for log in (job.stdout, job.stderr):
+            if not log:
+                continue
+            if root and (job.scope != "system" or job.account is not None):
+                waiting = left_for_accounts if job.account is not None else left
+                if not Path(log).parent.is_dir() and str(Path(log).parent) not in waiting:
+                    waiting.append(str(Path(log).parent))
+                continue
+            make_private_directory(Path(log).parent)
+    if left:
+        print(
+            f"  Left for the account to create, since this ran as root: "
+            f"{', '.join(left)}. Run this again as that account."
+        )
+    if left_for_accounts:
+        print(
+            f"  Left for provision-accounts to create, since root would own them: "
+            f"{', '.join(left_for_accounts)}."
+        )
+
+
+def prepare_jobs(jobs, dry_run: bool) -> None:
+    """Create each job's declared directories, then run its prepare commands.
+
+    **SOME STATE HAS TO EXIST BEFORE A JOB FIRST STARTS, AND ONLY THE JOB'S
+    OWN DECLARATION KNOWS WHERE.** The Library opened a database nothing had
+    created, and served an empty one, until its tables were migrated and its
+    vector tables made by hand. The declaration already names the database in
+    its environment, so the steps live there too, and the path stays named once.
+
+    Each command runs in the job's working directory, with exactly the
+    environment the job itself gets and nothing inherited from this process,
+    so a prepare step sees what the service will see. A step that names a path
+    it `creates` is skipped while that path exists. They run before any unit
+    is written, so one that fails leaves the machine as it was. As root, a
+    user-scope job's steps are left for the account, for the reason
+    `ensure_log_directories` gives.
+    """
+    root = os.geteuid() == 0
+    for job in jobs:
+        if not job.directories and not job.prepare:
+            continue
+        if root and job.scope != "system":
+            print(
+                f"  Left for the account, since this ran as root: preparing "
+                f"{job.label}. Run this again as that account."
+            )
+            continue
+        for directory in job.directories:
+            if dry_run:
+                print(f"  would create {directory} (mode 700) for {job.label}")
+            else:
+                make_private_directory(Path(directory))
+        for step in job.prepare:
+            shown = " ".join(shlex.quote(part) for part in step.argv)
+            # A STEP THAT NAMES WHAT IT CREATES RUNS ONLY WHILE THAT IS ABSENT.
+            # A credential is minted once and never replaced (a re-install that
+            # minted again would strand the token the running service holds),
+            # so its step is skipped once its token file exists.
+            if step.creates and os.path.exists(
+                os.path.join(job.working_directory, step.creates)
+            ):
+                verb = "would skip" if dry_run else "skipped"
+                print(f"  {verb}, for {job.label}, since {step.creates} exists: {shown}")
+                continue
+            if dry_run:
+                print(f"  would run, for {job.label}: {shown}")
+                continue
+            try:
+                done = subprocess.run(
+                    list(step.argv), cwd=job.working_directory, env=dict(job.environment),
+                    capture_output=True, text=True, check=False, timeout=600,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise Refused(
+                    f"preparing {job.label} failed at `{shown}`: {exc}. "
+                    f"Nothing was installed."
+                ) from exc
+            if done.returncode != 0:
+                tail = (done.stderr or done.stdout).strip()[-600:]
+                raise Refused(
+                    f"preparing {job.label} failed at `{shown}`, exit "
+                    f"{done.returncode}:\n{tail}\nNothing was installed."
+                )
+            print(f"  prepared {job.label}: {shown}")
+
+
+def make_private_directory(directory: Path) -> None:
+    """Create `directory` and any missing parents at mode 700, following nothing.
+
+    Refuses when the directory, or a component this had to create, is or turns
+    out to be a symlink. See `ensure_log_directories` for why.
+    """
+    missing = []
+    probe = directory
+    while not os.path.lexists(probe):
+        missing.append(probe)
+        probe = probe.parent
+    for component in reversed(missing):
+        try:
+            os.mkdir(component, 0o700)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise Refused(
+                f"could not create directory {component}: {exc.strerror}. "
+                f"Nothing was installed."
+            ) from exc
+        if not stat.S_ISDIR(os.lstat(component).st_mode):
+            raise Refused(
+                f"refusing to create {directory}: {component} is not "
+                f"a directory this could create. A symlink there would send the "
+                f"logs wherever it points. Nothing was installed."
+            )
+    if not stat.S_ISDIR(os.lstat(directory).st_mode):
+        raise Refused(
+            f"refusing to use {directory}: it is a symlink or not a "
+            f"directory, and a symlink there would send the logs wherever it points. "
+            f"Nothing was installed."
+        )
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Install Builder's backend jobs from their declarations.",
+    )
+    parser.add_argument("--jobs", type=Path, help="directory of .toml declarations")
+    parser.add_argument("--home", help="the account's home directory")
+    parser.add_argument("--root", help="the Builder root")
+    parser.add_argument("--deploy", help="the deploy area jobs run from")
+    parser.add_argument("--state", help="writable state and logs")
+    parser.add_argument("--bin", help="where Builder's commands are linked")
+    parser.add_argument("--python", help="the provisioned interpreter, absolute")
+    parser.add_argument(
+        "--system-dir",
+        help="where system-scope jobs install, instead of /Library/LaunchDaemons "
+        "or /etc/systemd/system. A system-scope job ignores --home, so this is "
+        "what lets an install be staged or tested without touching the machine. "
+        "Every component of the path must be free of anything another account "
+        "can write: a symlink at the destination is refused, but a symlinked "
+        "parent directory is still followed.",
+    )
+    parser.add_argument(
+        "--platform",
+        choices=("macos", "linux"),
+        help="render for this platform instead of the one we are on",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="say what would happen, change nothing"
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="report only, and exit 1 if any unit is missing, differs or was "
+        "skipped. Distinct from --dry-run, which exits 0 whether or not there "
+        "is anything to install, and so cannot answer 'is this machine done?'",
+    )
+    parser.add_argument(
+        "--status", action="store_true", help="report what is installed and running"
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="replace a live unit that differs from its declaration",
+    )
+    parser.add_argument(
+        "--activate",
+        action="store_true",
+        help="also start the jobs marked enabled-by-default",
+    )
+    args = parser.parse_args(argv)
+    if args.check:
+        # A CHECK CHANGES NOTHING, so it takes the dry-run path exactly. Only
+        # the exit code differs, below: --dry-run answers "what would happen"
+        # and --check answers "is there anything left to do".
+        args.dry_run = True
+
+    platform = args.platform or detect_platform()
+    machine = machine_from(args)
+    jobs_dir = args.jobs or (REPO / "jobs")
+
+    declared = load_jobs(jobs_dir, platform)
+    if not machine.root:
+        using_root = sorted(job.label for job in declared
+                            if placeholders.uses_placeholder(job, "root"))
+        if using_root:
+            why = (
+                "a run as root never executes `builder-root`, since another "
+                "account could have placed it. Pass --root."
+                if os.geteuid() == 0 else
+                f"`builder-root` is not in {machine.bin} or on PATH, or did not "
+                f"print one absolute path. Pass --root, or run bin/link-commands "
+                f"first."
+            )
+            raise Refused(
+                f"cannot find the Builder root, which {', '.join(using_root)} "
+                f"name as {{root}}: {why} Nothing was installed."
+            )
+    jobs = resolve(declared, machine)
+    if not jobs:
+        print(f"{PROG}: no declarations list {platform}; nothing to install")
+        return 0
+
+    system_scope = [job for job in jobs if job.scope == "system"]
+    if system_scope and os.geteuid() != 0 and not args.dry_run and not args.status:
+        raise Refused(
+            f"{len(system_scope)} job(s) are system-scope and install outside your "
+            f"home directory, which needs root: "
+            f"{', '.join(job.label for job in system_scope)}. Re-run as root, or "
+            f"pass --dry-run to see what they would write."
+        )
+
+    record_file = record_path(machine)
+    record = load_record(record_file)
+    keep_record = record is not None
+    if record is None:
+        print(f"  No record is kept at {record_file}, since another account owns or "
+              f"can write a directory on the way to it; a unit that differs is "
+              f"refused as a hand edit.")
+        record = {}
+    entries = plan(jobs, platform, machine.home, args.system_dir, record)
+
+    # Refused for the WHOLE run rather than skipped per file: a symlink at a
+    # destination means something is wrong with the directory this is pointed
+    # at, and installing the rest as though that were routine buries it.
+    planted = [entry for entry in entries if entry["state"] == "symlink"]
+    if planted:
+        listing = "\n".join(f"    {entry['path']}" for entry in planted)
+        raise Refused(
+            f"{len(planted)} destination(s) are symlinks, and a symlink is never "
+            f"read or written through:\n{listing}\n\n"
+            f"Reading one would print another file's contents as a diff, and "
+            f"writing through one would put this installer's content wherever it "
+            f"points. Nothing was installed. Remove them, or point --system-dir "
+            f"at a directory only this account can write."
+        )
+
+    if args.status:
+        return report_status(jobs, entries, platform)
+
+    if not args.dry_run:
+        ensure_log_directories(jobs)
+    prepare_jobs(jobs, args.dry_run)
+
+    wrote = replaced = skipped = unchanged = 0
+    replaced_jobs: dict[str, declaration.Job] = {}
+    written = dict(record)
+    try:
+        for entry in entries:
+            outcome = install_entry(entry, args)
+            if outcome == "unchanged":
+                unchanged += 1
+            elif outcome == "skipped":
+                skipped += 1
+            elif outcome == "replaced":
+                replaced += 1
+                replaced_jobs[entry["job"].label] = entry["job"]
+            else:
+                wrote += 1
+            if outcome != "skipped":
+                # A unit already matching is recorded too, so a machine
+                # installed before the record existed comes under it now.
+                written[str(entry["path"])] = digest(entry["wanted"].encode("utf-8"))
+    finally:
+        # Saved even when a write refused partway, so the units written before
+        # it are recognised as this installer's own on the next run.
+        # Only units still declared are kept, so a retired job's entry goes.
+        declared_paths = {str(entry["path"]) for entry in entries}
+        written = {k: v for k, v in written.items() if k in declared_paths}
+        if keep_record and not args.dry_run and written != record:
+            save_record(record_file, written)
+
+    verb = "would install" if args.dry_run else "installed"
+    print(
+        f"{PROG}: {verb} {wrote} file(s), replaced {replaced}, left {unchanged} "
+        f"unchanged, skipped {skipped} that differ"
+    )
+    if skipped:
+        print(
+            "  Reconcile those, or re-run with --force to replace the live copies. "
+            "A live unit is never overwritten silently."
+        )
+
+    if args.check:
+        # EXIT 1 IF ANYTHING IS NOT ALREADY IN PLACE. `--dry-run` returns 0
+        # here whether it would write ten units or none, so a caller asking
+        # "is supervision installed?" could not tell those apart.
+        return 1 if (wrote or replaced or skipped) else 0
+    reloaded = reload_replaced(list(replaced_jobs.values()), platform, machine.home, args)
+    return (activation(jobs, platform, machine.home, args) or reloaded
+            or (1 if skipped else 0))
+
+
+def install_entry(entry: dict, args: argparse.Namespace) -> str:
+    """Write one planned file if it should be, and say what happened to it:
+    `unchanged`, `skipped`, `replaced` or `written`."""
+    path, state = entry["path"], entry["state"]
+    if state == "unchanged":
+        return "unchanged"
+    if state == "differs" and not args.force:
+        print(f"  SKIPPED (live differs from its declaration and from what this "
+              f"installer last wrote there): {path}")
+        for line in difflib.unified_diff(
+            entry["live"].splitlines(),
+            entry["wanted"].splitlines(),
+            fromfile=f"live {path.name}",
+            tofile=f"declared {path.name}",
+            lineterm="",
+            n=1,
+        ):
+            print(f"      {line}")
+        return "skipped"
+    replacing = state in ("differs", "outdated")
+    why = " (an earlier release wrote it, unedited since)" if state == "outdated" else ""
+    if args.dry_run:
+        print(f"  would {'replace' if replacing else 'write'} {path}{why}")
+    else:
+        write_without_following(path, entry["wanted"])
+        if why:
+            print(f"  replaced {path}{why}")
+    return "replaced" if replacing else "written"
+
+
+def report_status(jobs, entries, platform: str) -> int:
+    by_job: dict[str, list] = {}
+    for entry in entries:
+        by_job.setdefault(entry["job"].label, []).append(entry)
+    print(f"{PROG}: {len(jobs)} declaration(s) for {platform}")
+    for job in jobs:
+        states = {entry["state"] for entry in by_job[job.label]}
+        if "install" in states:
+            on_disk = "NOT INSTALLED"
+        elif "differs" in states:
+            on_disk = "DIFFERS from its declaration"
+        elif "outdated" in states:
+            on_disk = "OUT OF DATE (an install replaces it)"
+        else:
+            on_disk = "installed"
+        running = is_active(job, platform)
+        live = {True: "running", False: "NOT RUNNING", None: "unknown"}[running]
+        want = "should run" if job.enabled_by_default else "off by default"
+        print(f"  {job.label}: {on_disk}, {live} ({want})")
+    return 0
+
+
+def reload_replaced(replaced, platform: str, home: str, args: argparse.Namespace) -> int:
+    """Reload the jobs this run replaced a file for, if they may be running.
+
+    A job whose state could not be read is reloaded too, as `activation` treats
+    an unknown state: skipping it quietly would leave the old definition running,
+    which is the gap this closes. Opt-in with `--activate`, like starting a job,
+    because on launchd the reload restarts the job and on systemd `try-restart`
+    does.
+    """
+    states = {job.label: is_active(job, platform) for job in replaced}
+    live = [job for job in replaced if states[job.label] is not False]
+    if not live:
+        return 0
+    commands = []
+    for job in live:
+        for line in reload(job, platform, home, args.system_dir):
+            if line not in commands:
+                commands.append(line)
+    had = "would have a file replaced" if args.dry_run else "had a file replaced"
+    print(
+        f"\n  {len(live)} job(s) that may be running {had}, and keep running the "
+        f"old definition until they are reloaded:"
+    )
+    for job in live:
+        note = "" if states[job.label] else " (state unknown — could not ask the supervisor)"
+        print(f"    {job.label}{note}")
+    if not args.activate or args.dry_run:
+        how = "these would run" if args.activate else "reload them with --activate, or by hand"
+        print(f"  {how.capitalize()}:")
+        for line in commands:
+            print(f"    {line}")
+        return 0
+    print("  Reloading:")
+    failed = 0
+    for line in commands:
+        print(f"    {line}")
+        result = subprocess.run(line, shell=True, check=False)
+        if result.returncode != 0:
+            failed += 1
+            print(f"      FAILED with status {result.returncode}")
+    if failed:
+        print(f"  {failed} reload command(s) failed; those jobs may still run the old definition.")
+        return 1
+    # Asked again for the reason `activation` asks again: a restart that
+    # succeeds is not a job that runs. Straight away, as there: on this Mac's
+    # launchd a job bootstrapped a moment before listed with its PID in five
+    # runs of five, so the question does not land in a window where a healthy
+    # job reads as absent.
+    down = [job for job in live if is_active(job, platform) is False]
+    if down:
+        print(f"\n  {len(down)} job(s) were reloaded and are not running:")
+        for job in down:
+            print(f"    {job.label}")
+        logs = logs_of(down)
+        if logs:
+            print(f"  Their logs say why: {', '.join(logs)}")
+        return 1
+    return 0
+
+
+def activation(jobs, platform: str, home: str, args: argparse.Namespace) -> int:
+    """Report, and optionally close, the gap between installed and running.
+
+    THIS LIST COMES FROM THE DECLARATIONS, WHICH IS THE WHOLE POINT. A
+    hardcoded list of labels drifts from the jobs it names. A list derived from the
+    same files the jobs come from cannot fall behind them.
+    """
+    wanted = [job for job in jobs if job.enabled_by_default]
+    if not wanted:
+        return 0
+
+    # UNKNOWN IS REPORTED ALONGSIDE NOT-RUNNING RATHER THAN INSTEAD OF IT.
+    # An earlier version listed the jobs it could not ask about and then stopped,
+    # so on a machine with no reachable supervisor — a container, or a host
+    # before the daemon is up — the operator was told the state was unknown and
+    # given nothing to do about it, which is the case where they most need the
+    # command. Found by running this suite on Ubuntu rather than only on the Mac
+    # that wrote it.
+    #
+    # The cost of offering a command for a job that turns out to be running is
+    # NOT the same on both platforms, and an earlier version of this comment
+    # said it was. `systemctl enable --now` on an active unit is a no-op. The
+    # launchd pair is not: `bootout` followed by `bootstrap` unloads and
+    # reloads, so it RESTARTS a job that was already running. That is why the
+    # commands are offered rather than run, and why --activate is opt-in.
+    needs_attention = []
+    for job in wanted:
+        state = is_active(job, platform)
+        if state is None:
+            needs_attention.append((job, "state unknown — could not ask the supervisor"))
+        elif not state:
+            needs_attention.append((job, "NOT running"))
+
+    if not needs_attention:
+        print(f"\n  All {len(wanted)} job(s) marked enabled-by-default are running.")
+        return 0
+
+    print(
+        f"\n  {len(needs_attention)} job(s) are marked enabled-by-default and may "
+        f"not be running. Installing a unit file does not start it."
+    )
+    for job, why in needs_attention:
+        print(f"    {job.label} — {why}")
+        print(f"      {job.description.strip().splitlines()[0]}")
+
+    inactive = [job for job, _ in needs_attention]
+    commands = [
+        line for job in inactive for line in activate(job, platform, home, args.system_dir)
+    ]
+    if not args.activate:
+        print("\n  Start them with --activate, or by hand:")
+        for line in commands:
+            print(f"    {line}")
+        return 0
+
+    if args.dry_run:
+        print("\n  --activate with --dry-run; these would run:")
+        for line in commands:
+            print(f"    {line}")
+        return 0
+
+    print("\n  Activating:")
+    failed = 0
+    for line in commands:
+        print(f"    {line}")
+        result = subprocess.run(line, shell=True, check=False)
+        if result.returncode != 0:
+            failed += 1
+            print(f"      FAILED with status {result.returncode}")
+    if failed:
+        print(f"  {failed} activation command(s) failed; those jobs are not running.")
+        return 1
+
+    # ASK AGAIN AFTERWARDS, BECAUSE A START THAT SUCCEEDS IS NOT A JOB THAT
+    # RUNS. `systemctl enable --now` exits 0 for a unit that then fails on every
+    # restart, and in the first activation on a clean machine all four
+    # default-on services did exactly that while this returned 0. Only a job
+    # the supervisor reports as down counts; one it cannot be asked about is
+    # left as unknown, as above.
+    #
+    # This asks once, straight away, so it catches a job that fails before
+    # its program starts or at the first thing it does, and misses one that
+    # runs for a moment before dying: on the same clean machine the knowledge
+    # watcher read as active here and died a second later. No wait is added,
+    # because no wait is long enough for every job. `--status` asks again.
+    down = [job for job in inactive if is_active(job, platform) is False]
+    if down:
+        print(f"\n  {len(down)} job(s) were started and are not running:")
+        for job in down:
+            print(f"    {job.label}")
+        logs = logs_of(down)
+        if logs:
+            print(f"  Their logs say why: {', '.join(logs)}")
+        return 1
+    return 0
+
+
+def logs_of(jobs) -> list[str]:
+    """Each job's log files, once each, in the order the jobs were given."""
+    seen: list[str] = []
+    for job in jobs:
+        for log in (job.stdout, job.stderr):
+            if log and log not in seen:
+                seen.append(log)
+    return seen
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except Refused as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc

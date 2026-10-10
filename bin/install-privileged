@@ -1,0 +1,847 @@
+#!/usr/bin/env python3
+"""The root-owned half of Builder's install: the review launcher, the reviewers'
+tools and the one sudo rule that reaches the launcher.
+
+    sudo <absolute python3> -I /opt/builder/src/shipwright@<sha>/bin/install-privileged --org <name>
+        [--agent-platform-repo <name>] [--shipwright-repo <name>]
+        [--commit <repo>=<sha>]... [--consent ask|yes|no]
+    sudo /opt/builder/libexec/update-privileged
+
+**This runs only from its own extracted tree.** It refuses unless its file sits at
+`<prefix>/src/shipwright@<sha>/bin/install-privileged` and every directory from the
+prefix down, plus the file and `github-gate` beside it, belongs to the account
+running it with no group or other write bit. The first run has the same shape, and root
+does the extraction, so the tree belongs to root:
+
+    sudo mkdir -p /opt/builder/src/shipwright@<sha>
+    git -C <checkout> archive <sha> | sudo tar -x -C /opt/builder/src/shipwright@<sha>
+    sudo <absolute python3> -I /opt/builder/src/shipwright@<sha>/bin/install-privileged --org <name>
+
+A tree the operator's own account extracted is refused, because its files belong to that
+account. The check runs before `github-gate` is loaded, because `github-gate` sits beside
+this file.
+
+**Root installs only what GitHub confirms is on `main`.** For each repository it
+mints a read token from the approver key, fetches `refs/heads/main` alone into a
+bare copy under `<prefix>/src`, and revokes the token. The commit it installs is the
+fetched head, or the one named with `--commit <repo>=<sha>`, which is refused unless
+it is an ancestor of that fetched `main`. Each commit is extracted with `git archive`
+into its own root-owned tree, refused if it holds a symbolic link, a submodule or any
+other special entry. Everything placed comes from those trees alone, read without
+following a link. Nothing under the `agents` home or a deploy area is read, except
+the instruction-file diff that the operator is shown and may consent to.
+
+**Nothing live changes until everything is built.** The launcher, library, sudo
+rule, reviewers' tools and venv are staged beside their live paths and checked. Only
+then are they swapped in, and the entry point is rewritten last.
+
+**The entry point runs root's own copy.** `libexec/update-privileged` takes no
+arguments. It runs the copy in the newest tree it has installed, under `env -i`. A
+newer shipwright commit is installed by running that commit's copy, and the entry
+point moves only when that copy succeeds.
+
+**Settings persist, and only the settings that name this install do.** The first
+run writes `install.json` beside the slots: the organisation and the repository
+names. Test settings never persist. They come from `fixtures.json` under the prefix,
+and only where the prefix is not the real install root.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import difflib
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import platform as platform_mod
+import re
+import secrets
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import urllib.request
+
+HERE_FILE = pathlib.Path(__file__).resolve()
+HERE = HERE_FILE.parent
+PROG = "install-privileged"
+REAL_ROOT = "/opt/builder"
+RUNNING = re.compile(r"^(?P<prefix>.*)/src/shipwright@(?P<sha>[0-9a-f]{40})/bin/install-privileged$")
+
+
+def printable(text: str) -> str:
+    """`text` with every control character escaped, so a line cannot move the cursor
+    or rewrite what the operator's terminal shows. Newlines stay."""
+    return "".join(ch if ch == "\n" or ch.isprintable() else ch.encode("unicode_escape").decode("ascii")
+                   for ch in text)
+
+
+def running_copy() -> tuple[str, str]:
+    """The prefix and shipwright SHA this copy belongs to. Refused, and nothing else
+    is loaded, unless the copy sits in its own extracted tree."""
+    euid = os.geteuid()
+    match = RUNNING.match(str(HERE_FILE))
+    problem = None
+    if not match:
+        problem = "the file is not at <prefix>/src/shipwright@<sha>/bin/install-privileged"
+    else:
+        prefix = match.group("prefix")
+        for path in (prefix, os.path.join(prefix, "src"), str(HERE.parent), str(HERE), str(HERE_FILE),
+                     str(HERE / "github-gate")):
+            st = os.lstat(path)
+            if stat.S_ISLNK(st.st_mode) or st.st_uid != euid or st.st_mode & 0o022:
+                problem = f"{path} is not owned by uid {euid} alone, or another account can write it"
+                break
+    if problem:
+        print(f"{PROG}: refusing to run from {HERE_FILE}: {problem}. Run the copy from its own "
+              f"extracted tree as root. Nothing was changed.", file=sys.stderr)
+        sys.exit(2)
+    return match.group("prefix"), match.group("sha")
+
+
+def _load_sibling(module_name: str, filename: str):
+    loader = importlib.machinery.SourceFileLoader(module_name, str(HERE / filename))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(module_name, loader))
+    # Registered first: dataclasses looks the module up by name while it executes.
+    sys.modules[module_name] = module
+    loader.exec_module(module)
+    return module
+
+
+RUN_PREFIX, RUN_SHA = running_copy()
+# Root does not write bytecode into the tree it runs from.
+sys.dont_write_bytecode = True
+
+# The approver App's JWT, the slot layout and the key checks are github-gate's.
+# Reused from this commit's own copy, so the two installers cannot disagree.
+gg = _load_sibling("github_gate", "github-gate")
+Refused = gg.Refused
+
+ACCOUNT = "agents"
+ROLES = ("agent-platform", "shipwright")
+MAIN = "refs/heads/main"
+CONFIG = "install.json"
+FIXTURES = "fixtures.json"
+
+# The files placed from each tree. Paths are relative to the tree's root.
+LAUNCHER = "bin/review-launch"
+LIBRARY = "lib/agent-platform"
+REVIEWER_BINS = ("bin/mcp-kb-server", "bin/mcp-ops-server")
+LOCK = "requirements-reviewer.lock.txt"
+PIN = "etc/claude-pin.yaml"
+SUDOERS_TEMPLATE = "privileged/builder-review.sudoers"
+SUDOERS_NAME = "builder-review"
+INSTRUCTIONS = "payload/knowledge-seed/machine/CLAUDE.md"
+
+# A slot the installer creates empty. github-gate fills the first two.
+CLAUDE_SLOT = "etc/reviewers-claude-token"
+SLOTS = (gg.KEY_SLOT, gg.ID_SLOT, CLAUDE_SLOT)
+
+DEFAULT_SUDOERS_DIR = "/etc/sudoers.d"
+DEFAULT_VISUDO = "/usr/sbin/visudo"
+DEFAULT_DOWNLOAD_BASE = "https://downloads.claude.ai/claude-code-releases"
+GIT = "/usr/bin/git"
+TAR = "/usr/bin/tar"
+DSCL = "/usr/bin/dscl"
+GETENT = "/usr/bin/getent"
+SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+CLEAN_ENV = {"PATH": SYSTEM_PATH, "HOME": "/var/root", "LANG": "C"}
+# The argv the updater and the handoff run under. `env -i` clears what the
+# caller exported, PYTHONPATH and PATH included.
+ENTRY_ARGV = ["/usr/bin/env", "-i", f"PATH={SYSTEM_PATH}", "HOME=/var/root"]
+INTERPRETERS = {"Darwin": "/opt/homebrew/bin/python3", "Linux": "/usr/bin/python3"}
+CLAUDE_PLATFORMS = {
+    ("Darwin", "arm64"): "darwin-arm64",
+    ("Linux", "x86_64"): "linux-x64",
+    ("Linux", "aarch64"): "linux-arm64",
+}
+# How long the pinned binary gets to answer --version before it is refused.
+CLAUDE_VERSION_TIMEOUT = 120
+
+SHA = re.compile(r"[0-9a-f]{40}")
+COMMIT_ARG = re.compile(r"([A-Za-z0-9._-]+)=([0-9a-f]{40})")
+ORG = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?")
+PIN_VERSION = re.compile(r"  version: ([0-9]+(?:\.[0-9]+)+)")
+PIN_SHA = re.compile(r"    ([a-z0-9-]+): ([0-9a-f]{64})")
+LINK_MODES = {b"120000", b"160000"}
+
+DEFAULTS = {
+    "github_base": "https://github.com",
+    "agent_platform_repo": "agent-platform",
+    "shipwright_repo": "shipwright",
+    "download_base": DEFAULT_DOWNLOAD_BASE,
+    "api_base": gg.API,
+    "sudoers_dir": DEFAULT_SUDOERS_DIR,
+    "visudo": DEFAULT_VISUDO,
+    "interpreter": None,
+    "pip_args": [],
+    "homes": {},
+    "require_root": True,
+}
+# What install.json keeps. Every other setting is a test setting.
+PERSISTED = ("org", "agent_platform_repo", "shipwright_repo")
+# What fixtures.json may name. Honoured only where the prefix is not the real root.
+FIXTURE_KEYS = ("github_base", "download_base", "api_base", "interpreter", "sudoers_dir",
+                "visudo", "pip_args", "homes", "require_root")
+
+
+def token() -> str:
+    return secrets.token_hex(8)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog=PROG, description="The root-owned half of Builder's install.")
+    p.add_argument("--org", help="the GitHub organisation that holds the repositories")
+    p.add_argument("--agent-platform-repo", help="the agent-platform repository's name")
+    p.add_argument("--shipwright-repo", help="the shipwright repository's name")
+    p.add_argument("--commit", action="append", default=[], metavar="REPO=SHA",
+                   help="install this commit of REPO instead of its main (repeatable)")
+    p.add_argument("--consent", choices=("ask", "yes", "no"), default="ask",
+                   help="answer the instruction-file question without asking")
+    return p
+
+
+# Reading and writing under the prefix.
+
+def write_atomic(path: str, data: bytes, mode: int) -> None:
+    """Write `data` to `path` owned by root with `mode`, by write-then-rename."""
+    tmp = f"{path}.tmp-{token()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            os.fchown(f.fileno(), gg.ROOT_UID, gg.ROOT_GID)
+            os.fchmod(f.fileno(), mode)
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def open_beneath(root: str, parts: tuple[str, ...]) -> int:
+    """A descriptor for `root/<parts>`, opening each name from the directory above it with
+    O_NOFOLLOW, so no link anywhere on the way is followed. A FIFO cannot block the open."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    dirfd = os.open(root, flags | os.O_DIRECTORY)
+    try:
+        for name in parts[:-1]:
+            nxt = os.open(name, flags | os.O_DIRECTORY, dir_fd=dirfd)
+            os.close(dirfd)
+            dirfd = nxt
+        return os.open(parts[-1], flags, dir_fd=dirfd)
+    finally:
+        os.close(dirfd)
+
+
+def read_beneath(root: str, parts: tuple[str, ...], *, one_name: bool = False) -> bytes | None:
+    """A regular file's bytes under `root`, None when it is absent. Refused when a link is on
+    the path or the file is not regular, and with `one_name`, when it has a second name. A
+    refusal never includes the file's bytes."""
+    shown = os.path.join(root, *parts)
+    try:
+        fd = open_beneath(root, parts)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise Refused(f"{shown} cannot be read without following a link ({exc.strerror}). "
+                      f"Nothing was changed.")
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise Refused(f"{shown} is not a regular file. Nothing was changed.")
+        if one_name and st.st_nlink != 1:
+            raise Refused(f"{shown} has more than one name, so it is refused. Nothing was changed.")
+        return f.read()
+
+
+def read_tree_file(tree: str, rel: str) -> bytes:
+    data = read_beneath(tree, tuple(pathlib.PurePosixPath(rel).parts))
+    if data is None:
+        raise Refused(f"{rel} is missing from {tree}. Nothing was changed.")
+    return data
+
+
+def own_tree(path: str) -> None:
+    """Root owns everything under `path`, and no group or other account can write it."""
+    for target in [path] + [os.path.join(d, n) for d, dirs, files in os.walk(path)
+                            for n in dirs + files]:
+        st = os.lstat(target)
+        os.lchown(target, gg.ROOT_UID, gg.ROOT_GID)
+        if not stat.S_ISLNK(st.st_mode):
+            os.chmod(target, st.st_mode & 0o7777 & ~0o022)
+
+
+def make_dir(path: str, mode: int) -> None:
+    gg.make_root_dir(path, mode)
+
+
+def remove(path: str) -> None:
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    elif os.path.lexists(path):
+        os.unlink(path)
+
+
+class Plan:
+    """Artifacts built beside their live paths. Nothing live changes until `swap`; a refusal
+    before then removes what was built."""
+
+    def __init__(self) -> None:
+        self.moves: list[tuple[str, str]] = []
+
+    def stage(self, staged: str, live: str) -> None:
+        self.moves.append((staged, live))
+
+    def discard(self) -> None:
+        for staged, _ in self.moves:
+            remove(staged)
+
+    def swap(self) -> None:
+        retired = []
+        for staged, live in self.moves:
+            if os.path.isdir(live) and not os.path.islink(live):
+                old = f"{live}.old-{token()}"
+                os.rename(live, old)
+                retired.append(old)
+            os.replace(staged, live)
+        for old in retired:
+            shutil.rmtree(old)
+
+
+def stage_file(plan: Plan, live: str, data: bytes, mode: int) -> None:
+    staged = f"{live}.new-{token()}"
+    write_atomic(staged, data, mode)
+    plan.stage(staged, live)
+
+
+def check_settings_file(path: str) -> None:
+    """Refuse a settings file that is not a regular file the root account owns, with no group
+    or other write bit. Both settings files are read as root, so both get this check."""
+    st = os.lstat(path)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != gg.ROOT_UID or st.st_mode & 0o022:
+        raise Refused(f"{path} must be a root-owned file that no other account can write. "
+                      f"Nothing was changed.")
+
+
+def load_config(prefix: str) -> dict:
+    path = os.path.join(prefix, CONFIG)
+    if not os.path.lexists(path):
+        return {}
+    check_settings_file(path)
+    try:
+        return json.loads((read_beneath(prefix, (CONFIG,)) or b"{}").decode("utf-8"))
+    except ValueError as exc:
+        raise Refused(f"{path} is not JSON ({exc}). Nothing was changed.")
+
+
+def fixture_settings(prefix: str) -> dict:
+    """The test settings in `fixtures.json`. Honoured only where the install root is not the
+    real one, and the installer never writes the file."""
+    if not os.path.lexists(os.path.join(prefix, FIXTURES)):
+        return {}
+    if prefix == REAL_ROOT or prefix.startswith(REAL_ROOT + "/"):
+        raise Refused(f"{prefix}/{FIXTURES} holds test settings, and the real install root does not "
+                      f"honour them. Remove it. Nothing was changed.")
+    check_settings_file(os.path.join(prefix, FIXTURES))
+    try:
+        data = json.loads((read_beneath(prefix, (FIXTURES,)) or b"{}").decode("utf-8"))
+    except ValueError as exc:
+        raise Refused(f"{prefix}/{FIXTURES} is not JSON ({exc}). Nothing was changed.")
+    if not isinstance(data, dict) or set(data) - set(FIXTURE_KEYS):
+        raise Refused(f"{prefix}/{FIXTURES} may name only: {', '.join(FIXTURE_KEYS)}.")
+    return data
+
+
+def merged_config(stored: dict, fixtures: dict, args: argparse.Namespace) -> dict:
+    extra = sorted(set(stored) - set(PERSISTED))
+    if extra:
+        raise Refused(f"{CONFIG} names {', '.join(extra)}, which is not a persisted setting. "
+                      f"Nothing was changed.")
+    cfg = {**DEFAULTS, **{k: stored[k] for k in PERSISTED if k in stored}, **fixtures}
+    for key, value in (("org", args.org), ("agent_platform_repo", args.agent_platform_repo),
+                       ("shipwright_repo", args.shipwright_repo)):
+        if value is not None:
+            cfg[key] = value
+    if not cfg.get("org") or not ORG.fullmatch(cfg["org"]):
+        raise Refused("name the GitHub organisation with --org (a single name, no slash).")
+    if not str(cfg["download_base"]).startswith(("https://", "http://")):
+        raise Refused("the Claude download base must be an http or https URL.")
+    if not cfg.get("interpreter"):
+        system = platform_mod.system()
+        if system not in INTERPRETERS:
+            raise Refused(f"there is no default interpreter for {system}.")
+        cfg["interpreter"] = INTERPRETERS[system]
+    if not os.path.isabs(cfg["interpreter"]):
+        raise Refused("the interpreter must be an absolute path.")
+    return cfg
+
+
+def parse_commits(items: list[str], names: dict[str, str]) -> dict[str, str]:
+    """`--commit repo=sha`, one per repository. A bare SHA is refused."""
+    out: dict[str, str] = {}
+    known = sorted(names.values())
+    for item in items:
+        m = COMMIT_ARG.fullmatch(item)
+        if not m:
+            raise Refused(f"--commit takes <repo>=<40-hex SHA>, one per repository, and "
+                          f"{printable(item)!r} is not that. A bare SHA is refused: name its repository.")
+        repo, sha = m.groups()
+        if repo not in known:
+            raise Refused(f"--commit names {repo!r}, which is not one of {', '.join(known)}.")
+        if repo in out:
+            raise Refused(f"--commit names {repo!r} twice.")
+        out[repo] = sha
+    return out
+
+
+def claude_platform() -> str:
+    key = (platform_mod.system(), platform_mod.machine())
+    if key not in CLAUDE_PLATFORMS:
+        raise Refused(f"there is no Claude pin for {key[0]} {key[1]}.")
+    return CLAUDE_PLATFORMS[key]
+
+
+def parse_pin(text: str) -> tuple[str, dict[str, str]]:
+    """The pin's shape and nothing more: `claude:`, a version, and a sha256 per platform."""
+    version = None
+    pins: dict[str, str] = {}
+    saw_claude = False
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if line == "claude:":
+            saw_claude = True
+        elif line == "  sha256:":
+            continue
+        elif (m := PIN_VERSION.fullmatch(line)):
+            version = m.group(1)
+        elif (m := PIN_SHA.fullmatch(line)):
+            pins[m.group(1)] = m.group(2)
+        else:
+            raise Refused(f"{PIN} line {number} is outside the pin's shape (claude, version, "
+                          f"sha256 per platform): {printable(line)!r}")
+    if not saw_claude or version is None or not pins:
+        raise Refused(f"{PIN} names no claude version or no sha256 per platform.")
+    return version, pins
+
+
+# Git and GitHub.
+
+def git_in(bare: str, *args: str, token_value: str | None = None) -> subprocess.CompletedProcess:
+    env = dict(CLEAN_ENV)
+    if token_value is not None:
+        basic = base64.b64encode(f"x-access-token:{token_value}".encode()).decode("ascii")
+        env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="http.extraHeader",
+                   GIT_CONFIG_VALUE_0=f"Authorization: Basic {basic}", GIT_TERMINAL_PROMPT="0")
+    return subprocess.run([GIT, "-c", "credential.helper=", f"--git-dir={bare}", *args],
+                          env=env, cwd="/", capture_output=True, check=False)
+
+
+def tail(data: bytes) -> str:
+    lines = data.decode("utf-8", "replace").strip().splitlines()
+    return printable(" | ".join(lines[-3:])) or "no output"
+
+
+def ensure_bare(path: str) -> None:
+    if os.path.lexists(path):
+        return
+    done = subprocess.run([GIT, "init", "--bare", "-q", path], env=CLEAN_ENV, cwd="/",
+                          capture_output=True)
+    if done.returncode:
+        raise Refused(f"git could not create {path}: {tail(done.stderr)}")
+    own_tree(path)
+
+
+def read_token(gh, jwt: str, org: str, repo: str) -> str:
+    """A token that reads `repo`'s contents and nothing else."""
+    inst = gg.installation_for(gh, jwt, org)
+    code, payload = gh.request(
+        "POST", f"{gh.api}/app/installations/{inst['id']}/access_tokens", jwt,
+        {"permissions": {"contents": "read"}, "repositories": [repo]},
+    )
+    value = payload.get("token") if code == 201 and isinstance(payload, dict) else None
+    if not value:
+        raise Refused(f"GitHub refused a read token for {repo} ({code}: "
+                      f"{gg.message(payload)}). Nothing was changed.")
+    return value
+
+
+def fetch_main(bare: str, url: str, value: str) -> None:
+    done = git_in(bare, "fetch", "--no-tags", "--no-write-fetch-head", "--quiet", url,
+                  f"+{MAIN}:{MAIN}", token_value=value)
+    if done.returncode:
+        raise Refused(f"git could not fetch main from {url}: {tail(done.stderr)}. "
+                      f"Nothing was installed from it.")
+
+
+def main_head(bare: str) -> str:
+    done = git_in(bare, "rev-parse", "--verify", "--quiet", f"{MAIN}^{{commit}}")
+    if done.returncode:
+        raise Refused(f"{bare} has no {MAIN} after the fetch. Nothing was installed.")
+    return done.stdout.decode().strip()
+
+
+def is_on_main(bare: str, sha: str) -> bool:
+    return git_in(bare, "merge-base", "--is-ancestor", sha, MAIN).returncode == 0
+
+
+def extract(prefix: str, bare: str, name: str, sha: str) -> str:
+    """The tree of `name` at `sha`, root-owned. An existing tree for the same SHA is the same tree."""
+    dest = os.path.join(prefix, "src", f"{name}@{sha}")
+    label = f"{name}@{sha}"
+    if os.path.lexists(dest):
+        if not os.path.isdir(dest) or os.path.islink(dest):
+            raise Refused(f"{dest} is not a plain directory. Nothing was changed.")
+        return dest
+    listing = git_in(bare, "ls-tree", "-r", "-z", "--full-tree", sha)
+    if listing.returncode:
+        raise Refused(f"git could not list {label}: {tail(listing.stderr)}")
+    for entry in listing.stdout.split(b"\0"):
+        meta, _, path = entry.partition(b"\t")
+        mode = meta.split(b" ")[0]
+        if mode in LINK_MODES:
+            kind = "a symbolic link" if mode == b"120000" else "a submodule (gitlink)"
+            raise Refused(f"{label} holds {printable(path.decode('utf-8', 'replace'))} as {kind}. "
+                          f"A tree with one is refused. Nothing was changed.")
+    archive = git_in(bare, "archive", "--format=tar", sha)
+    if archive.returncode:
+        raise Refused(f"git could not archive {sha} of {name}: {tail(archive.stderr)}")
+    staged = f"{dest}.tmp-{token()}"
+    os.mkdir(staged, 0o755)
+    done = subprocess.run([TAR, "-x", "-f", "-", "-C", staged], input=archive.stdout,
+                          env=CLEAN_ENV, cwd="/", capture_output=True, check=False)
+    if done.returncode:
+        shutil.rmtree(staged, ignore_errors=True)
+        raise Refused(f"tar could not extract {label}: {tail(done.stderr)}")
+    own_tree(staged)
+    os.rename(staged, dest)
+    return dest
+
+
+def stage_library(plan: Plan, tree: str, dst: str) -> None:
+    """The library's top-level Python modules, staged as one directory and swapped in whole."""
+    src = os.path.join(tree, LIBRARY)
+    staged = f"{dst}.new-{token()}"
+    os.mkdir(staged, 0o755)
+    plan.stage(staged, dst)
+    for name in sorted(os.listdir(src)):
+        if name.endswith(".py"):
+            write_atomic(os.path.join(staged, name),
+                         read_tree_file(tree, f"{LIBRARY}/{name}"), 0o644)
+    own_tree(staged)
+
+
+# Accounts and the instruction file.
+
+def home_of(cfg: dict, account: str) -> str:
+    if account in cfg["homes"]:
+        return cfg["homes"][account]
+    if platform_mod.system() == "Darwin":
+        done = subprocess.run([DSCL, ".", "-read", "/Users/" + account, "NFSHomeDirectory"],
+                              env=CLEAN_ENV, cwd="/", capture_output=True, check=False)
+        value = done.stdout.decode().partition(":")[2].strip() if done.returncode == 0 else ""
+    else:
+        done = subprocess.run([GETENT, "passwd", account], env=CLEAN_ENV, cwd="/",
+                              capture_output=True, check=False)
+        fields = done.stdout.decode().strip().split(":")
+        value = fields[5] if done.returncode == 0 and len(fields) > 5 else ""
+    if not value.startswith("/"):
+        raise Refused(f"the directory service has no account {account}. Create it with "
+                      f"bin/provision-accounts first.")
+    return value
+
+
+def consent(mode: str) -> bool:
+    if mode == "yes":
+        return True
+    if mode == "no":
+        return False
+    try:
+        answer = input("Install the account's edit above as the reviewers' instruction file? [y/N] ")
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
+def stage_instructions(cfg: dict, args, sw_tree: str, rv: str, plan: Plan) -> None:
+    shipped = read_tree_file(sw_tree, INSTRUCTIONS)
+    home = home_of(cfg, ACCOUNT)
+    held = read_beneath(home, (".claude", "CLAUDE.md"), one_name=True)
+    chosen = shipped
+    if held is not None and held != shipped:
+        held_path = printable(os.path.join(home, ".claude", "CLAUDE.md"))
+        print(f"the {ACCOUNT} account's {held_path} differs from the shipped {INSTRUCTIONS}:")
+        sys.stdout.write("".join(difflib.unified_diff(
+            printable(shipped.decode("utf-8", "replace")).splitlines(keepends=True),
+            printable(held.decode("utf-8", "replace")).splitlines(keepends=True),
+            fromfile=f"shipped {INSTRUCTIONS}", tofile=held_path)))
+        if consent(args.consent):
+            chosen = held
+            print("reviewers/CLAUDE.md takes the account's edit.")
+        else:
+            print(f"reviewers/CLAUDE.md takes the shipped {INSTRUCTIONS}.")
+    stage_file(plan, os.path.join(rv, "CLAUDE.md"), chosen, 0o644)
+
+
+# The launcher, the sudo rule and the reviewers' tools.
+
+def stage_sudo_rule(cfg: dict, sw_tree: str, launcher: str, plan: Plan) -> None:
+    template = read_tree_file(sw_tree, SUDOERS_TEMPLATE).decode("utf-8")
+    text = template.replace("@LAUNCHER@", launcher).encode("utf-8")
+    sudoers = cfg["sudoers_dir"]
+    staged = os.path.join(sudoers, f".{SUDOERS_NAME}.tmp-{token()}")
+    write_atomic(staged, text, 0o440)
+    plan.stage(staged, os.path.join(sudoers, SUDOERS_NAME))
+    done = subprocess.run([cfg["visudo"], "-c", "-f", staged], env=CLEAN_ENV, cwd="/",
+                          capture_output=True, check=False)
+    if done.returncode:
+        raise Refused(f"visudo refused the sudo rule, so nothing was placed: {tail(done.stderr + done.stdout)}")
+
+
+def stage_venv(cfg: dict, ap_tree: str, rv: str, plan: Plan) -> None:
+    lock = os.path.join(ap_tree, LOCK)
+    staging = os.path.join(rv, f"venv.staging-{token()}")
+    plan.stage(staging, os.path.join(rv, "venv"))
+    made = subprocess.run([cfg["interpreter"], "-I", "-m", "venv", staging], env=CLEAN_ENV,
+                          cwd="/", capture_output=True, check=False)
+    if made.returncode:
+        raise Refused(f"could not create the reviewers' venv: {tail(made.stderr)}. "
+                      f"Nothing that is live was replaced.")
+    pip_env = dict(CLEAN_ENV, PIP_NO_INPUT="1", PIP_DISABLE_PIP_VERSION_CHECK="1",
+                   PIP_NO_CACHE_DIR="1", PIP_CONFIG_FILE=os.devnull)
+    pip = subprocess.run(
+        [os.path.join(staging, "bin", "python"), "-I", "-m", "pip", "install",
+         "--only-binary=:all:", "--require-hashes", *cfg["pip_args"], "-r", lock],
+        env=pip_env, cwd="/", capture_output=True, check=False)
+    if pip.returncode:
+        raise Refused(f"pip refused {LOCK} (a hash did not match, or a build failed): "
+                      f"{tail(pip.stderr + pip.stdout)}. Nothing that is live was replaced.")
+    own_tree(staging)
+
+
+def fetch_claude(cfg: dict, ap_tree: str) -> tuple[str, str]:
+    """Download the pinned Claude binary as a scratch file that cannot run, check its hash, then run
+    it once with --version. Returns the scratch path and the --version line. The caller stages the
+    file; a refusal here removes it."""
+    version, pins = parse_pin(read_tree_file(ap_tree, PIN).decode("utf-8"))
+    which = claude_platform()
+    if which not in pins:
+        raise Refused(f"the pin in {PIN} has no sha256 for {which}.")
+    expected = pins[which]
+    scratch_dir = os.path.join(cfg["prefix"], "scratch")
+    make_dir(scratch_dir, 0o700)
+    url = f"{cfg['download_base'].rstrip('/')}/{version}/{which}/claude"
+    scratch = os.path.join(scratch_dir, f"claude-{token()}")
+    fd = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    digest = hashlib.sha256()
+    with os.fdopen(fd, "wb") as out:
+        os.fchown(fd, gg.ROOT_UID, gg.ROOT_GID)
+        try:
+            with urllib.request.urlopen(url, timeout=600) as resp:
+                for chunk in iter(lambda: resp.read(1 << 20), b""):
+                    digest.update(chunk)
+                    out.write(chunk)
+        except OSError as exc:
+            os.unlink(scratch)
+            raise Refused(f"could not download {url}: {exc}. Nothing was run.")
+    got = digest.hexdigest()
+    if got != expected:
+        os.unlink(scratch)
+        raise Refused(f"{url} has sha256 {got}, and the pin says {expected}. Nothing was run, "
+                      f"and the download was deleted.")
+    os.chmod(scratch, 0o755)
+    try:
+        ran = subprocess.run([scratch, "--version"], env=CLEAN_ENV, cwd="/", capture_output=True,
+                             timeout=CLAUDE_VERSION_TIMEOUT, check=False)
+    except subprocess.TimeoutExpired:
+        os.unlink(scratch)
+        raise Refused(f"the pinned binary did not finish --version within {CLAUDE_VERSION_TIMEOUT}s. "
+                      f"It was removed.")
+    text = ran.stdout.decode("utf-8", "replace")
+    words = text.split()
+    if ran.returncode or not words or words[0] != version:
+        os.unlink(scratch)
+        raise Refused(f"the pinned binary did not report {version} as the first word of --version "
+                      f"(exit {ran.returncode}). It was removed.")
+    return scratch, text.strip()
+
+
+def stage_reviewers(cfg: dict, args, ap_tree: str, sw_tree: str, plan: Plan) -> None:
+    rv = os.path.join(cfg["prefix"], "reviewers")
+    make_dir(rv, 0o755)
+    make_dir(os.path.join(rv, "bin"), 0o755)
+    make_dir(os.path.join(rv, "lib"), 0o755)
+    # projects.py reads this path first. Empty, it does not parse, so every reader raises and
+    # fails closed. It holds no data, so it cannot go stale the way a copy of the registry can.
+    make_dir(os.path.join(rv, "config"), 0o755)
+    stage_file(plan, os.path.join(rv, "config", "projects.json"), b"", 0o644)
+    for rel in REVIEWER_BINS:
+        stage_file(plan, os.path.join(rv, "bin", os.path.basename(rel)),
+                   read_tree_file(ap_tree, rel), 0o755)
+    stage_library(plan, ap_tree, os.path.join(rv, "lib", "agent-platform"))
+    stage_instructions(cfg, args, sw_tree, rv, plan)
+    stage_venv(cfg, ap_tree, rv, plan)
+    scratch, text = fetch_claude(cfg, ap_tree)
+    plan.stage(scratch, os.path.join(rv, "claude"))
+    print(f"reviewers: {text}")
+
+
+# The updater and the handoff.
+
+def write_updater(prefix: str, interpreter: str, sha: str) -> None:
+    target = os.path.join(prefix, "src", f"shipwright@{sha}", "bin", "install-privileged")
+    text = (f"#!/bin/sh\n"
+            f"exec {' '.join(ENTRY_ARGV)} {shlex.quote(interpreter)} -I {shlex.quote(target)}\n")
+    write_atomic(os.path.join(prefix, "libexec", "update-privileged"), text.encode("utf-8"), 0o755)
+
+
+def hand_off(cfg: dict, args, sw_tree: str, shas: dict[str, str]) -> int:
+    """Run the newer commit's own copy, which installs and rewrites the entry point."""
+    argv = [*ENTRY_ARGV, cfg["interpreter"], "-I",
+            os.path.join(sw_tree, "bin", "install-privileged"), "--consent", args.consent]
+    for repo, sha in sorted(shas.items()):
+        argv += ["--commit", f"{repo}={sha}"]
+    print(f"{PROG}: handing off to {sw_tree}")
+    return subprocess.run(argv, cwd="/", check=False).returncode
+
+
+def verify_ownership(prefix: str) -> list[str]:
+    """Every path under the prefix owned by root with no group or other write bit."""
+    bad: list[str] = []
+    top = os.lstat(prefix)
+    if top.st_uid != gg.ROOT_UID or top.st_mode & 0o022:
+        bad.append(prefix)
+    for dirpath, dirnames, filenames in os.walk(prefix):
+        for name in dirnames + filenames:
+            path = os.path.join(dirpath, name)
+            st = os.lstat(path)
+            if st.st_uid != gg.ROOT_UID or (not stat.S_ISLNK(st.st_mode) and st.st_mode & 0o022):
+                bad.append(path)
+    return bad
+
+
+# The run.
+
+def stage_all(cfg: dict, args, sw_tree: str, ap_tree: str, ap_sha: str, records: str, plan: Plan) -> None:
+    prefix = cfg["prefix"]
+    libexec = os.path.join(prefix, "libexec")
+    make_dir(libexec, 0o755)
+    launcher = os.path.join(libexec, "review-launch")
+    stage_file(plan, launcher, read_tree_file(ap_tree, LAUNCHER), 0o755)
+    print(f"launcher: agent-platform@{ap_sha} {LAUNCHER} -> libexec/review-launch")
+    make_dir(os.path.join(prefix, "lib"), 0o755)
+    stage_library(plan, ap_tree, os.path.join(prefix, "lib", "agent-platform"))
+    stage_sudo_rule(cfg, sw_tree, launcher, plan)
+    print(f"sudo rule: {cfg['sudoers_dir']}/{SUDOERS_NAME}")
+    stage_reviewers(cfg, args, ap_tree, sw_tree, plan)
+    stage_file(plan, os.path.join(prefix, "src", "installed"), records.encode("utf-8"), 0o644)
+
+
+def install(args: argparse.Namespace) -> int:
+    # Every root child, github-gate's openssl included, inherits a root-owned working directory.
+    os.chdir("/")
+    euid = os.geteuid()
+    gg.ROOT_UID, gg.ROOT_GID = (0, 0) if euid == 0 else (euid, os.getegid())
+    prefix = RUN_PREFIX
+    cfg = merged_config(load_config(prefix), fixture_settings(prefix), args)
+    cfg["prefix"] = prefix
+    if euid != 0 and cfg["require_root"]:
+        raise Refused("this installs the root-owned half, and only root may run it. "
+                      "Run it with sudo.")
+    commits = parse_commits(args.commit, {r: cfg[f"{r.replace('-', '_')}_repo"] for r in ROLES})
+    print(f"{PROG}: running {HERE_FILE}")
+
+    make_dir(prefix, 0o755)
+    make_dir(os.path.join(prefix, "etc"), 0o700)
+    make_dir(os.path.join(prefix, "src"), 0o755)
+    persisted = {k: cfg[k] for k in PERSISTED}
+    data = (json.dumps(persisted, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    if read_beneath(prefix, (CONFIG,)) != data:
+        write_atomic(os.path.join(prefix, CONFIG), data, 0o644)
+
+    ensure_slots(prefix)
+    key_path = os.path.join(prefix, gg.KEY_SLOT)
+    if not gg.read_slot(key_path):
+        raise Refused(f"no approver key is placed at {key_path}. The slots are created. Place "
+                      f"the key with: sudo {shlex.quote(cfg['interpreter'])} -I "
+                      f"{shlex.quote(os.path.join(HERE, 'github-gate'))} --place-key "
+                      f"<file> --app-id <id>. Nothing was fetched.")
+    key_path, app_id = gg.placed_key(prefix)
+    jwt = gg.app_jwt(key_path, app_id)
+    gh = gg.GitHub(api=cfg["api_base"])
+
+    names = {r: cfg[f"{r.replace('-', '_')}_repo"] for r in ROLES}
+    trees: dict[str, tuple[str, str, str]] = {}
+    for role in ROLES:
+        name = names[role]
+        bare = os.path.join(prefix, "src", f"{name}.git")
+        ensure_bare(bare)
+        value = read_token(gh, jwt, cfg["org"], name)
+        try:
+            fetch_main(bare, f"{cfg['github_base'].rstrip('/')}/{cfg['org']}/{name}", value)
+        finally:
+            gh.revoke(value)
+        head = main_head(bare)
+        sha = commits.get(name, head)
+        if not is_on_main(bare, sha):
+            raise Refused(f"{sha} is not on {MAIN} of {name}, whose head GitHub gives as {head}. "
+                          f"The fetch has already set the bare copy's {MAIN} to that head. Only a commit "
+                          f"on {MAIN} is installed. Nothing was installed.")
+        trees[role] = (name, sha, extract(prefix, bare, name, sha))
+        print(f"source: {name} at {sha} from {trees[role][2]}")
+
+    sw_name, sw_sha, sw_tree = trees["shipwright"]
+    if RUN_SHA != sw_sha:
+        return hand_off(cfg, args, sw_tree, {n: s for n, s, _ in trees.values()})
+
+    ap_name, ap_sha, ap_tree = trees["agent-platform"]
+    records = "".join(f"{n} {s}\n" for n, s, _ in trees.values())
+    plan = Plan()
+    try:
+        stage_all(cfg, args, sw_tree, ap_tree, ap_sha, records, plan)
+    except BaseException:
+        plan.discard()
+        raise
+    plan.swap()
+    bad = verify_ownership(prefix)
+    if bad:
+        raise Refused("these paths are not root-owned, or another account can write them: "
+                      + ", ".join(bad) + ". The entry point was not rewritten.")
+    write_updater(prefix, cfg["interpreter"], sw_sha)
+    print(f"installed: {sw_name}@{sw_sha}, {ap_name}@{ap_sha}; entry point "
+          f"{os.path.join(prefix, 'libexec', 'update-privileged')}")
+    return 0
+
+
+def ensure_slots(prefix: str) -> None:
+    """Each credential slot as an empty root-owned file, with a `.needed` marker beside it."""
+    for rel in SLOTS:
+        path = os.path.join(prefix, rel)
+        if gg.read_slot(path) is None:
+            write_atomic(path, b"", 0o600)
+        marker = path + gg.NEEDED_SUFFIX
+        # Only an empty slot is needed; a placed key must not regain its marker.
+        if not gg.read_slot(path) and not os.path.lexists(marker):
+            write_atomic(marker, f"{rel} is empty; the install needs it.\n".encode("utf-8"), 0o644)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return install(args)
+    except Refused as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
