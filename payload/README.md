@@ -8,8 +8,11 @@ An AI agent is an AI model, such as Claude, given a role and the tools it may us
 on a task. A crew is one project and the agents working on it. You do not need to know more than
 that to begin, because the steward explains each part of Builder when your work reaches it.
 
-Builder is free and open source under the Apache 2.0 licence. [Installing Builder
-today](docs/installing.md) covers the install itself, as Builder's first public release runs it.
+**Builder's website is [convivybuilder.org](https://convivybuilder.org).** It carries the
+documentation and the install pages.
+
+Builder is free and open source under the Apache 2.0 licence. [Installing
+Builder](docs/installing.md) covers the install itself, as Builder's first public release runs it.
 
 **This repository holds the payload, the part of Builder an install places on your machine: the
 skills, the steward's charter, the documentation, the starting knowledge and a backup command. It

@@ -180,7 +180,15 @@ class System:
         # LC_ALL=C because sudo keeps the caller's locale by default, and `ls`
         # translates "Permission denied" into it.
         argv = ["/usr/bin/sudo", "-n", "-u", user, "/usr/bin/env", "LC_ALL=C", "/bin/ls", path]
-        done = self.run(argv)
+        # A HOST WITH NO sudo AT ALL RAISES HERE, NOT A RETURN CODE. Left uncaught it
+        # reached the operator as a traceback, and the isolation row was not
+        # reported as the probe that did not run.
+        try:
+            done = self.run(argv)
+        except OSError as exc:
+            raise Refused(
+                f"`{' '.join(argv)}` could not run ({exc.strerror}), so the isolation "
+                f"check did not run. It needs sudo at /usr/bin/sudo.") from exc
         if done.returncode == 0:
             return True
         if "Permission denied" in done.stderr:

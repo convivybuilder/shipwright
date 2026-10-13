@@ -1,0 +1,545 @@
+#!/usr/bin/env python3
+"""bootstrap-library — make the operator the Library's first person, once.
+
+    bin/bootstrap-library                      do it, unless it is already done
+    bin/bootstrap-library --status             whether it is already done
+    bin/bootstrap-library --dry-run            say what would happen, change nothing
+    bin/bootstrap-library --check              report only; 1 if work is left
+    bin/bootstrap-library --print-operator-name  resolve and print the operator's
+                                                display name and its source; change nothing
+
+**RUN AFTER `install-jobs`, NOT BEFORE.** The Library's tables, including
+`bootstrap_record`, come from `python -m alembic upgrade head`, which is the
+first of `jobs/library.toml`'s own `prepare` commands and runs when that
+declaration's job is installed. Before that has happened, the database this
+reads and writes does not exist. `bin/stand-up-backend` runs this step right
+after `supervise`, which is the step that installs that job.
+
+## What it does
+
+Reads `jobs/library.toml`, resolves it against this machine the way
+`bin/install-jobs` would, and uses the resolved `working-directory` and
+`environment` to find the Library's deploy area, its database
+(`LIBRARY_DB`) and its approved-client credential file
+(`LIBRARY_CLIENT_TOKENS`) — never a hardcoded path, for the same reason
+`bin/install-jobs` never hardcodes one: those are this machine's paths, not
+every adopter's. The resolved environment also carries
+`LIBRARY_WRITES_ENABLED`, which `jobs/library.toml` sets to `"1"`:
+`bootstrap_library.py` calls `store.connect_rw()`, which refuses to write
+anything unless that variable is exactly `"1"`, so this command takes it
+from the job declaration rather than setting it itself.
+
+When the operator config file already names a `person_id`, this returns at
+once: it never runs the migration and never touches the database. Otherwise
+it runs `{deploy}/library/.venv/bin/python -m alembic upgrade head` itself,
+idempotently, like `jobs/library.toml`'s own prepare step, and then:
+
+- if `bootstrap_record` already has its one row BEFORE this runs, that is
+  the operator's id; nothing is minted again, and `bootstrap_library.py`
+  never runs at all.
+- otherwise it runs `{deploy}/library/.venv/bin/python bootstrap_library.py
+  "<display name>"` once, which records the row, makes the named person the
+  Library's first administrator, and mints an approved-client credential
+  scoped to every product. A non-zero exit from that command is always a
+  refusal, named with its exit status and its stderr tail — never read as
+  "already done" by checking the table again afterwards, which cannot tell
+  a race that landed first from a genuine failure that happened to collide
+  with one. The only check for "already done" is the row's presence before
+  the command runs.
+
+The id is then written into the operator config file (`operator.json`,
+unless `$CONVIVY_OPERATOR_CONFIG` says otherwise) under the key `person_id`,
+value `person_<ULID>`, which `agentctl crew register` reads to record who
+created a new crew. **An operator config that already holds `person_id` is
+left alone, byte for byte**, the same rule `bin/write-operator-config`
+follows for the whole file.
+
+## The credential never reaches a terminal or a log
+
+`bootstrap_library.py` prints the raw token on stdout and nothing else;
+status goes to stderr. This command sends that stdout to `/dev/null` and
+never logs it. Only the credential FILE's path and the entry's name — the
+operator's own person id, never the token — are printed, so the operator
+knows where to find it without this command ever showing it.
+
+## The display name
+
+A display name, not a secret, so `--operator-name` is a plain option. Unset,
+it falls back, in order, to `git config --global user.name`, then the login
+account's full name (`getent passwd`'s gecos field on Linux, `id -F` on a
+Mac), then the login name. Every fallback is printed, naming its source,
+since nothing here prompts: this runs piped from curl and over ssh, where
+there is nobody to ask.
+
+**`--print-operator-name` resolves the chain and exits, nothing else.** It
+runs before anything that needs `--root` or the jobs directory: no database,
+no `operator.json`. `bin/stand-up-backend`'s `--shape two` runs this mode as
+a subprocess, in the operator's own process, since this command is the one
+place the chain is defined and its `library-person` step otherwise runs as
+`agents`, which has no claim to the operator's name.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pwd
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+PROG = "bootstrap-library"
+
+
+def _python_too_old(version=None, executable: str | None = None) -> str | None:
+    """The message to die with under an interpreter that cannot read TOML.
+
+    The same guard `bin/install-jobs` runs, for the same reason: this reads
+    `jobs/library.toml`, which needs `tomllib`, so a stock Ubuntu 22.04
+    `python3` would otherwise fail inside `jobs.declaration`'s own import with
+    `ModuleNotFoundError`, which names the symptom and not the fix.
+    """
+    version = version or sys.version_info
+    if version >= (3, 11):
+        return None
+    return (
+        f"{PROG} needs Python 3.11 or newer for tomllib, and this is "
+        f"{version[0]}.{version[1]} at {executable or sys.executable}. "
+        f"Ubuntu 22.04 ships 3.10, so install 3.11 and run this under it — a "
+        f"job declaration is TOML and cannot be read without it."
+    )
+
+
+_too_old = _python_too_old()
+if _too_old:
+    sys.exit(_too_old)
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "tools"))
+
+from jobs import declaration, placeholders
+
+# `jobs/library.toml`'s own label. Matched rather than the filename, so a
+# fork that renames the file, or points `--jobs` at a directory that does not
+# ship one at all, is told "nothing to bootstrap" rather than crashing on a
+# path that assumed the name.
+LIBRARY_LABEL = "com.convivy.library"
+
+# Mirrors `bin/write-operator-config`'s own ENV_VAR and config_path(), so this
+# writes into the same file that reads from.
+ENV_VAR = "CONVIVY_OPERATOR_CONFIG"
+
+PERSON_ID_KEY = "person_id"
+
+
+class Refused(Exception):
+    """Something the operator has to decide about. Never a stack trace."""
+
+
+def config_path() -> Path:
+    env = os.environ.get(ENV_VAR)
+    return Path(env) if env else Path.home() / ".config" / "convivy" / "operator.json"
+
+
+def builder_root(bin_dir: str) -> str | None:
+    """The Builder root, as `builder-root` prints it, or None if it cannot say.
+
+    The same lookup `bin/install-jobs` makes, for the same reason: asked
+    rather than assumed, and never run as root, since `bin_dir` follows
+    `--home` and could be another account's.
+    """
+    if os.geteuid() == 0:
+        return None
+    for candidate in (os.path.join(bin_dir, "builder-root"), shutil.which("builder-root")):
+        if not candidate or not os.path.isfile(candidate):
+            continue
+        try:
+            result = subprocess.run([candidate], capture_output=True, text=True,
+                                    check=False, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        root = result.stdout.strip()
+        if result.returncode == 0 and os.path.isabs(root) and "\n" not in root:
+            return root
+    return None
+
+
+def machine_from(args: argparse.Namespace) -> placeholders.Machine:
+    home = args.home or os.path.expanduser("~")
+    bin_dir = args.bin or f"{home}/.local/bin"
+    return placeholders.Machine.for_home(
+        home,
+        root=args.root or builder_root(bin_dir) or "",
+        python=args.python or sys.executable,
+        deploy=args.deploy,
+        state=args.state,
+        bin=bin_dir,
+    )
+
+
+def find_library_job(jobs_dir: Path) -> declaration.Job | None:
+    """The Library's own declaration in `jobs_dir`, or None.
+
+    None covers both a missing directory — a fork that ships no declarations
+    at all — and one that ships declarations but no Library job, which is the
+    same "nothing to bootstrap" answer either way.
+    """
+    if not jobs_dir.is_dir():
+        return None
+    try:
+        jobs = declaration.load_directory(jobs_dir)
+    except declaration.DeclarationError as exc:
+        raise Refused(
+            f"{exc}\n\nA declaration that will not parse is fixed before this "
+            f"reads it."
+        ) from exc
+    for job in jobs:
+        if job.label == LIBRARY_LABEL:
+            return job
+    return None
+
+
+def resolve_library(job: declaration.Job, machine: placeholders.Machine) -> declaration.Job:
+    """`job`, resolved against `machine`, refusing the way `bin/install-jobs` does
+    when a placeholder it needs cannot be answered."""
+    if not machine.root and placeholders.uses_placeholder(job, "root"):
+        why = (
+            "a run as root never executes `builder-root`, since another "
+            "account could have placed it. Pass --root."
+            if os.geteuid() == 0 else
+            f"`builder-root` is not in {machine.bin} or on PATH, or did not "
+            f"print one absolute path. Pass --root, or run bin/link-commands "
+            f"first."
+        )
+        raise Refused(
+            f"cannot find the Builder root, which {job.source} names as "
+            f"{{root}}: {why}"
+        )
+    try:
+        return placeholders.resolve(job, machine, programs={})
+    except placeholders.PlaceholderError as exc:
+        raise Refused(str(exc)) from exc
+
+
+def read_person_id(db_path: Path) -> str | None:
+    """`bootstrap_record.person_id`, or None when there is no row — including
+    when the database itself does not exist yet."""
+    if not db_path.is_file():
+        return None
+    conn = sqlite3.connect(str(db_path))
+    try:
+        try:
+            row = conn.execute(
+                "SELECT person_id FROM bootstrap_record WHERE id = 1"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            # No such table: the migration has not created it, which under a
+            # real run cannot happen (alembic runs first, above) but is the
+            # honest answer for a `--status` or `--check` asked before it has.
+            return None
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def run_migration(venv_python: Path, cwd: Path, env: dict[str, str]) -> None:
+    try:
+        done = subprocess.run(
+            [str(venv_python), "-m", "alembic", "upgrade", "head"],
+            cwd=cwd, env=env, capture_output=True, text=True, timeout=300, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Refused(f"could not run alembic: {exc}") from exc
+    if done.returncode != 0:
+        tail = (done.stderr or done.stdout).strip()[-600:]
+        raise Refused(f"`alembic upgrade head` failed, exit {done.returncode}:\n{tail}")
+    print(f"  migrated the Library's database")
+
+
+def run_bootstrap(venv_python: Path, cwd: Path, env: dict[str, str], name: str) -> tuple[int, str]:
+    """Run `bootstrap_library.py`; return its exit status and stderr, stripped.
+
+    Its stdout — the raw credential, and nothing else — is sent to
+    `/dev/null` rather than captured, logged or shown. stderr carries only
+    status, which is safe to show, and the caller shows it only when the run
+    turns out to have failed.
+
+    Never raises on a non-zero exit; the caller decides what that means.
+    """
+    script = cwd / "bootstrap_library.py"
+    try:
+        done = subprocess.run(
+            [str(venv_python), str(script), name],
+            cwd=cwd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True, timeout=120, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Refused(f"could not run bootstrap_library.py: {exc}") from exc
+    return done.returncode, (done.stderr or "").strip()
+
+
+def ensure_bootstrapped(
+    db_path: Path, venv_python: Path, cwd: Path, env: dict[str, str], name: str,
+    bootstrap=run_bootstrap, read=read_person_id,
+) -> str:
+    """The Library's first person's id, bootstrapping them if nobody is yet.
+
+    The only check for "already done" is a `bootstrap_record` row present
+    BEFORE `bootstrap_library.py` runs. A non-zero exit from that command is
+    always a refusal, named with its exit status and its stderr tail, even
+    if a row turns out to be there afterwards: reading the table again after
+    a failed run cannot tell a race that landed first from a genuine failure
+    that happened to collide with one, so it is never used to decide "done".
+
+    `bootstrap` and `read` are injected so a test can stand in for the real
+    subprocess and the real database.
+    """
+    person_id = read(db_path)
+    if person_id is not None:
+        return person_id
+    returncode, stderr = bootstrap(venv_python, cwd, env, name)
+    if returncode != 0:
+        tail = f": {stderr}" if stderr else ""
+        raise Refused(
+            f"bootstrap_library.py exited {returncode}{tail}"
+        )
+    person_id = read(db_path)
+    if person_id is None:
+        raise Refused(
+            f"bootstrap_library.py exited 0 but recorded no row in {db_path}; "
+            f"{name!r} was not made the Library's first person."
+        )
+    return person_id
+
+
+def read_operator_config(path: Path) -> dict:
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return {}
+    try:
+        content = json.loads(text)
+    except ValueError as exc:
+        raise Refused(f"{path} is not valid JSON; refusing to merge into it.") from exc
+    if not isinstance(content, dict):
+        raise Refused(f"{path} is not a JSON object; refusing to merge into it.")
+    return content
+
+
+def ensure_parent(parent: Path) -> None:
+    """Create `parent` at 0700 if it is missing, the same as
+    `bin/write-operator-config`. Never narrows one that already exists."""
+    if os.path.lexists(parent):
+        return
+    try:
+        parent.parent.mkdir(parents=True, exist_ok=True)
+        os.mkdir(parent, 0o700)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise Refused(f"could not create {parent}: {exc.strerror or exc}") from None
+    else:
+        os.chmod(parent, 0o700)
+
+
+def write_person_id(path: Path, person_id: str) -> bool:
+    """Add `person_id` to the operator config, preserving every other key and
+    the file's mode. Returns whether this wrote it — False when the key was
+    already there, including one that appeared since the caller last checked.
+    """
+    ensure_parent(path.parent)
+    try:
+        mode = os.stat(path).st_mode & 0o777
+        content = read_operator_config(path)
+    except FileNotFoundError:
+        mode = 0o600
+        content = {}
+    if PERSON_ID_KEY in content:
+        return False
+    content[PERSON_ID_KEY] = person_id
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".operator.json.")
+    try:
+        with os.fdopen(fd, "w") as out:
+            json.dump(content, out, indent=2, sort_keys=True)
+            out.write("\n")
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    return True
+
+
+def git_global_name(run=subprocess.run) -> str | None:
+    if shutil.which("git") is None:
+        return None
+    try:
+        done = run(["git", "config", "--global", "user.name"],
+                   capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    name = done.stdout.strip()
+    return name or None
+
+
+def system_full_name(platform: str = sys.platform, run=subprocess.run) -> str | None:
+    """The login account's full name, or None. `id -F` on a Mac — Open
+    Directory does not reliably fill the gecos field `pwd` would read —
+    and `getent passwd`'s gecos field, the first comma-separated part of it,
+    on Linux."""
+    try:
+        if platform == "darwin":
+            done = run(["id", "-F"], capture_output=True, text=True, timeout=30, check=False)
+            if done.returncode != 0:
+                return None
+            name = done.stdout.strip()
+            return name or None
+        login = pwd.getpwuid(os.getuid()).pw_name
+        done = run(["getent", "passwd", login],
+                   capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    fields = done.stdout.strip().split(":")
+    if len(fields) < 5:
+        return None
+    full = fields[4].split(",")[0].strip()
+    return full or None
+
+
+def login_name() -> str:
+    return pwd.getpwuid(os.getuid()).pw_name
+
+
+def operator_name(explicit: str | None, platform: str = sys.platform,
+                  git_name=git_global_name, full_name=system_full_name) -> tuple[str, str]:
+    """`(name, source)`. Tried in the order `bin/stand-up-backend` documents
+    for its own --operator-name: the explicit option, then `git config
+    --global user.name`, then the account's full name, then its login name.
+    Never prompts — this runs piped from curl and over ssh, with nobody to
+    ask."""
+    if explicit and explicit.strip():
+        return explicit.strip(), "the --operator-name option"
+    name = git_name()
+    if name:
+        return name, "git config --global user.name"
+    name = full_name(platform)
+    if name:
+        return name, "the account's full name"
+    return login_name(), "the account's login name"
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Make the operator the Library's first person, once.",
+    )
+    parser.add_argument("--operator-name", default=None,
+                        help="the administrator's display name (default: "
+                             "git config --global user.name, then the "
+                             "account's full name, then its login name)")
+    parser.add_argument("--jobs", type=Path, default=None,
+                        help="directory of job declarations (default: <repo>/jobs)")
+    parser.add_argument("--home", help="the account's home directory")
+    parser.add_argument("--root", help="the Builder root")
+    parser.add_argument("--deploy", help="the deploy area the Library runs from")
+    parser.add_argument("--state", help="writable state and logs")
+    parser.add_argument("--bin", help="where Builder's commands are linked")
+    parser.add_argument("--python", help="the provisioned interpreter, absolute")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--status", action="store_true",
+                      help="whether the operator is already the Library's first person")
+    mode.add_argument("--dry-run", action="store_true",
+                      help="say what would happen, change nothing")
+    mode.add_argument("--check", action="store_true",
+                      help="report only; 1 if work is left")
+    mode.add_argument("--print-operator-name", action="store_true",
+                      help="resolve and print the operator's display name and "
+                           "its source, then exit; touches no database or "
+                           "config file")
+    args = parser.parse_args(argv)
+
+    if args.print_operator_name:
+        name, source = operator_name(args.operator_name)
+        print(name)
+        print(source)
+        return 0
+
+    jobs_dir = args.jobs or (REPO / "jobs")
+    job = find_library_job(jobs_dir)
+    if job is None:
+        print(f"{PROG}: no Library job declared in {jobs_dir}; nothing to bootstrap")
+        return 0
+
+    machine = machine_from(args)
+    resolved = resolve_library(job, machine)
+    library_dir = Path(resolved.working_directory)
+    env = dict(resolved.environment)
+    db_path = Path(env["LIBRARY_DB"])
+    tokens_path = Path(env["LIBRARY_CLIENT_TOKENS"])
+    venv_python = library_dir / ".venv" / "bin" / "python"
+
+    path = config_path()
+    print(f"{PROG}: {path}")
+    existing = read_operator_config(path)
+    present = PERSON_ID_KEY in existing
+
+    if args.status:
+        print(f"  {'present' if present else 'absent'}: {PERSON_ID_KEY} in {path}")
+        return 0 if present else 1
+
+    if args.check:
+        print(f"  {'present' if present else 'absent'}: {PERSON_ID_KEY} in {path}")
+        return 0 if present else 1
+
+    if args.dry_run:
+        if present:
+            print(f"  already present: {PERSON_ID_KEY} in {path}")
+        else:
+            print(f"  would migrate the Library's database, make the operator "
+                  f"its first person if nobody is yet, and write {PERSON_ID_KEY} "
+                  f"to {path}")
+        return 0
+
+    if present:
+        print(f"  already present: {PERSON_ID_KEY} in {path} — left as it is")
+        return 0
+
+    if not venv_python.is_file():
+        raise Refused(
+            f"no interpreter at {venv_python}; place the Library first with "
+            f"bin/install-backend."
+        )
+
+    run_migration(venv_python, library_dir, env)
+
+    name, source = operator_name(args.operator_name)
+    print(f"  operator name: {name!r} (from {source})")
+
+    person_id = ensure_bootstrapped(db_path, venv_python, library_dir, env, name)
+
+    if write_person_id(path, person_id):
+        print(f"  wrote: {PERSON_ID_KEY} {person_id} to {path}")
+    else:
+        print(f"  already present: {PERSON_ID_KEY} in {path} — appeared during "
+              f"this run, left as it is")
+    print(f"  the operator's administrator credential is in {tokens_path}, as "
+          f"the entry named {person_id}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except Refused as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc

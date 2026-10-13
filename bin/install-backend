@@ -86,8 +86,17 @@ is not repeated here: `primary_worktree()` asks git.
 **It reads each repository's published ref rather than its local HEAD.** A
 checkout's HEAD is a local fact — it can be a branch, or a commit that was
 never pushed — and deploying from it would reintroduce, at the install, the
-staleness this decision exists to remove. `origin/main` is what a release
-serves.
+staleness this decision exists to remove.
+
+**The default ref is `origin/stable` when a checkout carries that branch,
+`origin/main` otherwise.** A development checkout has no `stable` branch, so
+`origin/main` is still what it installs. The one writer of `stable` is
+`commit-export`, into a clone of the public repository for a person to push,
+so a repository nothing publishes from never carries one. A public clone
+carries both `main`, the moving head, and `stable`, the latest release; a
+service installed from `origin/main` there would run unreleased code the
+adopter never asked for, so `default_ref_for()` prefers `origin/stable` when
+the checkout has it. An explicit `--ref` always wins.
 """
 
 from __future__ import annotations
@@ -268,6 +277,36 @@ def primary_worktree() -> Path:
     here = Path(__file__).resolve().parent.parent
     common = run("git", "-C", str(here), "rev-parse", "--git-common-dir").strip()
     return (Path(common) if Path(common).is_absolute() else here / common).resolve().parent
+
+
+def default_ref_for(repo: Path) -> str:
+    """`origin/stable` when `repo` carries that branch, `origin/main` otherwise.
+
+    Tried as the checkout's own remote-tracking ref first, since that is what
+    every clone of a released repository carries. The local branch
+    `refs/heads/stable` is tried only when the checkout has no `origin` remote
+    at all, and is never consulted where `origin` exists: before this, the
+    default read only `origin/main`, and a local branch outranking it would
+    let a ref nothing published choose what is installed. A development
+    checkout has neither, so it falls through to `origin/main` exactly as
+    before this existed.
+    """
+    def resolves(ref: str) -> bool:
+        return subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet",
+             f"{ref}^{{commit}}"],
+            capture_output=True, text=True, check=False,
+        ).returncode == 0
+
+    if resolves("refs/remotes/origin/stable"):
+        return "origin/stable"
+    has_origin = subprocess.run(
+        ["git", "-C", str(repo), "config", "--get", "remote.origin.url"],
+        capture_output=True, text=True, check=False,
+    ).returncode == 0
+    if not has_origin and resolves("refs/heads/stable"):
+        return "stable"
+    return "origin/main"
 
 
 def commit_of(repo: Path, ref: str) -> str:
@@ -1703,9 +1742,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--deploy", type=Path, default=None,
                         help="deploy root (default: ~/.local/deploy, or "
                              "$BUILDER_DEPLOY_ROOT)")
-    parser.add_argument("--ref", default="origin/main",
-                        help="ref to install from (default: origin/main). Never "
-                             "the checkout's HEAD unless you name it.")
+    parser.add_argument("--ref", default=None,
+                        help="ref to install from (default: origin/stable when "
+                             "a repository's checkout carries that branch, "
+                             "origin/main otherwise). Never the checkout's HEAD "
+                             "unless you name it.")
     parser.add_argument("--only", action="append", choices=PLACEABLE,
                         help="place only this repository or component; repeatable")
     parser.add_argument("--root", type=Path, default=None,
@@ -1804,8 +1845,9 @@ def main(argv: list[str]) -> int:
     still_running: list[str] = []
     for placement in placements:
         report: list[str] = []
+        ref = args.ref if args.ref is not None else default_ref_for(placement.source)
         state, detail = install_one(
-            placement.name, placement.source, placement.area, args.ref,
+            placement.name, placement.source, placement.area, ref,
             args.python or sys.executable, args.dry_run or args.check,
             subtree=placement.subtree, venv=placement.venv,
             program=placement.program, extra=placement.extra,

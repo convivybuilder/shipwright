@@ -155,13 +155,14 @@ def _service_body(job: Job, directory: accounts.Directory) -> list[str]:
     return lines
 
 
-def render_service(job: Job, directory: accounts.Directory = accounts.lookup) -> str:
+def render_service(job: Job, directory: accounts.Directory | None = None) -> str:
     """The `.service` unit.
 
     A job with a timer is installed with no `[Install]` section on purpose:
     the timer is what pulls it in, and a service that was also `WantedBy` a
     target would run once at every boot in addition to its schedule.
     """
+    directory = directory or accounts.lookup
     if not job.runs_on("linux"):
         raise ValueError(
             f"{job.name} does not list linux in platforms, so it has no systemd unit"
@@ -218,7 +219,7 @@ def unit_directory(job: Job, home: str) -> str:
     return f"{home}/.config/systemd/user"
 
 
-def render(job: Job, directory: accounts.Directory = accounts.lookup) -> dict[str, str]:
+def render(job: Job, directory: accounts.Directory | None = None) -> dict[str, str]:
     """Every unit file for this job, keyed by filename."""
     units = {f"{job.label}.service": render_service(job, directory)}
     timer = render_timer(job)

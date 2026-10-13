@@ -3,7 +3,8 @@ description = "Serves the LLM gateway every agent calls a model through. Without
 label = "com.convivy.llm-gateway"
 command = ["{home}/.local/lib/llm-gateway/llm-gateway-run.sh"]
 platforms = ["macos", "linux"]
-scope = "user"
+scope = "system"
+account = "agents"
 enabled-by-default = false
 working-directory = "{home}/.local/lib/llm-gateway"
 

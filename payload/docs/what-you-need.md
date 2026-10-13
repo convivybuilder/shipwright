@@ -11,16 +11,22 @@ point where your needs stop.
 
 ## The least you need
 
-- **A Mac**, and a terminal you are comfortable opening. A terminal is a window where you type
+- **Two machines.** This release needs both.
+  - **A server**, which runs Builder's backend and every session. It is a machine that stays on and
+    stays awake: a Linux machine, a virtual machine in the cloud, or a Mac left plugged in.
+  - **A Mac laptop**, which runs Deck, the app you work from. Deck reaches the server over SSH, a
+    standard way to open a terminal on another machine.
+- **A terminal you are comfortable opening** on each machine. A terminal is a window where you type
   commands, and on a Mac the application is called Terminal.
-- **The Mac's administrator password, for the two-account install.** Builder installs in one of two
-  shapes, though this release installs only the single-account shape; the two-account install comes
-  in a later release. The two-account install runs Builder under two user accounts of its own,
-  separate from yours. The install asks for the administrator password to create those two accounts,
-  and again whenever Builder's privileged half is installed or updated. Without the password, choose
-  the single-account install, which runs Builder as your own account.
-  [Where everything runs](where-everything-runs.md#two-install-shapes) explains both shapes and what
-  the single-account one gives up.
+- **An account of your own on each machine.** Builder installs on the server in one of two shapes,
+  and the shape counts only the server's accounts. This release installs only the single-account
+  shape, which runs Builder on the server as one account, yours. Deck runs on the laptop as your
+  account there, whichever shape the server has. The two-account install comes in a later release.
+  It runs Builder on the server under two accounts of its own, separate from yours, and it needs
+  the server's administrator password to create them, and again whenever Builder's privileged half
+  is installed or updated. [One account vs. multiple accounts on the
+  server](accounts-on-the-server.md)
+  explains both shapes and what the single-account one gives up.
 - **Claude Code, signed in to your Claude account.** Claude Code is the program that lets you talk
   with Claude, an AI model, in a terminal. Every Builder session is a conversation with Claude in a
   terminal. On the two-account install, Builder's two accounts sign in to Claude as well as your
@@ -33,13 +39,15 @@ On the two-account install, Homebrew installs anything else Builder needs, and t
 whole of it. Homebrew is a free program for the Mac that installs other programs. The single-account
 install installs no program itself: it checks each one and names any you need to install.
 
-Everything else on this page is what you add when you want agents working while your laptop is shut,
-or when you want to share something you have built. An agent is an AI model given a role and the tools
+The next two sections describe the machines as Builder is designed to use them, starting from one.
+This release needs both from the start, as listed above. The sections after them cover what you add
+when you want to share something you have built. An agent is an AI model given a role and the tools
 it may use, and Builder puts agents to work on tasks in your project.
 
 ## A laptop on its own
 
-A laptop runs the whole of Builder. Three things run there: the Library, which is where Builder
+This release does not install this way; it needs the two machines listed above. As designed, a
+laptop runs the whole of Builder. Three things run there: the Library, which is where Builder
 keeps everything a project knows, your sessions, and the agents they put to work. Deck, the desktop
 application where you pilot each project, is on the same machine.
 
@@ -48,6 +56,8 @@ stop mid-run. That is fine while you are building in bursts and sitting in front
 stops being fine the first time you want an overnight run.
 
 ## An always-on machine, once you want work to continue without you
+
+This release needs this machine from the start; it is the server listed above.
 
 A second machine that stays on and stays awake takes over running the sessions, and your laptop
 becomes the thing you drive them from. Work carries on while the laptop is shut, in a coffee shop,
@@ -133,7 +143,7 @@ A separate identity buys two things.
   you own that lists what agents may do without you. `agentctl kb merge`, the command the Library
   merges through, reads the policy and refuses anything it does not permit. A merge you start from
   Deck or Orient takes a separate path, through a merge check in the Library, and that check
-  approves every merge it is asked about for now, as [Installing Builder](installing.md) says. The
+  approves every merge it is asked about for now, as [What works and what does not yet](install-status.md) says. The
   App's identity is also how `agentctl kb merge` tells a pull request the Library opened from one
   anything else opened.
 
@@ -167,4 +177,5 @@ does this is not built yet. [Your own Cloudflare account](your-cloudflare-accoun
 ## Where to go next
 
 - **[Getting started](getting-started.md)** takes you from installing Builder to your first crew.
-- **[Where everything runs](where-everything-runs.md)** shows which parts can live on which machine.
+- **[How many machines Builder runs on](where-everything-runs.md)** covers one machine or
+  several, and what a second machine buys you.

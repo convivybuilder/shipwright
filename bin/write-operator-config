@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""Write the operator config file every backend service reads before it can
+answer a request — `lib/agent-platform/operator_config.py`'s own
+`$CONVIVY_OPERATOR_CONFIG`, or `operator.json` in `$HOME/.config/convivy` when
+that is unset.
+
+    bin/write-operator-config              write it, unless it already exists
+    bin/write-operator-config --status     whether it exists, and where
+    bin/write-operator-config --dry-run    say what would happen, change nothing
+    bin/write-operator-config --check      report only; 1 if absent, 2 if refused
+
+**WITHOUT THIS, NOTHING THAT READS THE FILE CAN START.** The knowledge
+watcher, and the roster loader `jobs/library.toml` runs before the Library
+first serves a request, both call `operator_config.get()`, which raises
+rather than falling back to an in-repo default. On a machine where nothing
+ever wrote the file, that is every one of them, every time.
+
+**RUN BEFORE `place`, NOT AFTER.** `bin/install-backend --seed-registry`
+seeds the Library's roster inside the deploy area it builds, and the roster
+loader that `jobs/library.toml` runs at the Library's first start already
+reads `operator_marker` from this file. `bin/stand-up-backend` runs this step
+right after `provision` and before `place` so the file exists for both.
+
+## Which account's file this is
+
+**Whichever account is running this**, under either install shape.
+`bin/stand-up-backend` never switches account for any of its steps — every
+one of them, this one included, runs as whoever invoked it, and the backend
+services a later step installs are user-scope jobs for that same account.
+On the single-account shape that is the operator's own login. The
+two-account shape's `agents` account is where "`agents` runs everything
+Builder does" (`payload/docs/where-everything-runs.md`), so there the file
+belongs to `agents`'s home — which is exactly what writing to the invoking
+account's `$HOME` already gives, once an administrator or the account
+itself runs this as `agents` rather than as the operator.
+
+## What it writes, and what it never does
+
+**`operator_marker` and `roster_crew` are both the constant `"operator"`**,
+and `excluded_crews` is always `[]`. These three are always written; no
+fork of this tool's config differs on them today. `config/operator.example.json`
+in agent-platform calls itself synthetic on purpose and is never copied from.
+
+**`github_login` and `tailnet_host` are each written only when they can be
+had with confidence, and omitted otherwise — never failing this step.**
+`github_login` comes from `gh api user --jq .login`, when `gh` is on PATH and
+that call succeeds with a value shaped like a GitHub login.
+`tailnet_host` comes from `tailscale status --json`'s `.Self.DNSName`, with
+one trailing dot stripped, when `tailscale` is on PATH and that call
+succeeds with a value shaped like a hostname. Omitting either costs the
+knowledge audit a clean reading in place of an unreadable one, which is
+reported here and left for the operator to close, not retried.
+
+**Nothing about publishing is written here.** `publish_scan.py`'s three
+keys — `shipwright_checkout`, `builder_private_names_file`,
+`builder_machine_names_file` — already default when absent, and are a
+developer's own machine detail, never an adopter's.
+
+## What it never touches
+
+**An existing file is the operator's.** Found present, it is reported and
+left alone, byte for byte — never rewritten, merged, or reformatted, however
+it differs from what this would have written.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+PROG = "write-operator-config"
+
+# Mirrors lib/agent-platform/operator_config.py's own ENV_VAR and
+# config_path(), so a deployment that sets the variable gets the same answer
+# from both sides.
+ENV_VAR = "CONVIVY_OPERATOR_CONFIG"
+
+OPERATOR_MARKER = "operator"
+ROSTER_CREW = "operator"
+
+# A GitHub login: letters, digits and hyphens, never starting or ending in
+# one, 1-39 characters — GitHub's own limit on a username.
+GITHUB_LOGIN_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?")
+
+# An RFC 1123 hostname: one or more dot-separated labels, each 1-63
+# characters, none starting or ending in a hyphen.
+_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+# Both are applied with `fullmatch`: a `$` anchor also matches before a
+# trailing newline, which let "host.example\n" through as a hostname.
+HOSTNAME_RE = re.compile(rf"{_LABEL}(?:\.{_LABEL})*")
+
+
+class Refused(Exception):
+    """Something the operator has to decide about. Never a stack trace."""
+
+
+def config_path() -> Path:
+    """`$CONVIVY_OPERATOR_CONFIG` if set, else `operator.json` in `$HOME/.config/convivy`.
+
+    Read fresh on every call, the same rule `operator_config.config_path()`
+    uses, so a test's `monkeypatch`-style environment override always takes
+    effect on the next call.
+    """
+    env = os.environ.get(ENV_VAR)
+    return Path(env) if env else Path.home() / ".config" / "convivy" / "operator.json"
+
+
+def _run_list(argv: list[str], timeout: int = 30) -> tuple[int, str]:
+    """Run `argv`, list-based and never through a shell, with a timeout.
+
+    `(1, "")` on anything that keeps this from answering — missing program,
+    timeout, any other `OSError` — so a caller need not tell "it failed" from
+    "it is not there" apart; both omit the key the same way.
+    """
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True,
+                              timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return 1, ""
+    return done.returncode, done.stdout
+
+
+def github_login(which=shutil.which, run=_run_list) -> tuple[str | None, str]:
+    """The adopter's GitHub login, or `None` and why it was omitted.
+
+    Never raises: the absence of `gh`, a failed call, an empty answer or one
+    that is not shaped like a login are all the same to a caller, which
+    omits the key and says so rather than failing the step.
+    """
+    if which("gh") is None:
+        return None, "gh is not on PATH"
+    code, out = run(["gh", "api", "user", "--jq", ".login"])
+    if code != 0:
+        return None, "gh api user failed"
+    login = out.strip()
+    if not login:
+        return None, "gh api user returned no login"
+    if not GITHUB_LOGIN_RE.fullmatch(login):
+        return None, f"{login!r} is not shaped like a GitHub login"
+    return login, ""
+
+
+def tailnet_host(which=shutil.which, run=_run_list) -> tuple[str | None, str]:
+    """This machine's tailnet hostname, or `None` and why it was omitted.
+
+    Reads `.Self.DNSName`, the node's name whether or not MagicDNS is on
+    (`bin/stand-up-backend`'s `tailnet_name` reads the same field for the
+    same reason), and strips exactly one trailing dot — the FQDN form
+    Tailscale reports it in.
+    """
+    if which("tailscale") is None:
+        return None, "tailscale is not on PATH"
+    code, out = run(["tailscale", "status", "--json"])
+    if code != 0:
+        return None, "tailscale status failed"
+    try:
+        status = json.loads(out)
+    except ValueError:
+        return None, "tailscale status printed invalid JSON"
+    name = (status.get("Self") or {}).get("DNSName") or ""
+    if not isinstance(name, str):
+        return None, "tailscale reported a DNSName that is not text"
+    name = name.strip()
+    if name.endswith("."):
+        name = name[:-1]
+    if not name:
+        return None, "tailscale reported no DNSName"
+    if not HOSTNAME_RE.fullmatch(name):
+        return None, f"{name!r} is not shaped like a hostname"
+    return name, ""
+
+
+def build_content(which=shutil.which, run=_run_list) -> tuple[dict, list[str]]:
+    """The file's content, and one line per key omitted and why."""
+    content: dict = {
+        "operator_marker": OPERATOR_MARKER,
+        "roster_crew": ROSTER_CREW,
+        "excluded_crews": [],
+    }
+    omitted: list[str] = []
+    login, why = github_login(which, run)
+    if login is not None:
+        content["github_login"] = login
+    else:
+        omitted.append(f"github_login: omitted ({why})")
+    host, why = tailnet_host(which, run)
+    if host is not None:
+        content["tailnet_host"] = host
+    else:
+        omitted.append(f"tailnet_host: omitted ({why})")
+    return content, omitted
+
+
+def refuse_occupied(path: Path) -> None:
+    """Something that is not a regular file sits at `path`.
+
+    A directory or other non-regular node there is not the operator's config
+    file — it is something else, and this never guesses what to do with it.
+    """
+    if os.path.lexists(path) and not path.is_file():
+        what = "a directory" if path.is_dir() else "not a regular file"
+        raise Refused(
+            f"{path} exists and is {what}, not the operator config file. "
+            f"Nothing was changed; move it aside first."
+        )
+
+
+def ensure_parent(parent: Path) -> None:
+    """Create `parent` at 0700 if it is missing. Never narrows one that
+    already exists — that directory is the operator's to loosen or not."""
+    if os.path.lexists(parent):
+        return
+    try:
+        parent.parent.mkdir(parents=True, exist_ok=True)
+        os.mkdir(parent, 0o700)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise Refused(f"could not create {parent}: {exc.strerror or exc}") from None
+    else:
+        os.chmod(parent, 0o700)
+
+
+def write_file(path: Path, content: dict) -> bool:
+    """Write `content` to `path`, atomically, mode 0600, unless a file appeared
+    there since `main` looked. Returns whether this wrote it.
+
+    A temporary file in the SAME directory, published with `os.link`, never a
+    write in place: a reader of `path` sees nothing or the whole file, never a
+    partial write. `os.link` fails when `path` exists, where `os.replace`
+    would overwrite it, so a file that appeared while `gh` and `tailscale`
+    were being asked (up to a minute) is left alone.
+    """
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".operator.json.")
+    try:
+        with os.fdopen(fd, "w") as out:
+            json.dump(content, out, indent=2, sort_keys=True)
+            out.write("\n")
+        os.chmod(tmp, 0o600)
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            return False
+        return True
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Write the operator config file, unless one is already there.",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--status", action="store_true",
+                      help="whether the file exists, and where")
+    mode.add_argument("--dry-run", action="store_true",
+                      help="say what would happen, change nothing")
+    mode.add_argument("--check", action="store_true",
+                      help="report only; 1 if absent, 2 if refused")
+    args = parser.parse_args(argv)
+
+    path = config_path()
+    print(f"{PROG}: {path}")
+    refuse_occupied(path)
+    present = path.is_file()
+
+    if args.status:
+        print(f"  present: {path}" if present else f"  absent: {path}")
+        return 0 if present else 1
+
+    if args.check:
+        print(f"  {'present' if present else 'absent'}: {path}")
+        return 0 if present else 1
+
+    if args.dry_run:
+        print(f"  {'already present' if present else 'would write'}: {path}")
+        return 0
+
+    if present:
+        print(f"  already present: {path} — left as it is")
+        return 0
+
+    content, omitted = build_content()
+    ensure_parent(path.parent)
+    if not write_file(path, content):
+        print(f"  already present: {path} — appeared during this run, left as it is")
+        return 0
+    print(f"  wrote: {path}")
+    for line in omitted:
+        print(f"  {line}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except Refused as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None

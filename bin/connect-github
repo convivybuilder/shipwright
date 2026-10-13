@@ -711,9 +711,17 @@ def connect(args: argparse.Namespace, home: Path) -> int:
             return 1
         print(f"{PROG}: enforced is active. Import the ruleset `{gate}` prints, if you have "
               f"not already.")
+        print(f"{PROG}: also turn on \"Automatically delete head branches\" in the "
+              f"repository's Settings, General, Pull Requests, if you have not already: a "
+              f"pull request stacked on another lands on main by itself only when GitHub "
+              f"deletes the base branch as part of merging it.")
     else:
         print(f"{PROG}: instruction mode. Import the ruleset `{gate}` prints, if you have "
               f"not already.")
+        print(f"{PROG}: also turn on \"Automatically delete head branches\" in the "
+              f"repository's Settings, General, Pull Requests, if you have not already: a "
+              f"pull request stacked on another lands on main by itself only when GitHub "
+              f"deletes the base branch as part of merging it.")
     if args.check and todo:
         return 1
     return 0

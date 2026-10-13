@@ -24,7 +24,7 @@ before you decide, and how many agents run at once. Out of the box it names noth
 merge. `agentctl kb merge`, the command the Library merges through, reads the policy and refuses
 anything it does not permit. A merge you start from Deck or Orient takes a separate path, through a
 merge check in the Library, and that check approves every merge it is asked about for now, as
-[Installing Builder](installing.md) says. [Customizing Builder](customizing.md#the-agent-policy)
+[What works and what does not yet](install-status.md) says. [Customizing Builder](customizing.md#the-agent-policy)
 shows how to change it.
 
 **`agents`** — The account the two-account install runs Builder as. The steward, every crew's
@@ -210,9 +210,10 @@ works through sessions of its own.
 passing. Signals are kept in the Archives, where each one can be looked up directly, and whether a
 kind of signal is also found by search is decided for that kind.
 
-**single-account install** — The install shape that runs Builder as your own account, for a machine
-where you have no administrator password, or for starting without GitHub. It creates no account and
-has no approver. Its agents reach GitHub as an App you create, and in the merge mode called
+**single-account install** — The install shape that runs Builder on the server as one account,
+your own, for a server where you have no administrator password, or for starting without GitHub.
+The shape counts only the server's accounts; Deck runs on your laptop as your account there. It
+creates no account and has no approver. Its agents reach GitHub as an App you create, and in the merge mode called
 Enforced, GitHub refuses to merge a pull request an agent opened until you approve it; in
 Instruction only, the agents'
 instructions hold that rule. [Connecting GitHub](connecting-github.md) sets it up.

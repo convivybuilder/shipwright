@@ -6,7 +6,8 @@ command = [
   "{deploy}/agent-platform/bin/knowledge-watcher",
 ]
 platforms = ["macos", "linux"]
-scope = "user"
+scope = "system"
+account = "agents"
 enabled-by-default = true
 working-directory = "{deploy}/agent-platform"
 

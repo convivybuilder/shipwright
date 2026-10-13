@@ -6,7 +6,8 @@ command = [
   "{deploy}/convivy-orient/github_capture.py",
 ]
 platforms = ["macos", "linux"]
-scope = "user"
+scope = "system"
+account = "agents"
 enabled-by-default = false
 working-directory = "{deploy}/convivy-orient"
 

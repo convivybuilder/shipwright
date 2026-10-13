@@ -35,6 +35,28 @@ has to run in the right order, holding two facts nobody wrote down:
   a job pointed at a missing area undoes the rule that a service serves only from
   its deploy area.
 
+**THE TWO-ACCOUNT SHAPE RUNS THREE STEPS AS `agents` AND SUPERVISION AS ROOT.**
+`place`, `link` and `register` run through `sudo -u agents -H`, so the deploy areas,
+the linked commands and the MCP registration are the backend account's. `supervise`
+runs root's own copy of `install-jobs`, from the commit `install-privileged` recorded,
+under the cleared environment `update-privileged` uses, and renders the declarations
+for `agents`. `provision` is left out: it installs packages, which needs an administrator
+this shape does not run as.
+
+`--migrate-from <operator home>` moves an existing single-account install into the
+`agents` account, and `--rollback-to <operator home>` reverses that from the record the
+migration wrote under the root-owned prefix. A real run is root's, and root runs only the
+copy `install-privileged` extracted and recorded, invoked by its absolute path:
+
+    sudo /opt/homebrew/bin/python3 -I /opt/builder/src/shipwright@<sha>/bin/stand-up-backend \
+        --shape two --migrate-from <operator home>
+
+Root refuses to start from any other copy, before it reads anything, unless that file, every
+directory above it and the `bin`, `tools` and `jobs` trees beside it belong to root with no
+group or other write bit. Both migration modes refuse before changing anything when the record
+already exists, a Builder job is loaded, a checkout has uncommitted work, or a product service
+names the root that is moving. Their steps are planned first, so `--dry-run` shows every one.
+
 **It calls them; it reimplements nothing.** They already refuse rather than
 half-installing, say what they did, and change nothing on a second run. This
 inherits those four properties by delegation, and must not become the fifth
@@ -103,7 +125,11 @@ Without it the jobs are on the machine and not running.
 
 **It writes no credentials of its own.** The Library's job declaration mints
 Orient's two and the work-queue tools' one, once each, and no installer
-copies or overwrites a credential. It provisions no chat webhooks, Slack's
+copies or overwrites a credential. The one exception is `bootstrap-library`,
+which runs after `supervise` and makes the operator the Library's first
+person: it is `bootstrap_library.py`, the Library's own one-time command,
+that mints the operator's administrator credential, once, and this never
+prints or logs the raw token. It provisions no chat webhooks, Slack's
 included, although `agent-platform/install.sh` lists them as a manual step:
 an installer that sets up a surface nobody reads is worse than one that omits
 it.
@@ -112,10 +138,14 @@ it.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import grp
 import json
 import os
 import pwd
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -124,12 +154,15 @@ from pathlib import Path
 PROG = "stand-up-backend"
 REPO = Path(__file__).resolve().parent.parent
 
+
 # `work_left_modes` NAMES THE MODES IN WHICH THAT TOOL'S `1` MEANS PENDING WORK
 # RATHER THAN A CRASH, and it is per-tool because the four disagree. Read off
 # each tool's own returns rather than assumed from the flag name, because
 # `--status` is where they diverge most:
 #
 #   provision-backend  `return 1 if (missing and args.check)`      (line 317)
+#   write-operator-config `--check` and `--status` both `1 if`
+#                      absent (268, 272)
 #   install-backend    `--check` 1 when stale (988); `--status`
 #                      returns `1 if missing` from status()        (866)
 #   register-mcp       `--check` 1 when unready (646); `--status`
@@ -142,6 +175,9 @@ REPO = Path(__file__).resolve().parent.parent
 #                      common case — when an activation command
 #                      failed, or when a job it activated is still
 #                      reported down afterwards                    (activation)
+#   bootstrap-library  `--check` and `--status` both `1 if` person_id is
+#                      absent (main); a real run has no non-crash `1` at
+#                      all — it either writes person_id or refuses
 #
 # Under `--dry-run` no tool reports pending work through its code at all, so a
 # `1` there is an uncaught exception in every case and the mode appears nowhere
@@ -153,6 +189,18 @@ STEPS = (
         "tool": "provision-backend",
         "why": "install what the platform lacks, verified by running each program",
         "modes": {"dry-run": "--dry-run", "check": "--check", "status": "--check"},
+        "work_left_modes": ("check", "status"),
+        "needs_311": False,
+    },
+    {
+        "name": "operator-config",
+        "tool": "write-operator-config",
+        "why": "write the operator identity file every backend service reads before it starts",
+        # **BEFORE `place` AND NOT AFTER.** `install-backend --seed-registry`
+        # seeds the Library's roster inside the deploy area it builds, and the
+        # roster loader `jobs/library.toml` runs at the Library's first start
+        # already reads `operator_marker` from this file.
+        "modes": {"dry-run": "--dry-run", "check": "--check", "status": "--status"},
         "work_left_modes": ("check", "status"),
         "needs_311": False,
     },
@@ -201,6 +249,18 @@ STEPS = (
         "work_left_modes": ("check", None),
         "needs_311": True,
     },
+    {
+        "name": "library-person",
+        "tool": "bootstrap-library",
+        "why": "make the operator the Library's first person, once",
+        # **AFTER `supervise` AND NOT BEFORE IT.** `jobs/library.toml`'s own
+        # `prepare` commands run `alembic upgrade head`, which is what creates
+        # `bootstrap_record` — the table this reads and writes. Nothing before
+        # `supervise` has run that migration.
+        "modes": {"dry-run": "--dry-run", "check": "--check", "status": "--status"},
+        "work_left_modes": ("check", "status"),
+        "needs_311": True,
+    },
 )
 
 
@@ -217,6 +277,29 @@ SHAPES = {
 TWO_ACCOUNT_USERS = ("agents", "reviewers")
 PRIVILEGED_INSTALLER = Path("bin", "install-privileged")
 
+# THE BACKEND'S ACCOUNT, AND THE ROOT-OWNED TREE THE PRIVILEGED HALF INSTALLS.
+# `sudo -u agents -H` is how the steps run as it: `-H` makes its home the HOME
+# the steps see. The root half is read from the record install-privileged
+# writes, `name sha` per line, and runs from its own extraction under
+# PRIVILEGED_PREFIX, never from the agents checkout (step 3's rule).
+AGENTS = "agents"
+SUDO = "/usr/bin/sudo"
+AS_AGENTS = [SUDO, "-u", AGENTS, "-H"]
+# BY ABSOLUTE PATH wherever root runs them, as SSH_KEYGEN is: a bare name resolves through PATH,
+# and an earlier PATH directory the operator or agents can write would supply the program root runs.
+GIT = "/usr/bin/git"
+LAUNCHCTL = "/bin/launchctl"
+PRIVILEGED_PREFIX = Path("/opt/builder")
+INSTALLED_RECORD = PRIVILEGED_PREFIX / "src" / "installed"
+# The cleared environment update-privileged runs root's tools under, so no
+# variable the operator exported reaches a process that runs as root.
+CLEAN_ENV = ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "HOME=/var/root"]
+# The same interpreters update-privileged names. The Homebrew one is the
+# operator's, which step 2 accepts in the design: root runs it, and `agents`
+# is in neither `admin` nor `staff`, so `agents` cannot change it.
+ROOT_INTERPRETERS = {"darwin": "/opt/homebrew/bin/python3", "linux": "/usr/bin/python3"}
+SHA = re.compile(r"[0-9a-f]{40}")
+
 
 def _account_exists(name: str) -> bool:
     try:
@@ -226,7 +309,94 @@ def _account_exists(name: str) -> bool:
     return True
 
 
-def two_shape_lacks(repo: Path = REPO, exists=_account_exists) -> list[str]:
+def installed_sha(record_text: str | None, name: str) -> str | None:
+    """The commit install-privileged recorded for `name`, or None.
+
+    The record is what root reads to find its own tree, so only a full 40-hex
+    SHA on a line naming exactly `name` counts. Anything else is no answer.
+    """
+    if record_text is None:
+        return None
+    for line in record_text.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0] == name and SHA.fullmatch(fields[1]):
+            return fields[1]
+    return None
+
+
+def _read_record(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+# --- the copy root runs --------------------------------------------------------
+
+RUNNING_COPY = re.compile(r"^(?P<prefix>.*)/src/shipwright@[0-9a-f]{40}/bin/stand-up-backend$")
+# The trees whose files root imports or executes, beside the script.
+ROOT_OWNED_TREES = ("bin", "tools", "jobs")
+# Root's files belong to uid 0, and every component above a root-run file is checked up to `/`.
+ROOT_UID = 0
+ROOT_TOP = Path("/")
+
+
+def _owned_by(path: Path, owner: int) -> str | None:
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return f"{path} is missing"
+    if stat.S_ISLNK(st.st_mode) or st.st_uid != owner or st.st_mode & 0o022:
+        return f"{path} is not owned by uid {owner} alone, or another account can write it"
+    return None
+
+
+def tree_problem(script: Path, owner: int, top: Path) -> str | None:
+    """Why root must not run `script` and the trees beside it, or None when it may.
+
+    **ROOT RUNS ONLY FILES THAT AN ACCOUNT RUNNING AGENT SESSIONS CANNOT CHANGE.** Every component
+    from `script` up to `top` must belong to `owner` with no group or other write bit and must not
+    be a symlink. So must everything under the `bin`, `tools` and `jobs` trees beside `script`.
+    """
+    for part in [script, *script.parents]:
+        if part == top or top in part.parents:
+            problem = _owned_by(part, owner)
+            if problem:
+                return problem
+    tree = script.parent.parent
+    for name in ROOT_OWNED_TREES:
+        base = tree / name
+        problem = _owned_by(base, owner)
+        if problem:
+            return problem
+        # A directory that cannot be listed is not skipped: os.walk would drop it and its entries unchecked.
+        unlistable: list[OSError] = []
+        for dirpath, dirs, files in os.walk(base, onerror=unlistable.append):
+            for entry in [*dirs, *files]:
+                problem = _owned_by(Path(dirpath, entry), owner)
+                if problem:
+                    return problem
+        if unlistable:
+            return (f"{unlistable[0].filename} cannot be listed, so its entries cannot be checked "
+                    f"({unlistable[0].strerror})")
+    return None
+
+
+def root_copy_problem(script: str, owner: int = 0, *, prefix: Path = PRIVILEGED_PREFIX,
+                      top: Path = Path("/")) -> str | None:
+    """Why root must not run `script`, or None when it may.
+
+    **ROOT RUNS ONLY THE COPY install-privileged EXTRACTED.** `REPO` is computed from the same file,
+    so every import root makes comes from the tree `tree_problem` checks.
+    """
+    match = RUNNING_COPY.match(script)
+    if match is None or match.group("prefix") != str(prefix):
+        return f"the file is not at {prefix}/src/shipwright@<sha>/bin/stand-up-backend"
+    return tree_problem(Path(script), owner, top)
+
+
+def two_shape_lacks(repo: Path = REPO, exists=_account_exists,
+                    record: Path = INSTALLED_RECORD) -> list[str]:
     """What the two-account shape needs and this machine lacks, one line each.
 
     **THE ACCOUNTS ARE ASKED OF THE DIRECTORY, NOT OF `provision-accounts
@@ -234,7 +404,9 @@ def two_shape_lacks(repo: Path = REPO, exists=_account_exists) -> list[str]:
     as the operator. Whether an account that exists has the right shape is
     `provision-accounts`' question, which the refusal tells the operator to
     ask. The privileged half's installer is looked for in this release, which
-    is where a release that cannot install it says so.
+    is where a release that cannot install it says so. The privileged half
+    itself is looked for in the record install-privileged writes, since the
+    steps this runs cannot work without the launcher it installs.
     """
     lacks = [
         f"the `{name}` account, which `sudo bin/provision-accounts` creates"
@@ -244,6 +416,11 @@ def two_shape_lacks(repo: Path = REPO, exists=_account_exists) -> list[str]:
         lacks.append(
             f"the privileged half: this release has no `{PRIVILEGED_INSTALLER}` "
             f"to install it with")
+    if installed_sha(_read_record(record), "shipwright") is None:
+        lacks.append(
+            f"the privileged half is not installed: {record} names no shipwright "
+            f"commit. Run `sudo bin/install-privileged` as the steps in the "
+            f"installer plan say")
     return lacks
 
 
@@ -290,9 +467,11 @@ def enable_linger(user: str, run=subprocess.run) -> str | None:
 
 
 def _has_tomllib(interpreter: str) -> bool:
+    # `-I` FOR EVERY PROBE: `-c` puts the current directory first on sys.path, so a `tomllib.py`
+    # planted there would run as root. Isolated mode drops the cwd and PYTHON* from sys.path.
     try:
         return subprocess.run(
-            [interpreter, "-c", "import tomllib"],
+            [interpreter, "-I", "-c", "import tomllib"],
             capture_output=True, timeout=60, check=False,
         ).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
@@ -300,13 +479,26 @@ def _has_tomllib(interpreter: str) -> bool:
 
 
 def best_interpreter() -> str | None:
-    """An interpreter with `tomllib`, or None — never a refusal from in here.
+    """An interpreter with `tomllib`, or None — never a refusal from in here, except under root.
 
     Returning None rather than raising is what lets a REPORTING mode say which
     step cannot run and still print the other three. Raising from inside the
     step loop threw the whole report away on the one machine the docstring is
     about: a fresh 22.04 box, first `--dry-run`, before `python3.11` exists.
+
+    **ROOT NAMES NO INTERPRETER IT WAS NOT GIVEN.** Its own interpreter is the one the
+    sudo command named by absolute path, and PATH is never searched: an earlier PATH
+    directory an agent can write would supply the program root runs. Root refuses,
+    naming what it needed, rather than returning None.
     """
+    if os.geteuid() == 0:
+        if os.path.isabs(sys.executable) and _has_tomllib(sys.executable):
+            return sys.executable
+        raise Refused(
+            f"root has no Python 3.11 or later at the absolute path it was started from "
+            f"({sys.executable}), and it never searches PATH for one. Run the installed copy under "
+            f"such an interpreter, named by its absolute path, as the usage in this file shows. "
+            f"Nothing was changed.")
     if _has_tomllib(sys.executable):
         return sys.executable
     for name in ("python3.11", "python3.12", "python3.13", "python3.14"):
@@ -350,6 +542,48 @@ def supervision_skipped(args) -> bool:
     return not (directory.is_dir() and any(directory.glob("*.toml")))
 
 
+def resolve_operator_name(explicit: str | None, best: str | None) -> tuple[str, str]:
+    """`(name, source)`, resolved by running `bin/bootstrap-library
+    --print-operator-name` as a subprocess, in THIS process's own context —
+    the operator's, never through `AS_AGENTS`.
+
+    **ONLY FOR `--shape two`.** Its `library-person` step runs as `agents`
+    (`runs_as`), and `bootstrap-library`'s own fallback chain, run from
+    there, would read `agents`' git config and account name rather than the
+    operator's. Resolving it here, before the step drops to `agents`, and
+    always passing the result as `--operator-name`, is what keeps the
+    Library's first administrator named after the person installing it.
+    `bin/bootstrap-library` is the one place the chain itself is defined;
+    this never duplicates it.
+
+    **RUN UNDER THE SAME 3.11 INTERPRETER THE `needs_311` STEPS USE**,
+    refusing with the same message when none is found: `bootstrap-library`
+    cannot even be imported under an older one, since it reads
+    `jobs/library.toml`, which needs `tomllib`. `--print-operator-name`
+    resolves the name and exits before anything that needs `--root` or the
+    jobs directory — no database, no operator config file.
+    """
+    interpreter = interpreter_for({"needs_311": True}, best)
+    argv = [interpreter, str(REPO / "bin" / "bootstrap-library"), "--print-operator-name"]
+    if explicit is not None:
+        argv += ["--operator-name", explicit]
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Refused(
+            f"could not resolve the operator name: {exc}. Nothing was installed.") from exc
+    if done.returncode != 0:
+        raise Refused(
+            f"bootstrap-library --print-operator-name failed: "
+            f"{(done.stderr or '').strip()}. Nothing was installed.")
+    lines = done.stdout.splitlines()
+    if len(lines) != 2:
+        raise Refused(
+            f"bootstrap-library --print-operator-name printed "
+            f"{len(lines)} line(s), expected 2: {done.stdout!r}. Nothing was installed.")
+    return lines[0], lines[1]
+
+
 def argv_for(step: dict, args, mode: str | None, best: str | None) -> list[str]:
     """The exact command line for one step, from what that tool accepts.
 
@@ -366,7 +600,7 @@ def argv_for(step: dict, args, mode: str | None, best: str | None) -> list[str]:
         # The single-account shape has no administrator: name what is missing
         # and how to install it, never sudo.
         argv.append("--no-install")
-    if step["name"] in ("place", "register") and args.deploy is not None:
+    if step["name"] in ("place", "register", "library-person") and args.deploy is not None:
         argv += ["--deploy", str(args.deploy)]
     if step["name"] == "place" and best is not None:
         # `--python` defaults to whatever invoked the tool. On 22.04 that is
@@ -377,11 +611,140 @@ def argv_for(step: dict, args, mode: str | None, best: str | None) -> list[str]:
         argv += ["--seed-registry"]
     if step["name"] == "supervise":
         argv += ["--jobs", str(declarations_dir(args))]
+        if args.shape == "single":
+            # The declarations name `agents` for the two-account shape; the operator runs them here.
+            argv += ["--single-account"]
         if args.deploy is not None:
             argv += ["--deploy", str(args.deploy)]
         if args.activate:
             argv += ["--activate"]
+    if step["name"] == "library-person":
+        argv += ["--jobs", str(declarations_dir(args))]
+        if args.shape == "two":
+            # `--shape single` runs this step as the operator, and
+            # `bootstrap-library` resolves the name for itself there,
+            # exactly as on main. `--shape two` runs it as `agents`, so the
+            # name is resolved here instead, as a subprocess in this
+            # process's own context, and always passed through.
+            name, source = resolve_operator_name(args.operator_name, best)
+            print(f"{PROG}: library-person's operator name: {name!r} (from {source})")
+            argv += ["--operator-name", name]
+        elif args.operator_name is not None:
+            argv += ["--operator-name", args.operator_name]
     return argv
+
+
+def steps_for(shape: str) -> tuple:
+    """The steps this shape runs, in order.
+
+    **THE TWO-ACCOUNT SHAPE LEAVES OUT `provision`.** That step installs
+    packages, which needs an administrator, and this shape runs as `agents`
+    and as root, never as the operator. Whether the interpreter exists is what
+    `place` refuses on, and `place` says which command installs it.
+    """
+    if shape == "two":
+        return tuple(step for step in STEPS if step["name"] != "provision")
+    return STEPS
+
+
+def runs_as(step: dict, shape: str) -> str:
+    """Who runs one step: the operator, `agents`, or root's own copy.
+
+    In the single-account shape everything is the operator's. In the two-account
+    shape the backend's steps are `agents`', and supervision is root's, because a
+    system-scope job is installed by root whatever account it runs as.
+    """
+    if shape == "single":
+        return "operator"
+    return "root" if step["name"] == "supervise" else "agents"
+
+
+def agents_home() -> str:
+    """The home the directory service reports for `agents`, never a literal."""
+    try:
+        return pwd.getpwnam(AGENTS).pw_dir
+    except KeyError:
+        raise Refused(f"the `{AGENTS}` account does not exist. Run "
+                      f"`sudo bin/provision-accounts`. Nothing was installed.")
+
+
+def agents_builder_root(home: str, run=None) -> str:
+    """The Builder root `agents` runs with, read by `agents` from its own linked command.
+
+    **ROOT DOES NOT ASK `builder-root`.** That command is asked only by the
+    account that runs it, for the reason install-jobs gives: a run as root never
+    executes a program another account could have placed. So `agents` answers,
+    and root is handed the answer as `--root`.
+    """
+    run = run or _run_quiet
+    link = f"{home}/.local/bin/builder-root"
+    code, out = run([*AS_AGENTS, link])
+    root = out.strip()
+    if code != 0 or not os.path.isabs(root) or "\n" in root:
+        raise Refused(
+            f"could not read the Builder root from `{link}` as `{AGENTS}`. The "
+            f"link step places that command, so it has to run first. Nothing was "
+            f"installed for supervision.")
+    return root
+
+
+def root_supervise(args, mode: str | None, run=None) -> tuple[list[str], list[str]]:
+    """The root-run supervision command, and the arguments a person reads for it.
+
+    **ROOT RUNS ITS OWN COPY, FROM THE COMMIT STEP 3 INSTALLED, UNDER THE CLEARED
+    ENVIRONMENT update-privileged uses.** The tree is found through the record
+    install-privileged writes, so this never reads the agents checkout that
+    invoked it. `--home` and `--root` name `agents`' home and root, because the
+    job declarations are rendered for that account, and `--jobs` names the
+    declarations in the same tree the code runs from.
+
+    **THAT TREE IS CHECKED AS THE RUNNING COPY IS, BEFORE ROOT RUNS ANYTHING IN IT.** The record names
+    a commit that can differ from the copy the operator typed, so the running copy's check does not
+    cover it.
+    """
+    sha = installed_sha(_read_record(INSTALLED_RECORD), "shipwright")
+    if sha is None:
+        raise Refused(f"{INSTALLED_RECORD} names no shipwright commit, so root has no "
+                      f"copy to supervise from. Nothing was installed.")
+    tree = PRIVILEGED_PREFIX / "src" / f"shipwright@{sha}"
+    tool = tree / "bin" / "install-jobs"
+    if not tool.is_file():
+        raise Refused(f"{tool} is missing, so root has no copy of install-jobs to run. "
+                      f"Re-run install-privileged. Nothing was installed.")
+    problem = tree_problem(tool, ROOT_UID, ROOT_TOP)
+    if problem:
+        raise Refused(f"{tool} is not a copy root may run: {problem}. Re-run install-privileged. "
+                      f"Nothing was installed.")
+    home = agents_home()
+    # THE LOGS OF THE ACCOUNT'S JOBS GO UNDER THE ROOT-OWNED PREFIX, not the account's home, so root never
+    # opens a log path the account can re-point (see install-jobs' `resolve`).
+    flags = ["--home", home, "--root", agents_builder_root(home, run),
+             "--jobs", str(tree / "jobs"), "--log-dir", str(PRIVILEGED_PREFIX / "var" / "log")]
+    if args.deploy is not None:
+        flags += ["--deploy", str(args.deploy)]
+    if mode is not None:
+        flags.append({"dry-run": "--dry-run", "check": "--check", "status": "--status"}[mode])
+    if args.activate:
+        flags.append("--activate")
+    interpreter = ROOT_INTERPRETERS["darwin" if sys.platform == "darwin" else "linux"]
+    shown = [str(tool), *flags]
+    return [SUDO, *CLEAN_ENV, interpreter, "-I", "-u", *shown], shown
+
+
+def launch(step: dict, args, mode: str | None, best: str | None, run=None) -> tuple[list[str], list[str]]:
+    """The full command for one step, and the part of it a person reads.
+
+    **THE PREFIX IS THE ONLY DIFFERENCE BETWEEN THE SHAPES' STEPS.** `argv_for`
+    builds the tool's own command line, which tests read, and this adds the
+    account it runs as in front of it. Supervision in the two-account shape is
+    not a prefix on the agents' command, since it runs root's copy instead.
+    """
+    who = runs_as(step, args.shape)
+    if who == "root":
+        return root_supervise(args, mode, run)
+    argv = argv_for(step, args, mode, best)
+    prefix = AS_AGENTS if who == "agents" else []
+    return [*prefix, argv[0], "-u", *argv[1:]], argv[1:]
 
 
 def run_step(step: dict, args, mode: str | None, best: str | None) -> dict:
@@ -398,14 +761,14 @@ def run_step(step: dict, args, mode: str | None, best: str | None) -> dict:
     tell a refusal from a report.
     """
     try:
-        argv = argv_for(step, args, mode, best)
+        full, shown = launch(step, args, mode, best)
     except Refused as exc:
         # NOT raised out of the loop. A reporting mode must still show the
         # other steps; a real run stops on it like any other refusal.
         return {"step": step, "argv": None, "code": 2, "stdout": "",
                 "stderr": str(exc), "unrunnable": True}
 
-    print(f"→ {step['name']}: {' '.join(argv[1:])}")
+    print(f"→ {step['name']}: {' '.join(shown)}")
     lines: list[str] = []
     # STDERR GOES TO A FILE, NOT A SECOND PIPE. Draining stdout to exhaustion
     # and only then reading a stderr PIPE deadlocks: a step that fills the
@@ -420,8 +783,7 @@ def run_step(step: dict, args, mode: str | None, best: str | None) -> dict:
         # exists to cover. Measured: print, sleep 3, print delivers both lines
         # at 3.0s without it and the first at 0.0s with it.
         child = subprocess.Popen(
-            [argv[0], "-u", *argv[1:]], stdout=subprocess.PIPE, stderr=errors,
-            text=True,
+            full, stdout=subprocess.PIPE, stderr=errors, text=True,
         )
         assert child.stdout is not None
         for line in child.stdout:
@@ -439,7 +801,7 @@ def run_step(step: dict, args, mode: str | None, best: str | None) -> dict:
     print()
     return {
         "step": step,
-        "argv": argv,
+        "argv": shown,
         "code": child.returncode,
         "stdout": "".join(lines),
         "stderr": stderr,
@@ -502,6 +864,7 @@ def blocks_from(results: list[dict]) -> list[tuple[str, str]]:
 
 def report(results: list[dict], args, stopped: dict | None, best: str | None,
            mode: str | None) -> None:
+    total = len(steps_for(args.shape))
     print(f"{PROG}: {'macos' if sys.platform == 'darwin' else 'linux'}")
     if best is not None and best != sys.executable:
         did = "would use" if mode is not None else "used"
@@ -512,6 +875,8 @@ def report(results: list[dict], args, stopped: dict | None, best: str | None,
     if supervision_skipped(args):
         print(f"  {'not built':<12} {'supervise':<10} "
               f"this repository ships no job declarations — see below")
+        print(f"  {'not built':<12} {'library-person':<10} "
+              f"no job declarations means no Library job to find a database in")
     print()
 
     # EVERY refusal's reason, not only the one that stopped the chain. In a
@@ -537,14 +902,14 @@ def report(results: list[dict], args, stopped: dict | None, best: str | None,
         # INSTALLED, so an all-zero --status still does not mean settled.
         # Saying "reported success" in either mode contradicts the lines above.
         if mode in ("dry-run", "status"):
-            print(f"every step ran ({len(results)} of {len(STEPS)}); these modes "
+            print(f"every step ran ({len(results)} of {total}); these modes "
                   f"exit 0 whatever is pending — read the report, not the code")
         else:
-            print(f"every step reported success ({len(results)} of {len(STEPS)} ran)")
+            print(f"every step reported success ({len(results)} of {total} ran)")
     else:
         left = [r["step"]["name"] for r in results if r["code"] != 0]
         if supervision_skipped(args):
-            left.append("supervise")
+            left += ["supervise", "library-person"]
         print(f"work left in: {', '.join(left)}")
 
 
@@ -738,7 +1103,1725 @@ def closing_pairing(euid: int, user: str, shape: str, lines=pairing_lines) -> li
     return lines(user)
 
 
+# --- the migration: --migrate-from and --rollback-to --------------------------
+#
+# **THE MIGRATION IS PLANNED FIRST, THEN RUN, AND RECORDED AS IT RUNS.** The plan
+# reads the operator's files and lists every move, copy, rewrite and ownership
+# change before anything changes, so the refusals and the dry run describe what
+# would really happen. Each path a step is about to change is recorded as a source
+# and a destination BEFORE the step runs, so a run that stops half way has written
+# down every place it may have touched. Rollback reverses those pairs in reverse
+# order, and derives each reversal from the pair and from what is on disk. Nothing
+# is reversed from memory, and no operation or command is stored.
+#
+# **EVERY FILE CHANGE IS MADE IN PYTHON AS ROOT, THROUGH DIRECTORY HANDLES.** The
+# `agents` account writes all of its own home, so any destination in it can be made
+# a symlink before root arrives. Each component from a home down is opened with
+# O_NOFOLLOW from the descriptor of the one above it, and each entry root creates is
+# opened and handed to its owner through that descriptor. No shell command makes a
+# file change: `mv`, `cp`, `tee` and `chown -R` each resolve their path again, and a
+# symlink swapped in between would be followed as root.
+#
+# **THE RECORD IS ROOT'S.** It sits under the root-owned prefix, and rollback reads it
+# only when it and every directory down to it are owned by root with no group or other
+# write bit. `agents` cannot change what rollback will reverse.
+
+RECORD = PRIVILEGED_PREFIX / "var" / "migration.json"
+# What moves whole, from the operator's home into `agents`' home. The Builder root is
+# not in this list: it is found with the operator's own `builder-root` and moves to the
+# same place relative to the `agents` home.
+MOVED = (".library", ".orient-control")
+# What is copied rather than moved, because the operator keeps a working copy.
+COPIED = (".config/convivy",)
+# The root pin the session agent reads, inside the copied config directory. It is
+# written after the copy, so the copy leaves it out and the rewrite creates it.
+PIN_PATH = (".config", "convivy", "session-agent.env")
+# Never copied: the operator's own person token. The design keeps it on the operator's
+# side, and the copy excludes it by name.
+KEPT_OUT_OF_COPY = ("kb-person.json",)
+# The part of the operator's Claude setup the backend's Claude needs. Session history
+# under `projects/` is not copied: it is keyed on the old paths.
+CLAUDE_ITEMS = ("settings.json", "CLAUDE.md", "settings.local.json", "skills", "commands", "plugins")
+# The launchd property lists the agent-platform checkout ships. Those labels are the
+# Builder jobs an install puts on the operator's account, and the migration refuses
+# while any of them is loaded.
+AGENT_PLATFORM_LAUNCHD = ("agent-platform", "launchd")
+# Where a product service can name a path: a property list, or a sudoers fragment. Any
+# one of them naming the old root keeps the path in use by something Builder does not own.
+SERVICE_DIRECTORIES = (
+    (Path("/Library/LaunchAgents"), "*.plist"),
+    (Path("/Library/LaunchDaemons"), "*.plist"),
+    (Path("/etc/sudoers.d"), "*"),
+)
+REMOTE_PREFIX = "git@github.com:"
+HTTPS_PREFIX = "https://github.com/"
+DIR_OPEN = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+FILE_OPEN = os.O_RDONLY | os.O_NOFOLLOW
+NEW_FILE = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+# A new file that is handed over is created readable as well. macOS reopens `/dev/fd/N` with the descriptor's
+# own access mode, so the ACL clear, which names the descriptor by that path, cannot open a write-only one.
+NEW_FILE_RW = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+
+
+def _walk_owned(home: str, parts: list[str], uid: int) -> int:
+    """A descriptor for `home/parts`, each directory opened without following a symlink and owned by `uid`."""
+    handle = os.open(home, DIR_OPEN)
+    try:
+        if os.fstat(handle).st_uid != uid:
+            raise Refused(f"refusing {home}: it is not owned by uid {uid}. Nothing was changed.")
+        for name in parts:
+            child = _child(handle, name, home)
+            os.close(handle)
+            handle = child
+            if os.fstat(handle).st_uid != uid:
+                raise Refused(f"refusing {home}/{name}: it is not owned by uid {uid}. Nothing was changed.")
+        return handle
+    except BaseException:
+        os.close(handle)
+        raise
+
+
+def read_owned(home: str, path: str, uid: int) -> str | None:
+    """The text of the regular file at `path` under `home`, read as data, or None when it is missing.
+
+    **THIS READS, IT NEVER EXECUTES.** Every directory from `home` down and the file itself are
+    opened without following a symlink, and each must belong to `uid`, so a path the operator
+    owns is read only while the operator owns it. A path outside `home` is refused.
+    """
+    if ".." in path.split("/") or not os.path.normpath(path).startswith(home + os.sep):
+        raise Refused(f"refusing {path}: it is not under {home}. Nothing was changed.")
+    parts = os.path.relpath(path, home).split(os.sep)
+    try:
+        dir_fd = _walk_owned(home, parts[:-1], uid)
+    except FileNotFoundError:
+        return None
+    try:
+        fd = os.open(parts[-1], FILE_OPEN | os.O_NONBLOCK, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise Refused(f"refusing {path}: a symlink is in the way ({exc.strerror}). Nothing was changed.") from exc
+    finally:
+        os.close(dir_fd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != uid:
+            raise Refused(f"refusing {path}: it is not a regular file owned by uid {uid}. Nothing was changed.")
+        with os.fdopen(fd, "r", encoding="utf-8", closefd=False) as stream:
+            return stream.read()
+    finally:
+        os.close(fd)
+
+
+def operator_root(op: str, uid: int | None = None) -> str:
+    """The Builder root the operator's settings name, read as data and confirmed by the root's own marker.
+
+    **ROOT READS THE ROOT AND NEVER RUNS `builder-root`.** The resolver takes the root from
+    `CREWS_ROOT` in the session-agent settings, the pinned file the migration rewrites, and
+    refuses a root whose `.builder-root` names another path. This reads the same two lines, with
+    every path component owned by the operator and opened without following a symlink. The root
+    has no fixed name, so one outside the operator's home has no destination and is refused.
+    """
+    uid = os.lstat(op).st_uid if uid is None else uid
+    settings = read_owned(op, os.path.join(op, *PIN_PATH), uid) or ""
+    value = next((m.group(1) for m in (re.match(r"^\s*CREWS_ROOT\s*=\s*(.*?)\s*$", line)
+                                       for line in settings.splitlines()) if m), None)
+    if value is None or not os.path.isabs(value) or "\n" in value:
+        raise Refused(f"the operator's settings at {os.path.join(op, *PIN_PATH)} name no absolute "
+                      f"CREWS_ROOT, so there is no Builder root to move. Nothing was changed.")
+    if os.path.commonpath([op, value]) != op or value == op:
+        raise Refused(f"the Builder root {value} is not inside the operator's home {op}, so the "
+                      f"migration has no place to move it to. Nothing was changed.")
+    marker = read_owned(op, os.path.join(value, ".builder-root"), uid)
+    if marker is None or marker.splitlines()[:1] != [value]:
+        raise Refused(f"the Builder root {value} does not name itself in its marker, so the resolver "
+                      f"would not trust it either. Nothing was changed.")
+    return value
+
+
+def operator_drop(op: str) -> dict:
+    """Keyword arguments that run a child as the operator, dropped, when this process is root. Empty otherwise.
+
+    **GIT READS THE OPERATOR'S CHECKOUTS AND THE OPERATOR'S CONFIGURATION, SO IT RUNS AS THE
+    OPERATOR THAT OWNS THEM,** with the operator's own groups and an environment whose home is the
+    operator's, never root's. Dropped before the program starts, so nothing in it is ever root's.
+    """
+    if os.geteuid() != 0:
+        return {}
+    ident = operator_identity(op)
+    groups = os.getgrouplist(ident["account"], ident["gid"])
+    return {"user": ident["uid"], "group": ident["gid"], "extra_groups": groups,
+            "env": {"PATH": "/usr/bin:/bin", "HOME": op, "LC_ALL": "C"}}
+
+
+def _operator_git(op: str, argv: list[str], drop: dict, timeout: int = 30):
+    """Run one git command for a checkout, dropped to the operator when root runs it, or refused by name."""
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=timeout, **drop)
+    except OSError as exc:
+        raise Refused(f"could not run git for the checkouts under {op} as the operator who owns them "
+                      f"({exc.strerror}). Nothing was changed.") from exc
+
+
+def git_remotes(root: str, op: str) -> dict[str, str]:
+    """Each checkout under `root` whose `origin` is ssh, and that URL. Read as the operator, before anything moves."""
+    found = {}
+    drop = operator_drop(op)
+    for child in sorted(Path(root).iterdir()) if Path(root).is_dir() else []:
+        if not (child / ".git").exists():
+            continue
+        done = _operator_git(op, [GIT, "-C", str(child), "remote", "get-url", "origin"], drop)
+        url = done.stdout.strip()
+        if done.returncode == 0 and url.startswith(REMOTE_PREFIX):
+            found[child.name] = url
+    return found
+
+
+def https_of(ssh_url: str) -> str:
+    """The https form of an ssh GitHub URL, which keeps its organisation and repository."""
+    return HTTPS_PREFIX + ssh_url[len(REMOTE_PREFIX):].removesuffix(".git")
+
+
+def operator_identity(op: str) -> dict:
+    """The operator's account and primary group, from the directory service.
+
+    **THE ACCOUNT IS THE OWNER OF ITS HOME.** The home was made for the operator, so the
+    owner of the operator's home is the operator, and its primary group is read from the
+    directory service rather than inferred from the home's name.
+    """
+    entry = pwd.getpwuid(os.lstat(op).st_uid)
+    return {"account": entry.pw_name, "group": grp.getgrgid(entry.pw_gid).gr_name,
+            "uid": entry.pw_uid, "gid": entry.pw_gid}
+
+
+def agents_ids() -> tuple[int, int]:
+    try:
+        entry = pwd.getpwnam(AGENTS)
+    except KeyError:
+        raise Refused(f"the `{AGENTS}` account does not exist. Run "
+                      f"`sudo bin/provision-accounts`. Nothing was changed.")
+    return entry.pw_uid, entry.pw_gid
+
+
+def plan_migration(op: str, ag: str, *, root: str, labels=(), read=None,
+                   exists=os.path.lexists, remotes=None) -> list[dict]:
+    """Every change the migration makes, in order. Nothing here changes a file.
+
+    `op` is the operator's home and `ag` is `agents`' home, both as the directory
+    service reports them, and `root` is the operator's Builder root under `op`.
+    The root lands at the same place relative to `ag`. Files are read as data, owned
+    by the operator, and checkouts are listed as the operator.
+    """
+    read = read or (lambda path: read_owned(op, path, os.lstat(op).st_uid))
+    remotes = remotes or (lambda path: git_remotes(path, op))
+    op_root = root
+    ag_root = os.path.join(ag, os.path.relpath(root, op))
+    body: list[dict] = []
+    for name in MOVED:
+        if exists(f"{op}/{name}"):
+            body.append({"op": "move", "src": f"{op}/{name}", "dst": f"{ag}/{name}"})
+            body.append({"op": "own", "path": f"{ag}/{name}"})
+    # `root` marks the old root's own move: rollback expects a link at its source, not nothing.
+    body.append({"op": "move", "src": op_root, "dst": ag_root, "root": True})
+    # The operator's old root becomes a link to the moved one. It changes no permission:
+    # the moved tree is writable by `agents` at its real path too.
+    body.append({"op": "symlink", "target": ag_root, "link": op_root})
+    body.append({"op": "own", "path": ag_root})
+    # The marker the indexer compares. It is inside the moved root, so it is rewritten there.
+    marker = read(f"{op_root}/.builder-root")
+    if marker is not None:
+        body.append({"op": "rewrite", "path": f"{ag_root}/.builder-root",
+                     "text": marker.replace(op_root, ag_root)})
+    if exists(f"{op}/{COPIED[0]}"):
+        body.append({"op": "copy", "src": f"{op}/{COPIED[0]}", "dst": f"{ag}/{COPIED[0]}",
+                     "exclude": [*KEPT_OUT_OF_COPY, PIN_PATH[-1]]})
+    pin = read(os.path.join(op, *PIN_PATH))
+    if pin is not None:
+        body.append({"op": "write", "src": os.path.join(op, *PIN_PATH),
+                     "dst": os.path.join(ag, *PIN_PATH),
+                     "text": pin.replace(f"CREWS_ROOT={op_root}", f"CREWS_ROOT={ag_root}")})
+    for item in CLAUDE_ITEMS:
+        if not exists(f"{op}/.claude/{item}"):
+            continue
+        if item == "settings.json":
+            # Hook and skill paths in the settings name the old home, so the copy is rewritten.
+            original = read(f"{op}/.claude/{item}") or ""
+            body.append({"op": "write", "src": f"{op}/.claude/{item}",
+                         "dst": f"{ag}/.claude/{item}", "text": original.replace(op, ag)})
+        else:
+            body.append({"op": "copy", "src": f"{op}/.claude/{item}",
+                         "dst": f"{ag}/.claude/{item}", "exclude": []})
+    # The operator's claude.json names the old home in its MCP entries and project trust.
+    if exists(f"{op}/.claude.json"):
+        text = read(f"{op}/.claude.json") or ""
+        body.append({"op": "write", "src": f"{op}/.claude.json", "dst": f"{ag}/.claude.json",
+                     "text": text.replace(op, ag)})
+    for repo, url in sorted(remotes(op_root).items()):
+        body.append({"op": "remote", "repo": f"{ag_root}/{repo}",
+                     "before": url, "after": https_of(url)})
+    body.append({"op": "daemons", "labels": list(labels)})
+    # Containers the migration makes in `agents`' home, outermost first, each one before
+    # anything inside it. Only the ones that do not exist yet are made, and each is recorded.
+    # A directory another step creates is not a container: the copy of `.config/convivy` makes
+    # it, and the rewrite of the pin inside it only writes into it.
+    made = {e["dst"] for e in body if e["op"] in ("move", "copy")}
+    containers: list[str] = []
+    for entry in body:
+        if "dst" not in entry:
+            continue
+        parts = os.path.relpath(entry["dst"], ag).split(os.sep)[:-1]
+        for depth in range(1, len(parts) + 1):
+            path = os.path.join(ag, *parts[:depth])
+            if not exists(path) and path not in containers and path not in made:
+                containers.append(path)
+    return [{"op": "mkdir", "path": path} for path in containers] + body
+
+
+def acl_clear_argv(fd: int) -> list[str]:
+    """The command that removes every extended ACL entry from the file `fd` holds.
+
+    The command names the descriptor, not a path, so it acts on the inode the caller checked.
+    `-h` on macOS keeps the command from following a link; the descriptor is never a link.
+    """
+    if sys.platform == "darwin":
+        return ["/bin/chmod", "-h", "-N", f"/dev/fd/{fd}"]
+    return ["/usr/bin/setfacl", "-b", f"/proc/self/fd/{fd}"]
+
+
+class RootFiles:
+    """Owner and ACL changes made as root, each on an open descriptor the caller has checked.
+
+    `owners` maps a role (`operator`, `agents` or `root`) to the (uid, gid) that role's files belong to.
+    `run` runs the one command this class needs, which is the ACL clear; the suite injects a fake.
+    """
+
+    def __init__(self, owners: dict, run=subprocess.run):
+        self.owners = owners
+        self.run = run
+
+    def fchown(self, fd: int, who: str, label: str = "") -> None:
+        os.fchown(fd, *self.owners[who])
+
+    def clear_acl(self, fd: int, shown: str) -> None:
+        """Remove the extended ACL entries of the open entry. A failure refuses, naming the entry.
+
+        A file with no ACL clears with exit 0, so a non-zero exit is a real failure: the tool is
+        missing, or the entry could not be changed. The entry is then not handed to anyone.
+        """
+        done = self.run(acl_clear_argv(fd), pass_fds=(fd,), capture_output=True, text=True,
+                        check=False, timeout=60)
+        if done.returncode != 0:
+            raise Refused(f"refusing {shown}: its access control list could not be cleared, so an "
+                          f"account granted access to it would keep that access (exit {done.returncode}: "
+                          f"{(done.stderr or done.stdout).strip()[-200:]}). Its owner had already changed "
+                          f"when this ran. The record says what did complete.")
+
+
+def _cleared(argv, **kwargs) -> subprocess.CompletedProcess:
+    """The default answer for a fixture: the ACL clear succeeded."""
+    return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+
+class FixtureFiles(RootFiles):
+    """RootFiles on a fixture. The suite is not root, so no owner is changed here.
+
+    Each owner the migration would set is compared with the one `expect` gives, and each
+    comparison is kept. A wrong owner or group is therefore a failure the test reads, not
+    a call that was merely made. ACL clears are recorded in `cleared` and sent to `run`,
+    which the suite answers; by default every clear succeeds.
+    """
+
+    def __init__(self, owners: dict, expect: dict, run=None):
+        super().__init__(owners, run=run or _cleared)
+        self.expect = expect
+        self.seen: list[str] = []
+        self.wrong: list[str] = []
+        self.cleared: list[str] = []
+        # Every owner change and ACL clear, in the order they were made: "chown" or "acl", then the label.
+        self.order: list[tuple[str, str]] = []
+
+    def fchown(self, fd: int, who: str, label: str = "") -> None:
+        self.order.append(("chown", label or "(an entry made by the migration)"))
+        self._check(who, label or "(an entry made by the migration)")
+
+    def clear_acl(self, fd: int, shown: str) -> None:
+        self.order.append(("acl", shown))
+        self.cleared.append(shown)
+        super().clear_acl(fd, shown)
+
+    def _check(self, who: str, name: str) -> None:
+        got, want = tuple(self.owners[who]), tuple(self.expect[who])
+        self.seen.append(f"{name} as {who}")
+        if got != want:
+            self.wrong.append(f"{name} as {who}: would set {got}, the fixture expects {want}")
+
+
+def _open_dir_at(parent: int, name: str, shown: str) -> int:
+    try:
+        return os.open(name, DIR_OPEN, dir_fd=parent)
+    except OSError as exc:
+        raise Refused(f"refusing {shown}: it is a symlink, or a file where a directory belongs "
+                      f"({exc.strerror}). The record says what did complete.") from exc
+
+
+def _child(parent: int, name: str, shown: str) -> int:
+    """`name` opened under `parent` with O_NOFOLLOW. A missing component raises FileNotFoundError."""
+    try:
+        return os.open(name, DIR_OPEN, dir_fd=parent)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise Refused(f"refusing {shown}: a symlink or a file is in the way ({exc.strerror}). "
+                      f"The record says what did complete.") from exc
+
+
+def _walk(home: str, parts: list[str], shown: str) -> int:
+    """A descriptor for `home/parts`, each component opened with O_NOFOLLOW from the one above it."""
+    handle = os.open(os.path.realpath(home), DIR_OPEN)
+    try:
+        for name in parts:
+            child = _child(handle, name, shown)
+            os.close(handle)
+            handle = child
+        return handle
+    except BaseException:
+        os.close(handle)
+        raise
+
+
+def _anchor(home: str, path: str) -> tuple[int, str]:
+    """(a descriptor for the directory holding `path`, and the name `path` has there).
+
+    `path` must sit under `home` and must not contain `..`. The caller closes the descriptor.
+    """
+    if ".." in path.split("/"):
+        raise Refused(f"refusing {path}: it contains `..`, so it is not a path under {home}.")
+    rel = os.path.relpath(path, home)
+    if rel in (os.curdir, os.pardir) or rel.startswith(os.pardir + os.sep) or os.path.isabs(rel):
+        raise Refused(f"refusing {path}: it is not under {home}.")
+    parts = rel.split(os.sep)
+    return _walk(home, parts[:-1], path), parts[-1]
+
+
+@contextlib.contextmanager
+def _held(home: str, path: str):
+    fd, name = _anchor(home, path)
+    try:
+        yield fd, name
+    finally:
+        os.close(fd)
+
+
+def _entry_at(parent: int, name: str):
+    try:
+        return os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def _write_new(parent: int, name: str, text: str, shown: str, files, who: str) -> None:
+    """Create `name` with `text` at mode 600, refusing if anything is there, and hand it to `who`."""
+    try:
+        fd = os.open(name, NEW_FILE_RW, 0o600, dir_fd=parent)
+    except OSError as exc:
+        raise Refused(f"could not create {shown}: {exc.strerror}. The record says what did complete.") from exc
+    try:
+        _hand_to(fd, who, files, shown)
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as stream:
+            stream.write(text)
+    finally:
+        os.close(fd)
+
+
+MARKER_LIMIT = 4096  # a marker is one path line; anything longer is refused, not read into memory
+
+
+def _read_marker(moved: int, shown: str) -> str | None:
+    """The text of `.builder-root` in the moved tree at `moved`, read as data, or None when there is none.
+
+    **OPENED WITHOUT FOLLOWING A LINK AND WITHOUT BLOCKING ON A FIFO, IT MUST BE A REGULAR FILE, AND
+    IT IS READ AT MOST `MARKER_LIMIT` BYTES.** Anything else is refused by name, so a marker an agent
+    replaced is never read or unlinked around, and a large one never fills root's memory.
+    """
+    if _entry_at(moved, ".builder-root") is None:
+        return None
+    try:
+        fd = os.open(".builder-root", FILE_OPEN | os.O_NONBLOCK, dir_fd=moved)
+    except OSError as exc:
+        raise Refused(f"refusing {shown}/.builder-root: it is a symlink, or it changed while it was "
+                      f"read ({exc.strerror}).") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Refused(f"refusing {shown}/.builder-root: it is not a regular file.")
+        # Bytes are counted, not characters: a marker of two-byte characters is twice its length in characters.
+        chunks, total = [], 0
+        while total <= MARKER_LIMIT:
+            part = os.read(fd, MARKER_LIMIT + 1 - total)
+            if not part:
+                break
+            chunks.append(part)
+            total += len(part)
+    finally:
+        os.close(fd)
+    if total > MARKER_LIMIT:
+        raise Refused(f"refusing {shown}/.builder-root: it is larger than {MARKER_LIMIT} bytes, and a "
+                      f"marker is one path line.")
+    try:
+        return b"".join(chunks).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise Refused(f"refusing {shown}/.builder-root: it is not text.") from exc
+
+
+def _moved_marker(ag: str, dst: str) -> str | None:
+    """The marker text of the moved tree at `dst` under `ag`, read through descriptors. Read only."""
+    parent, name = _anchor(ag, dst)
+    try:
+        moved = _open_dir_at(parent, name, dst)
+        try:
+            return _read_marker(moved, dst)
+        finally:
+            os.close(moved)
+    finally:
+        os.close(parent)
+
+
+def _replace_at(parent: int, name: str, text: str, shown: str, files, who: str) -> None:
+    """Replace `name` with a new file holding `text`, without removing the old one first.
+
+    **THE NEW FILE IS WRITTEN UNDER A TEMPORARY NAME AND RENAMED OVER `name`.** A failed write leaves
+    the old entry where it was, and the temporary name is removed on failure, so no failure leaves
+    `name` missing. The temporary name is refused if it already exists, since it is not ours to remove.
+    """
+    temp = f".{name}.new"
+    try:
+        fd = os.open(temp, NEW_FILE_RW, 0o600, dir_fd=parent)
+    except OSError as exc:
+        raise Refused(f"could not create {shown}/{temp}: {exc.strerror}. Nothing was changed there.") from exc
+    try:
+        try:
+            # The new file is created inside its directory, so it inherits that directory's ACL: the handover clears it.
+            _hand_to(fd, who, files, shown)
+            with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as stream:
+                stream.write(text)
+        finally:
+            os.close(fd)
+        os.rename(temp, name, src_dir_fd=parent, dst_dir_fd=parent)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temp, dir_fd=parent)
+        raise
+
+
+def _private(mode: os.stat_result) -> int:
+    """The mode a copy keeps: the source's owner bits only. Group and other bits never reach a copy."""
+    return stat.S_IMODE(mode.st_mode) & 0o700
+
+
+def _open_entry(parent: int, name: str, shown: str) -> int:
+    """`name` under `parent`, opened without following a symlink. A symlink, or an entry swapped in since it was looked at, is refused."""
+    try:
+        return os.open(name, FILE_OPEN | os.O_NONBLOCK, dir_fd=parent)
+    except OSError as exc:
+        raise Refused(f"refusing {shown}: it is a symlink, or it changed while it was being handled "
+                      f"({exc.strerror}). The record says what did complete.") from exc
+
+
+def _identity(st: os.stat_result) -> tuple[int, int]:
+    return st.st_dev, st.st_ino
+
+
+def _moved_identity(parent: int, name: str, was: tuple[int, int], shown: str) -> tuple[int, int]:
+    """Confirm that `name` now holds the inode the move took from its source, and return that identity.
+
+    A rename keeps the inode, so the destination must be that inode. Anything else at the name means
+    the entry was swapped after the move, and it is refused.
+    """
+    fd = _open_entry(parent, name, shown)
+    try:
+        now = _identity(os.fstat(fd))
+    finally:
+        os.close(fd)
+    if now != was:
+        raise Refused(f"refusing {shown}: the entry there is not the one the move took, so it was "
+                      f"swapped after the move. The record says what did complete.")
+    return now
+
+
+def _create_dir(parent: int, name: str, shown: str, files, who: str) -> int:
+    """Make a directory under `parent`, and return an open descriptor for the directory it made.
+
+    The descriptor is checked against the identity of the directory that was just created, so a
+    directory swapped in between is refused rather than handed to `who`.
+    """
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent)
+    except OSError as exc:
+        raise Refused(f"could not create {shown}: {exc.strerror}. The record says what did complete.") from exc
+    made = _identity(os.stat(name, dir_fd=parent, follow_symlinks=False))
+    fd = _open_entry(parent, name, shown)
+    now = os.fstat(fd)
+    if _identity(now) != made or not stat.S_ISDIR(now.st_mode):
+        os.close(fd)
+        raise Refused(f"refusing {shown}: it was replaced after it was made. The record says what did complete.")
+    _hand_to(fd, who, files, shown)
+    return fd
+
+
+def _copy_entry(src: int, dst: int, name: str, exclude, files, who: str) -> None:
+    """Copy one entry, and everything under it, from `src` to `dst`, following no symlink.
+
+    Every entry is created through its parent descriptor, opened without following, and
+    handed to `who` by descriptor. A name in `exclude` is left out at any depth. A copy keeps
+    the source's owner bits and loses the group and other bits, so no other account can read it.
+    """
+    if name in exclude:
+        return
+    mode = os.stat(name, dir_fd=src, follow_symlinks=False)
+    if stat.S_ISLNK(mode.st_mode):
+        # A symlink keeps the owner it was made with: root's, here. Its owner decides no access,
+        # and changing it by name could reach the entry a swap put there.
+        os.symlink(os.readlink(name, dir_fd=src), name, dir_fd=dst)
+    elif stat.S_ISDIR(mode.st_mode):
+        made = _create_dir(dst, name, name, files, who)
+        try:
+            held = _open_dir_at(src, name, name)
+            try:
+                for child in os.listdir(held):
+                    _copy_entry(held, made, child, exclude, files, who)
+            finally:
+                os.close(held)
+            os.fchmod(made, _private(mode))
+        finally:
+            os.close(made)
+    elif stat.S_ISREG(mode.st_mode):
+        in_fd = os.open(name, FILE_OPEN, dir_fd=src)
+        try:
+            out_fd = os.open(name, NEW_FILE_RW, 0o600, dir_fd=dst)
+            try:
+                _hand_to(out_fd, who, files, name)
+                with os.fdopen(in_fd, "rb", closefd=False) as source, \
+                        os.fdopen(out_fd, "wb", closefd=False) as target:
+                    shutil.copyfileobj(source, target)
+                os.fchmod(out_fd, _private(mode))
+            finally:
+                os.close(out_fd)
+        finally:
+            os.close(in_fd)
+
+
+def _hand_to(fd: int, to: str, files, shown: str) -> None:
+    """Hand one open entry to `to`: the owner changes first, then the ACL is cleared, then the group and other write bits and the set-id and sticky bits go.
+
+    **THE OWNER CHANGES BEFORE THE ACL IS CLEARED.** Once the owner has moved, the account that held the
+    entry is no longer its owner, so a grant that account adds afterwards is one the clear removes. Clearing
+    first would leave a gap in which that account could add a grant that the owner change would keep. This
+    runs on every handover, in either direction, since an ACL is a grant the owner bits do not show. A clear
+    that fails refuses the entry, naming it.
+
+    **A GRANT THAT `writesecurity` OR `chown` GIVES THE ACCOUNT THAT HELD THE ENTRY CAN ACT DURING THE
+    WINDOW BETWEEN THE OWNER CHANGE AND THE CLEAR.** That is safe for a handover to the operator. The clear
+    removes every ACL entry, and `_not_owned_by` refuses the tree when any entry is not owned by the operator.
+
+    The modes the agents account set are not recorded, so none is restored: the entry keeps its owner
+    bits, and no account other than its owner keeps write access to it. A set-id bit is removed here too,
+    so an entry the agents account made set-id does not come back runnable as the operator.
+    """
+    files.fchown(fd, to, shown)
+    files.clear_acl(fd, shown)
+    os.fchmod(fd, stat.S_IMODE(os.fstat(fd).st_mode)
+              & ~(stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX))
+
+
+def _reown(parent: int, name: str, *, frm: str, to: str, files, skipped: list[str], shown: str,
+           expect: tuple[int, int] | None = None) -> None:
+    """Hand one entry, and everything under it, from the `frm` owner to `to`. Anything else is skipped and named.
+
+    **EVERY DECISION IS MADE ON THE DESCRIPTOR THE CHANGE IS MADE ON.** The entry is opened without
+    following a symlink, and its owner, identity and link count are read from that open file; the
+    owner is then changed through the same descriptor. So a name swapped between the look and the
+    change reaches nothing. `expect` binds the top entry to the inode the move produced, and refuses
+    a swap. A symlink keeps its owner (see `_copy_entry`). A file with more than one link is left
+    alone, since its inode is reachable from outside the tree, and so is anything `frm` does not own.
+    """
+    before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if stat.S_ISLNK(before.st_mode):
+        # A link keeps its owner, and is named when `frm` owns it: a link `frm` made can point anywhere.
+        if before.st_uid == files.owners[frm][0]:
+            target = os.readlink(name, dir_fd=parent)
+            skipped.append(f"{shown} (a symlink owned by uid {before.st_uid}, pointing at {target}; "
+                           f"its owner is kept, so review it)")
+        return
+    fd = _open_entry(parent, name, shown)
+    try:
+        now = os.fstat(fd)
+        if expect is not None and _identity(now) != expect:
+            raise Refused(f"refusing {shown}: the entry there is not the one the move produced, so it was "
+                          f"swapped after the move. The record says what did complete.")
+        if _identity(now) != _identity(before):
+            raise Refused(f"refusing {shown}: it changed between being looked at and being opened.")
+        # An entry already owned by `to` is not skipped and not named: a directory's children may still be `frm`'s.
+        mine = now.st_uid == files.owners[frm][0]
+        if not mine and now.st_uid != files.owners[to][0]:
+            skipped.append(f"{shown} (owned by uid {now.st_uid}, not {files.owners[frm][0]}, so it is not re-owned)")
+            return
+        if stat.S_ISDIR(now.st_mode):
+            # The directory is handed over before its children are listed. Once it is no longer `frm`'s, `frm`
+            # cannot add an entry to it, so the listing sees every child that will ever be there.
+            if mine:
+                _hand_to(fd, to, files, shown)
+            for child in os.listdir(fd):
+                _reown(fd, child, frm=frm, to=to, files=files, skipped=skipped, shown=f"{shown}/{child}")
+        elif stat.S_ISREG(now.st_mode):
+            if not mine:
+                return
+            if now.st_nlink != 1:
+                skipped.append(f"{shown} (has {now.st_nlink} links, so its inode is reachable outside the tree)")
+                return
+            _hand_to(fd, to, files, shown)
+        else:
+            skipped.append(f"{shown} (neither a file nor a directory)")
+    finally:
+        os.close(fd)
+
+
+class Leftover(Exception):
+    """Entries a rollback found that the operator does not own, after the handover.
+
+    Rollback returns 1 and keeps the record. `state` says where the tree is and what its handover
+    changed, so the operator can see what a rerun starts from.
+    """
+
+    def __init__(self, lines: list[str], state: str = ""):
+        super().__init__("; ".join(lines))
+        self.lines = lines
+        self.state = state
+
+
+def _replace_linked(parent: int, name: str, fd: int, files, shown: str) -> None:
+    """Replace a regular file with more than one link by an operator-owned copy of its content.
+
+    The other links are names outside the tree that reach the same inode, so the inode itself cannot be
+    handed over. The copy is made under a temporary name and renamed over the entry, and the old inode
+    keeps its other links. A failed copy removes its temporary name and leaves the entry where it was.
+    """
+    mode = _private(os.fstat(fd))
+    temp = f".{name}.copy"
+    try:
+        out = os.open(temp, NEW_FILE_RW, 0o600, dir_fd=parent)
+    except OSError as exc:
+        raise Refused(f"could not create a copy of {shown} as {temp}: {exc.strerror}. Nothing was changed there.") from exc
+    try:
+        try:
+            _hand_to(out, "operator", files, shown)
+            with os.fdopen(fd, "rb", closefd=False) as source, os.fdopen(out, "wb", closefd=False) as target:
+                shutil.copyfileobj(source, target)
+            os.fchmod(out, mode)
+        finally:
+            os.close(out)
+        os.rename(temp, name, src_dir_fd=parent, dst_dir_fd=parent)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temp, dir_fd=parent)
+        raise
+
+
+def _take_back(parent: int, name: str, *, agents: int, files, log, shown: str) -> None:
+    """Hand one entry of a tree in staging to the operator, removing or replacing what the agents account made.
+
+    **EVERY CHANGE IS MADE IN THE ROOT-ONLY STAGING DIRECTORY, ON THE DESCRIPTOR IT WAS CHECKED THROUGH.**
+    The agents account cannot traverse that directory, so no name in the tree is swapped while it is
+    handled. A symlink the agents account owns is removed, and named with its target, since its target
+    can point anywhere. A regular file with more than one link is replaced by a copy, since its other
+    links reach the same inode from outside the tree. Any other regular file the agents account owns is
+    handed over. A directory is handed over before its children are listed.
+
+    **EVERY ENTRY OPENED HERE HAS ITS ACL CLEARED, WHATEVER ITS OWNER.** An entry the operator already owns
+    can still carry a grant that a handover left behind when its clear failed, so a rerun clears it too.
+    An entry the agents account does not own keeps its owner, and `_not_owned_by` names it afterwards. A
+    symlink is not opened, so its ACL is not cleared.
+    """
+    before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if stat.S_ISLNK(before.st_mode):
+        if before.st_uid == agents:
+            target = os.readlink(name, dir_fd=parent)
+            os.unlink(name, dir_fd=parent)
+            log(f"  removed a link the agents account made: {shown} -> {target}")
+        return
+    fd = _open_entry(parent, name, shown)
+    try:
+        now = os.fstat(fd)
+        if _identity(now) != _identity(before):
+            raise Refused(f"refusing {shown}: it changed between being looked at and being opened.")
+        if stat.S_ISDIR(now.st_mode):
+            if now.st_uid == agents:
+                _hand_to(fd, "operator", files, shown)
+            else:
+                files.clear_acl(fd, shown)
+            for child in os.listdir(fd):
+                _take_back(fd, child, agents=agents, files=files, log=log, shown=f"{shown}/{child}")
+        elif stat.S_ISREG(now.st_mode) and now.st_nlink > 1:
+            _replace_linked(parent, name, fd, files, shown)
+            log(f"  replaced {shown}, which has {now.st_nlink} links, with an operator-owned copy of its content")
+        elif stat.S_ISREG(now.st_mode) and now.st_uid == agents:
+            _hand_to(fd, "operator", files, shown)
+        else:
+            files.clear_acl(fd, shown)
+    finally:
+        os.close(fd)
+
+
+def _not_owned_by(parent: int, name: str, uid: int, shown: str, found: list[str]) -> None:
+    """Name each entry under `parent/name` that `uid` does not own, following no symlink. Read only."""
+    st = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if st.st_uid != uid:
+        found.append(f"{shown} (owned by uid {st.st_uid})")
+    if stat.S_ISDIR(st.st_mode):
+        held = _open_dir_at(parent, name, shown)
+        try:
+            for child in os.listdir(held):
+                _not_owned_by(held, child, uid, f"{shown}/{child}", found)
+        finally:
+            os.close(held)
+
+
+def _return_to_source(stage_fd: int, name: str, home_fd: int, shown: str, staged: str, log) -> str:
+    """Put a tree that is still in staging back under its source name, if that name is free. Returns where the tree is.
+
+    Called on every refusal after the move into staging, so the record and the tree stay in the state
+    a rerun expects. If the name is taken, the tree is named and left in staging, at `staged`.
+    """
+    if _entry_at(home_fd, name) is not None:
+        log(f"  left {shown} in the staging directory: something now sits where it was")
+        return staged
+    try:
+        os.rename(name, name, src_dir_fd=stage_fd, dst_dir_fd=home_fd)
+    except OSError as exc:
+        log(f"  left {shown} in the staging directory ({exc.strerror})")
+        return staged
+    log(f"  returned {shown} from the staging directory; the record is kept")
+    return shown
+
+
+def _remove_tree(parent: int, name: str) -> None:
+    """Remove an entry, and everything under it, without following any symlink."""
+    if not stat.S_ISDIR(os.stat(name, dir_fd=parent, follow_symlinks=False).st_mode):
+        os.unlink(name, dir_fd=parent)
+        return
+    held = _open_dir_at(parent, name, name)
+    try:
+        for child in os.listdir(held):
+            _remove_tree(held, child)
+    finally:
+        os.close(held)
+    os.rmdir(name, dir_fd=parent)
+
+
+def pair_of(entry: dict) -> dict | None:
+    """The record's entry for one planned step, or None if it keeps none.
+
+    A move records `left`, what its source holds once the migration is done: `symlink` for the
+    old root, which the migration links to the moved tree, and `nothing` for every other move.
+    """
+    kind = entry["op"]
+    if kind == "move":
+        return {"op": kind, "src": entry["src"], "dst": entry["dst"],
+                "left": "symlink" if entry.get("root") else "nothing"}
+    if kind in ("copy", "write"):
+        return {"op": kind, "src": entry["src"], "dst": entry["dst"]}
+    if kind == "mkdir":
+        return {"op": kind, "src": "", "dst": entry["path"]}
+    if kind == "remote":
+        return {"op": kind, "src": entry["before"], "dst": entry["after"]}
+    return None
+
+
+class SudoExecutor:
+    """The commands the migration runs as another account, or as root, through sudo.
+
+    **THE FILE CHANGES ARE NOT HERE.** They are made in Python by RootFiles. What is left
+    is what sudo has to run: `git` as `agents`, root's copy of supervision, and launchctl.
+    `run` and `quiet` are the injection points the suite uses to answer those commands.
+    """
+
+    def __init__(self, args=None, run=subprocess.run, quiet=None):
+        self.args = args
+        self.run = run
+        self.quiet = quiet or _run_quiet
+
+    def _must(self, argv: list[str], stdin=None) -> None:
+        done = self.run(argv, input=stdin, capture_output=True, text=True, check=False, timeout=600)
+        if done.returncode != 0:
+            raise Refused(f"`{' '.join(argv[:4])}…` exited {done.returncode}: "
+                          f"{(done.stderr or done.stdout).strip()[-400:]}. "
+                          f"The record keeps what did complete.")
+
+    def remote(self, repo: str, url: str) -> None:
+        self._must([*AS_AGENTS, GIT, "-C", repo, "remote", "set-url", "origin", url])
+
+    def read_remote(self, repo: str) -> str | None:
+        done = self.run([*AS_AGENTS, GIT, "-C", repo, "remote", "get-url", "origin"],
+                        capture_output=True, text=True, check=False, timeout=60)
+        return done.stdout.strip() if done.returncode == 0 else None
+
+    def daemons(self, labels) -> None:
+        # Root's copy renders the declarations and bootstraps them, as a full run does.
+        full, _shown = root_supervise(self.args, None, run=self.quiet)
+        done = self.run(full, check=False)
+        if done.returncode != 0:
+            raise Refused(f"bootstrapping the daemons exited {done.returncode}. "
+                          f"The record keeps what did complete.")
+
+    def bootout(self, label: str) -> None:
+        self.run([SUDO, LAUNCHCTL, "bootout", f"system/{label}"],
+                 capture_output=True, check=False, timeout=60)
+
+
+def apply_entry(entry: dict, *, op: str, ag: str, files, executor, moved: dict | None = None) -> list[str]:
+    """Make one planned change. Each one is made through a descriptor, not a path.
+
+    `moved` maps each destination a move made to the identity of the inode it holds, so the `own`
+    step that follows re-owns exactly that inode. The returned list names each entry an `own` step
+    left alone, one line each; every other step returns none.
+    """
+    kind = entry["op"]
+    moved = {} if moved is None else moved
+    if kind == "mkdir":
+        with _held(ag, entry["path"]) as (fd, name):
+            os.close(_create_dir(fd, name, entry["path"], files, "agents"))
+    elif kind == "move":
+        with _held(op, entry["src"]) as (src_fd, src_name), \
+                _held(ag, entry["dst"]) as (dst_fd, dst_name):
+            was = _identity(os.stat(src_name, dir_fd=src_fd, follow_symlinks=False))
+            try:
+                os.rename(src_name, dst_name, src_dir_fd=src_fd, dst_dir_fd=dst_fd)
+            except OSError as exc:
+                raise Refused(f"moving {entry['src']} to {entry['dst']} failed: {exc.strerror}. "
+                              f"The record keeps what did complete.") from exc
+            moved[entry["dst"]] = _moved_identity(dst_fd, dst_name, was, entry["dst"])
+    elif kind == "symlink":
+        with _held(op, entry["link"]) as (fd, name):
+            os.symlink(entry["target"], name, dir_fd=fd)
+    elif kind == "own":
+        if entry["path"] not in moved:
+            raise Refused(f"{entry['path']} was not moved by this migration, so it is not re-owned. "
+                          f"The record keeps what did complete.")
+        skipped: list[str] = []
+        with _held(ag, entry["path"]) as (fd, name):
+            _reown(fd, name, frm="operator", to="agents", files=files, skipped=skipped,
+                   shown=entry["path"], expect=moved[entry["path"]])
+        return skipped
+    elif kind == "rewrite":
+        with _held(ag, entry["path"]) as (fd, name):
+            _replace_at(fd, name, entry["text"], entry["path"], files, "agents")
+    elif kind == "write":
+        with _held(ag, entry["dst"]) as (fd, name):
+            _write_new(fd, name, entry["text"], entry["dst"], files, "agents")
+    elif kind == "copy":
+        with _held(op, entry["src"]) as (src_fd, src_name), \
+                _held(ag, entry["dst"]) as (dst_fd, dst_name):
+            if src_name != dst_name:
+                raise Refused(f"copying {entry['src']} to {entry['dst']} needs the same name at both ends.")
+            _copy_entry(src_fd, dst_fd, src_name, entry["exclude"], files, "agents")
+    elif kind == "remote":
+        executor.remote(entry["repo"], entry["after"])
+    elif kind == "daemons":
+        executor.daemons(entry["labels"])
+    else:
+        raise Refused(f"unknown migration step {kind!r}")
+    return []
+
+
+def _preflight(ops: list[dict], op: str, ag: str) -> list[str]:
+    """Every destination whose path already holds something, or passes through a symlink.
+
+    Read only. These are refused before any change, so a symlink planted in `agents`' home
+    stops the migration rather than being followed by a step halfway through it.
+    """
+    reasons = []
+    for entry in ops:
+        dst = entry.get("dst")
+        if dst is None or entry["op"] == "mkdir":
+            continue
+        if os.path.lexists(dst):
+            reasons.append(f"{dst} already exists, and the migration would not overwrite it. "
+                           f"Move it aside, then run again.")
+        try:
+            fd, name = _anchor(ag, dst)
+        except FileNotFoundError:
+            continue  # a container the migration makes; checked when it is made
+        except Refused as exc:
+            reasons.append(str(exc))
+            continue
+        os.close(fd)
+    return reasons
+
+
+def record_refusal(record: Path = RECORD) -> str | None:
+    """The refusal for a migration whose record already exists, or None. Checked before anything else in a migration."""
+    if os.path.lexists(record):
+        return (f"a migration already ran here: {record} exists. Roll it back first, or the second "
+                f"run would move a root the first one left behind. Nothing was changed.")
+    return None
+
+
+def migration_refusals(op: str, ag: str, *, root: str, loaded=None,
+                       dirty=None, plists=None, declared=()) -> list[str]:
+    """Every reason the migration must not run now, one line each. Nothing is changed.
+
+    `loaded(label)` asks the operator's launchd domain; `dirty(root)` lists the
+    checkouts with uncommitted work, read as the operator; `plists(op, root, builder)`
+    lists product services that name the root about to move. Each one is an injection
+    point so the suite can answer from a fixture.
+    """
+    # The operator's domain is the operator's uid, read from its home: under sudo the process is root.
+    operator_uid = os.lstat(op).st_uid
+    loaded = loaded or (lambda label: _loaded_in_operator_domain(label, operator_uid))
+    dirty = dirty or (lambda path: dirty_checkouts(path, op))
+    plists = plists or service_plists_naming
+    op_root = root
+    reasons = []
+    builder_labels = set(declared) | {
+        p.stem for p in Path(root, *AGENT_PLATFORM_LAUNCHD).glob("*.plist")}
+    running = sorted(label for label in builder_labels if loaded(label))
+    if running:
+        reasons.append(
+            "the operator's session still has these Builder jobs loaded, so they would "
+            "keep running from the moved tree: " + ", ".join(running) + ". Boot them "
+            "out, as the migration runbook's freeze step says, and run again.")
+    unclean = dirty(op_root)
+    if unclean:
+        reasons.append(
+            "these checkouts have uncommitted changes, which a move would leave in "
+            "the wrong place: " + "; ".join(f"{repo} ({n} path(s))" for repo, n in unclean)
+            + ". Commit or stash them, then run again.")
+    services = plists(op, op_root, builder_labels)
+    if services:
+        reasons.append(
+            "these services name the root that is about to move, and each needs its own "
+            "checkout outside it first, or its entry removed: " + ", ".join(services) + ".")
+    return reasons
+
+
+# launchctl's exit for a label that is not loaded in the domain it was asked about, as
+# `launchctl print gui/<uid>/<absent label>` returns it. It is the only "not loaded".
+LAUNCHCTL_ABSENT = 113
+
+
+def _launchctl_loaded(label: str, domain: str) -> bool:
+    """Whether launchctl has `label` loaded in `domain`.
+
+    **ANY EXIT OTHER THAN 0 OR 113 REFUSES, NAMING THE LABEL AND THE STATUS.** A check that reads
+    every failure as "not loaded" lets the migration or the rollback proceed while a job still runs.
+    """
+    try:
+        done = subprocess.run([LAUNCHCTL, "print", f"{domain}/{label}"],
+                              capture_output=True, check=False, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Refused(f"could not ask launchctl whether {label} is loaded in {domain} ({exc}). "
+                      f"Refusing, since that is not known.") from exc
+    if done.returncode == 0:
+        return True
+    if done.returncode == LAUNCHCTL_ABSENT:
+        return False
+    raise Refused(f"launchctl print {domain}/{label} exited {done.returncode}, so whether {label} "
+                  f"is loaded is not known. Refusing, since that is not known.")
+
+
+def _loaded_in_operator_domain(label: str, uid: int) -> bool:
+    return _launchctl_loaded(label, f"gui/{uid}")
+
+
+def _loaded_in_system_domain(label: str) -> bool:
+    return _launchctl_loaded(label, "system")
+
+
+PGREP = "/usr/bin/pgrep"
+
+
+def agents_processes(uid: int, run=subprocess.run) -> list[str]:
+    """Each process that runs as `uid`, as `pid name`, or [] when there is none.
+
+    **ANY EXIT OTHER THAN 0 OR 1 REFUSES, AND ANY LINE THAT IS NOT `pid name` REFUSES.** pgrep exits 1
+    when nothing matches. A check that read a failure as "nothing running" would let rollback change a
+    tree an agent still writes. Root's own processes are not `uid`'s, so the check never sees the
+    rollback itself.
+    """
+    try:
+        done = run([PGREP, "-l", "-U", str(uid)], capture_output=True, text=True, check=False, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Refused(f"could not list the processes of uid {uid} ({exc}). Refusing, since that is not "
+                      f"known.") from exc
+    if done.returncode == 1 and not done.stdout.strip():
+        return []
+    if done.returncode != 0:
+        raise Refused(f"{PGREP} -U {uid} exited {done.returncode}, so the processes that run as uid {uid} are "
+                      f"not known. Refusing.")
+    lines = done.stdout.splitlines()
+    for line in lines:
+        if not re.fullmatch(r"\d+ \S.*", line):
+            raise Refused(f"{PGREP} printed a line that is not `pid name`: {line!r}. Refusing, since the "
+                          f"processes are not known.")
+    if not lines:
+        raise Refused(f"{PGREP} exited 0 and printed nothing, which is not an answer.")
+    return lines
+
+
+def dirty_checkouts(root: str, op: str) -> list[tuple[str, int]]:
+    """Each checkout under `root` with uncommitted paths, and how many. Read as the operator, never as root."""
+    found = []
+    drop = operator_drop(op)
+    for child in sorted(Path(root).iterdir()) if Path(root).is_dir() else []:
+        if not (child / ".git").exists():
+            continue
+        done = _operator_git(op, [GIT, "-C", str(child), "status", "--porcelain"], drop, timeout=120)
+        lines = [line for line in done.stdout.splitlines() if line.strip()]
+        if done.returncode != 0 or lines:
+            found.append((child.name, len(lines) or 1))
+    return found
+
+
+def service_plists_naming(op: str, root: str, builder: set, directories=None) -> list[str]:
+    """Product services whose property list or sudoers fragment names the root being moved.
+
+    A property list is named by its label and a sudoers fragment by its file name. A
+    Builder job's own list is exempt, because the freeze step boots it out first. The root
+    matches as a whole path component, so `Convivy` does not match `Convivy-old`.
+    """
+    pattern = re.compile(re.escape(root) + r"(?=$|[/\s\"'<:,])", re.M)
+    sources = directories or [(Path(op, "Library", "LaunchAgents"), "*.plist"), *SERVICE_DIRECTORIES]
+    found = []
+    for directory, glob in sources:
+        if not directory.is_dir():
+            continue
+        for entry in sorted(directory.glob(glob)):
+            if not entry.is_file():
+                continue
+            name = entry.stem if glob == "*.plist" else entry.name
+            if glob == "*.plist" and name in builder:
+                continue
+            try:
+                text = entry.read_bytes().decode("utf-8", "replace")
+            except OSError:
+                continue
+            if pattern.search(text):
+                found.append(name)
+    return found
+
+
+# --- the record: what rollback may reverse, read only through root's directories --
+
+def _trusted_chain(path: Path, owner: int, top: Path) -> None:
+    """Refuse unless `path`, and each directory from `top` down to it, is owned by `owner` with no group or other write bit.
+
+    No component may be a symlink. The file itself must also carry no group or other bit.
+    """
+    chain = [p for p in [*reversed(path.parents), path] if p == top or top in p.parents]
+    for part in chain:
+        try:
+            info = os.lstat(part)
+        except FileNotFoundError:
+            raise Refused(f"there is no migration record at {path}.") from None
+        if stat.S_ISLNK(info.st_mode):
+            raise Refused(f"refusing {part}: it is a symlink, and the migration record is read only "
+                          f"through directories and a file that root owns.")
+        if info.st_uid != owner or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise Refused(f"refusing {part}: it is not owned by uid {owner} with no group or other "
+                          f"write bit.")
+        if part == path and info.st_mode & 0o077:
+            raise Refused(f"refusing {path}: the record must be mode 0600, with no group or other "
+                          f"bit.")
+
+
+def read_record(path: Path, owner: int = 0, top: Path = Path("/")) -> dict:
+    _trusted_chain(path, owner, top)
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise Refused(f"the migration record at {path} is unreadable ({exc}).") from exc
+
+
+def store_record(path: Path, data: dict) -> None:
+    """Write the record whole: a temporary file made with O_EXCL, then renamed over the record."""
+    temp = path.with_name(path.name + ".tmp")
+    try:
+        fd = os.open(temp, NEW_FILE, 0o600)
+    except FileExistsError:
+        raise Refused(f"{temp} is left from an earlier run that stopped while writing the record. "
+                      f"Remove it, then run again. Nothing was changed by this run.") from None
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as stream:
+            stream.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rename(temp, path)
+
+
+def recorded_owner(data: dict) -> tuple[int, int]:
+    """The operator's uid and gid as the record names them, checked against the account's own primary group.
+
+    The account and the group are looked up by name in the directory service. A group that is
+    not the account's primary group is refused, so a record cannot hand the operator's tree to
+    some other group.
+    """
+    account, group = data.get("operator_account"), data.get("operator_group")
+    try:
+        entry = pwd.getpwnam(account)
+        gid = grp.getgrnam(group).gr_gid
+    except (KeyError, TypeError) as exc:
+        raise Refused(f"the record names the operator's account {account!r} and group {group!r}, "
+                      f"and the directory service does not know them ({exc}).") from exc
+    if gid != entry.pw_gid:
+        raise Refused(f"the record names group {group}, which is not the primary group of "
+                      f"{account}.")
+    return entry.pw_uid, gid
+
+
+def checked_pairs(pairs: list, op: str, ag: str) -> list[dict]:
+    """The recorded pairs, each one a path under the operator's home or `agents`' home, with no `..`.
+
+    A remote pair holds two URLs rather than paths, and is checked by its scheme instead.
+    """
+    for pair in pairs:
+        if pair["op"] == "remote":
+            continue
+        for field, home in (("src", op), ("dst", ag)):
+            path = pair[field]
+            if path == "" and field == "src":
+                continue
+            normal = os.path.normpath(path)
+            if ".." in path.split("/") or not (normal == home or normal.startswith(home + os.sep)):
+                raise Refused(f"the record names {path!r}, which is not under {home}.")
+    return pairs
+
+
+def _entry_status(home: str, path: str):
+    """What sits at `path` under `home`, read without following a symlink: its stat, or None when nothing does."""
+    try:
+        fd, name = _anchor(home, path)
+    except FileNotFoundError:
+        return None
+    try:
+        return _entry_at(fd, name)
+    finally:
+        os.close(fd)
+
+
+def _link_target(home: str, path: str) -> str | None:
+    """Where the symlink at `path` under `home` points, or None when there is no symlink there."""
+    try:
+        fd, name = _anchor(home, path)
+    except FileNotFoundError:
+        return None
+    try:
+        st = _entry_at(fd, name)
+        if st is None or not stat.S_ISLNK(st.st_mode):
+            return None
+        return os.readlink(name, dir_fd=fd)
+    finally:
+        os.close(fd)
+
+
+def _describe_entry(st: os.stat_result, link_to: str | None) -> str:
+    if link_to is not None:
+        return f"a link to {link_to}"
+    return "a directory" if stat.S_ISDIR(st.st_mode) else "a file"
+
+
+def plan_undo(op: str, ag: str, pairs: list[dict]) -> list[tuple[dict, str]]:
+    """What rollback does for each recorded pair, read from disk before anything changes. Refuses by name.
+
+    **A PAIR IS REVERSED ONLY WHEN ITS SOURCE HOLDS EXACTLY WHAT THE MIGRATION LEFT.** A move's
+    source holds nothing, and the old root's source holds the link to the moved tree, or nothing
+    when the migration stopped before making it. Anything else there means the moved tree was
+    not left where the record says, so it stays where it is and the rollback is refused. A copy or
+    a write is undone by removing its copy, which is only safe while the operator's original still
+    exists: without it the copy is the only one left. A move's destination is never removed.
+
+    Each action is one of `done` (already reversed), `move`, `link-and-move`, `remove`, `mkdir`
+    and `remote`, and rollback runs them in reverse order of the record.
+    """
+    plan: list[tuple[dict, str]] = []
+    for pair in pairs:
+        kind = pair["op"]
+        if kind in ("mkdir", "remote"):
+            plan.append((pair, kind))
+            continue
+        src, dst = pair["src"], pair["dst"]
+        dst_st = _entry_status(ag, dst)
+        src_st = _entry_status(op, src)
+        if kind == "move":
+            link_to = _link_target(op, src)
+            if dst_st is not None and stat.S_ISLNK(dst_st.st_mode):
+                raise Refused(f"{dst} is a link, not the moved tree the migration made.")
+            if dst_st is not None and stat.S_ISDIR(dst_st.st_mode):
+                # THE MARKER IS READ HERE, BEFORE ANY LINK IS UNLINKED, SO A MARKER THAT IS NOT A
+                # REGULAR FILE REFUSES WHILE THE OPERATOR'S ROOT IS STILL WHERE IT WAS.
+                _moved_marker(ag, dst)
+            if dst_st is None:
+                if src_st is None:
+                    raise Refused(f"the moved tree is not at {dst}, and nothing is at {src}.")
+                if link_to is not None:
+                    raise Refused(f"{src} links to {dst}, which is gone.")
+                plan.append((pair, "done"))
+            elif src_st is None:
+                plan.append((pair, "move"))
+            elif pair.get("left") == "symlink" and link_to == dst:
+                plan.append((pair, "link-and-move"))
+            else:
+                raise Refused(f"{src} holds {_describe_entry(src_st, link_to)}, which the migration did not "
+                              f"leave there, so the moved tree at {dst} stays where it is.")
+        else:
+            if src_st is None:
+                raise Refused(f"{src} is gone, so the copy at {dst} is the only copy left, and it stays.")
+            plan.append((pair, "remove" if dst_st is not None else "done"))
+    return plan
+
+
+def _staging_name() -> str:
+    """The name of this run's staging directory in the operator's home."""
+    return f".builder-undo-{os.getpid()}"
+
+
+@contextlib.contextmanager
+def _staging(op: str, files, log):
+    """A directory in the operator's home, owned by root and mode 0700, that a moved tree passes through.
+
+    `agents` cannot write into it, so a tree in it cannot be swapped between two renames. It is
+    removed when the block ends if it is empty. A tree left in it is named, not removed.
+    """
+    home = _walk(op, [], op)
+    name = _staging_name()
+    try:
+        try:
+            os.mkdir(name, 0o700, dir_fd=home)
+        except FileExistsError as exc:
+            raise Refused(f"{op}/{name} is left from an earlier rollback that stopped. Remove it, then run "
+                          f"again.") from exc
+        stage = os.open(name, DIR_OPEN, dir_fd=home)
+        try:
+            # A new directory inherits the operator home's ACL, so the handover clears it: nothing but root may traverse this.
+            _hand_to(stage, "root", files, f"{op}/{name}")
+            yield stage
+        finally:
+            os.close(stage)
+            try:
+                os.rmdir(name, dir_fd=home)
+            except OSError:
+                log(f"  left {op}/{name}: it still holds the tree named above")
+    finally:
+        os.close(home)
+
+
+def _tree_state(state: dict) -> str:
+    """What a refusal says about its tree: where the tree is now, and whether its handover had begun."""
+    if not state["handing"]:
+        return f"The tree is at {state['where']}, and no owner, write bit or ACL on it has changed."
+    return (f"The tree is at {state['where']}. Its handover had begun: the entries it reached that the agents "
+            f"account owned now have the operator as owner, entries owned by any other account kept their "
+            f"owner, and any entry it did not finish may keep a group or other write bit or an ACL. The entries "
+            f"it had not reached are as the migration left them.")
+
+
+def _undo_move(op: str, ag: str, src: str, dst: str, *, unlink: bool, files, log, before_stage=None,
+               agents_idle=None) -> None:
+    """Move a recorded tree back to its source, and hand it to the operator inside the staging directory.
+
+    **THE TREE NEVER REACHES THE OPERATOR'S PATH UNTIL IT HAS BEEN HANDED OVER.** The order is: confirm the
+    identity in `agents`' home; move the tree into the root-only staging directory, which `agents` cannot
+    traverse; confirm the identity there; hand the tree over (`_take_back`, then the marker rewrite); check
+    that nothing in it is still not the operator's; confirm the identity again; check that no process runs as
+    `agents`; unlink the operator's link; and move the tree into place. Every refusal returns the tree to its
+    source, or leaves it in staging, and keeps the record. Its message says where the tree is and what the
+    handover changed (`_tree_state`), so a rerun starts from a state the operator can read.
+
+    `before_stage(dst)` runs between the first identity check and the move into staging. `agents_idle()`
+    runs once the tree is handed over, and raises when a process runs as `agents`. Both exist so the suite
+    can act in those windows.
+    """
+    state = {"where": dst, "handing": False}
+    try:
+        _undo_move_tree(op, ag, src, dst, unlink=unlink, files=files, log=log, before_stage=before_stage,
+                        agents_idle=agents_idle, state=state)
+    except Refused as exc:
+        raise Refused(f"{exc} {_tree_state(state)}") from exc
+    except Leftover as exc:
+        raise Leftover(exc.lines, _tree_state(state)) from exc
+
+
+def _undo_move_tree(op: str, ag: str, src: str, dst: str, *, unlink: bool, files, log, before_stage,
+                    agents_idle, state: dict) -> None:
+    """The steps of `_undo_move`. `state` is set to where the tree is, and whether its handover has begun, at each step."""
+    dst_fd, dst_name = _anchor(ag, dst)
+    try:
+        dst_st = os.stat(dst_name, dir_fd=dst_fd, follow_symlinks=False)
+        was = _identity(dst_st)
+        _moved_identity(dst_fd, dst_name, was, dst)
+        src_fd, src_name = _anchor(op, src)
+        staged = os.path.join(op, _staging_name(), dst_name)
+        try:
+            with _staging(op, files, log) as stage_fd:
+                if before_stage is not None:
+                    before_stage(dst)
+                try:
+                    os.rename(dst_name, dst_name, src_dir_fd=dst_fd, dst_dir_fd=stage_fd)
+                except OSError as exc:
+                    raise Refused(f"moving {dst} into the staging directory failed: {exc.strerror}. "
+                                  f"Nothing was unlinked.") from exc
+                state["where"] = staged
+                try:
+                    _moved_identity(stage_fd, dst_name, was, dst)
+                except Refused:
+                    # The entry that was swapped in goes back where it came from, unless something now sits there.
+                    if _entry_at(dst_fd, dst_name) is None:
+                        os.rename(dst_name, dst_name, src_dir_fd=stage_fd, dst_dir_fd=dst_fd)
+                        state["where"] = dst
+                    raise
+                try:
+                    state["handing"] = True
+                    _take_back(stage_fd, dst_name, agents=files.owners["agents"][0], files=files, log=log, shown=dst)
+                    # The marker is read and rewritten through the tree in staging, after the identity is confirmed.
+                    tree = _open_dir_at(stage_fd, dst_name, dst)
+                    try:
+                        marker = _read_marker(tree, dst)
+                        if marker is not None:
+                            _replace_at(tree, ".builder-root", marker.replace(dst, src), f"{dst}/.builder-root",
+                                        files, "operator")
+                    finally:
+                        os.close(tree)
+                    found: list[str] = []
+                    _not_owned_by(stage_fd, dst_name, files.owners["operator"][0], dst, found)
+                    if found:
+                        raise Leftover(found)
+                    _moved_identity(stage_fd, dst_name, was, dst)
+                    if agents_idle is not None:
+                        agents_idle()
+                except BaseException:
+                    state["where"] = _return_to_source(stage_fd, dst_name, dst_fd, dst, staged, log)
+                    raise
+                restore = None
+                if unlink and _entry_at(src_fd, src_name) is not None:
+                    restore = os.readlink(src_name, dir_fd=src_fd)
+                    os.unlink(src_name, dir_fd=src_fd)
+                    log(f"  undo link: {src}")
+                try:
+                    os.rename(dst_name, src_name, src_dir_fd=stage_fd, dst_dir_fd=src_fd)
+                except OSError as exc:
+                    # The link is put back, so the operator's root is where it was, and the tree returns to its source.
+                    if restore is not None:
+                        os.symlink(restore, src_name, dir_fd=src_fd)
+                    state["where"] = _return_to_source(stage_fd, dst_name, dst_fd, dst, staged, log)
+                    link = f", and the operator's link at {src} was put back" if restore is not None else ""
+                    raise Refused(f"moving {dst} to {src} failed: {exc.strerror}. Nothing was moved into place"
+                                  f"{link}.") from exc
+                state["where"] = src
+                _moved_identity(src_fd, src_name, was, src)
+                log(f"  undo move: {dst} -> {src}")
+        finally:
+            os.close(src_fd)
+    finally:
+        os.close(dst_fd)
+
+
+def _undo_copy(ag: str, dst: str, *, log) -> None:
+    """Remove a copy the migration made. Only `plan_undo` decides it may be removed."""
+    dst_fd, dst_name = _anchor(ag, dst)
+    try:
+        _remove_tree(dst_fd, dst_name)
+    finally:
+        os.close(dst_fd)
+    log(f"  undo copy: removed {dst}")
+
+
+def _undo_container(ag: str, dst: str, *, log) -> None:
+    """Remove a directory the migration made, if it is empty. A non-empty one holds later work, so it stays."""
+    try:
+        fd, name = _anchor(ag, dst)
+    except FileNotFoundError:
+        return
+    try:
+        os.rmdir(name, dir_fd=fd)
+        log(f"  undo mkdir: {dst}")
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log(f"  left {dst}: it holds files written since the migration ({exc.strerror})")
+    finally:
+        os.close(fd)
+
+
+def _restore_remote(pair: dict, pairs: list[dict], executor, *, log) -> None:
+    """Point a checkout back at the ssh URL the record names, where it still has the https one."""
+    for other in pairs:
+        if other["op"] == "remote" or other["src"] == "":
+            continue
+        if not os.path.isdir(other["dst"]) or os.path.islink(other["dst"]):
+            continue
+        for child in sorted(Path(other["dst"]).iterdir()):
+            if (child / ".git").exists() and executor.read_remote(str(child)) == pair["dst"]:
+                executor.remote(str(child), pair["src"])
+                log(f"  undo remote: {child} origin back to {pair['src']}")
+
+
+UNCHANGED = ("Nothing was rolled back: no owner, write bit or ACL has changed, and each tree is where the "
+             "migration left it.")
+BOOTED = UNCHANGED + " The daemons were booted out before this check."
+EARLIER = "Steps this run finished before this tree are not undone."
+
+
+def rollback(op: str, ag: str, *, record: Path = RECORD, owner: int = 0, top: Path = Path("/"),
+             files_for=None, executor=None, loaded=None, labels=None, log=print, hooks=None,
+             agents_running=None) -> int:
+    """Reverse a recorded migration from its record alone. 0 done, 1 not finished, 2 refused.
+
+    Every pair is checked against the disk before anything is changed, so a refusal leaves the
+    migrated tree and the record where they were. The daemons are the exception: each declared
+    label is booted out before the process and still-loaded checks, so a refusal leaves them booted
+    out, and the refusal names each process or daemon still running. `agents_running(uid)` lists
+    the processes that run as `agents`, and is checked again just before a tree leaves staging.
+    Exit 1 means entries are still not the operator's: the record is kept, and a rerun repeats the
+    handover. A refusal says where each tree is and whether its owners, write bits or ACLs changed.
+    `hooks` holds the seams the suite uses (`before_stage`).
+    """
+    hooks = hooks or {}
+    agents_running = agents_running or agents_processes
+    op, ag = os.path.abspath(op), os.path.abspath(ag)
+    try:
+        data = read_record(record, owner, top)
+        if data.get("operator_home") != op or data.get("agents_home") != ag:
+            raise Refused(f"the record at {record} is for {data.get('operator_home')} and "
+                          f"{data.get('agents_home')}, not {op} and {ag}.")
+        pairs = checked_pairs(data.get("pairs", []), op, ag)
+        actions = plan_undo(op, ag, pairs)
+        agents_st = os.lstat(ag)
+        files = (files_for or RootFiles)({"operator": recorded_owner(data),
+                                          "agents": (agents_st.st_uid, agents_st.st_gid),
+                                          "root": (0, 0)})
+    except Refused as exc:
+        raise Refused(f"{exc} {UNCHANGED}") from exc
+    except OSError as exc:
+        # EVERY CHECK ABOVE RUNS BEFORE THE FIRST CHANGE, SO AN OS ERROR HERE IS A REFUSAL, NOT A TRACEBACK.
+        raise Refused(f"could not check {exc.filename or 'the migration state'} before any change "
+                      f"({exc.strerror}). {UNCHANGED}") from exc
+    executor = executor or SudoExecutor()
+    loaded = loaded or _loaded_in_system_domain
+    labels = declared_labels() if labels is None else list(labels)
+    try:
+        for label in labels:
+            executor.bootout(label)
+        running = agents_running(agents_st.st_uid)
+        if running:
+            log("rollback is refused, and these processes run as the agents account: " + "; ".join(running)
+                + f". Stop them, then run again. {BOOTED}")
+            return 2
+        still = [label for label in labels if loaded(label)]
+        if still:
+            log("rollback is refused, and these daemons were booted out but are still loaded: "
+                + f"{', '.join(still)}. {BOOTED}")
+            return 2
+    except Refused as exc:
+        raise Refused(f"{exc} {BOOTED}") from exc
+
+    def idle_again() -> None:
+        running = agents_running(agents_st.st_uid)
+        if running:
+            raise Refused("rollback stopped before the tree reached the operator's path, because these processes "
+                          "run as the agents account: " + "; ".join(running) + ". The handover had given every "
+                          "entry the agents account owned to the operator, with no group or other write bit and no "
+                          "ACL, and had removed the links the agents account made inside the tree, so those processes "
+                          "can no longer open its entries for writing, though one that already holds a write descriptor "
+                          "can still write through it. Stop them, then run again.")
+
+    finished = 0
+    try:
+        for pair, action in reversed(actions):
+            if action == "remote":
+                try:
+                    _restore_remote(pair, pairs, executor, log=log)
+                except Refused as exc:
+                    raise Refused(f"{exc} This step changes a checkout's remote, and no tree has changed in it.") from exc
+            elif action == "mkdir":
+                _undo_container(ag, pair["dst"], log=log)
+            elif action == "done":
+                log(f"  already reversed: {pair['dst']}")
+                continue
+            elif action == "remove":
+                _undo_copy(ag, pair["dst"], log=log)
+            else:
+                _undo_move(op, ag, pair["src"], pair["dst"], unlink=action == "link-and-move",
+                           files=files, log=log, before_stage=hooks.get("before_stage"),
+                           agents_idle=idle_again)
+            finished += 1
+    except Leftover as exc:
+        for line in exc.lines:
+            log(f"  not the operator's, so the tree was not moved into place: {line}")
+        log(exc.state)
+        if finished:
+            log(EARLIER)
+        log("rollback is not finished. The record is kept, so running it again repeats the handover.")
+        return 1
+    except Refused as exc:
+        if finished:
+            raise Refused(f"{exc} {EARLIER}") from exc
+        raise
+    Path(record).unlink()
+    log(f"rolled back the migration of {op}")
+    return 0
+
+
+def declared_labels(repo: Path = REPO) -> list[str]:
+    """The launchd labels of every shipped job declaration, read from `jobs/`.
+
+    **THE DECLARATION MODULE MUST COME FROM `repo`'s OWN `tools/`.** Root's copy names `repo` as the
+    tree it was checked as, so an import that resolves anywhere else is refused rather than run.
+    """
+    tools = (repo / "tools").resolve()
+    sys.path.insert(0, str(tools))
+    from jobs import declaration
+
+    origin = Path(declaration.__file__).resolve()
+    if tools not in origin.parents:
+        raise Refused(f"jobs.declaration was imported from {origin}, not from {tools}. Nothing was changed.")
+    return [declaration.load(path).label for path in sorted((repo / "jobs").glob("*.toml"))]
+
+
+def run_migration(op: str, ag: str, *, root=None, labels=(), dry_run=False, args=None, executor=None,
+                  files_for=None, refusals=None, plan=None, record: Path = RECORD, owners=None,
+                  agents=None, log=print) -> int:
+    """Migrate the operator's Builder tree into `agents`' home. 0 done, 2 refused.
+
+    `agents` is the (uid, gid) of the `agents` account, and `owners` maps `operator` and
+    `agents` to the (uid, gid) each one's files are handed to. Both come from the directory
+    service when the caller gives neither, which is how the CLI runs.
+    """
+    # THE RECORD IS CHECKED BEFORE ANYTHING ELSE, including the operator's root, which is read below.
+    refused = record_refusal(record)
+    if refused is not None:
+        log("the migration is refused, and nothing was changed:")
+        log(f"  - {refused}")
+        return 2
+    op, ag = os.path.abspath(op), os.path.abspath(ag)
+    if op == ag:
+        raise Refused("the operator's home and `agents`' home are the same directory. "
+                      "Nothing was changed.")
+    root = root or operator_root(op)
+    ident = operator_identity(op)
+    reasons = (refusals or migration_refusals)(op, ag, root=root, declared=labels)
+    ops = (plan or plan_migration)(op, ag, root=root, labels=labels)
+    reasons = reasons + _preflight(ops, op, ag)
+    if reasons:
+        log("the migration is refused, and nothing was changed:")
+        for reason in reasons:
+            log(f"  - {reason}")
+        return 2
+    if dry_run:
+        log(f"the migration would run {len(ops)} step(s), and changes nothing:")
+        for entry in ops:
+            log(f"  {entry['op']}: {_describe(entry)}")
+        return 0
+    owners = owners or {"operator": (ident["uid"], ident["gid"]),
+                        "agents": agents or agents_ids()}
+    files = (files_for or RootFiles)(owners)
+    executor = executor or SudoExecutor(args)
+    data = {"operator_account": ident["account"], "operator_group": ident["group"],
+                "operator_home": op, "agents_home": ag, "pairs": []}
+    record.parent.mkdir(parents=True, exist_ok=True)
+    store_record(record, data)
+    moved: dict = {}
+    for entry in ops:
+        pair = pair_of(entry)
+        if pair is not None:
+            data["pairs"].append(pair)
+            store_record(record, data)
+        log(f"  {entry['op']}: {_describe(entry)}")
+        try:
+            skipped = apply_entry(entry, op=op, ag=ag, files=files, executor=executor, moved=moved)
+        except FileNotFoundError as exc:
+            raise Refused(f"{exc.filename} went missing during the migration. The record keeps "
+                          f"what did complete.") from exc
+        for line in skipped:
+            log(f"  left as it is: {line}")
+    log(f"migrated the Builder tree to {ag}. Verify it with the checks in the runbook's "
+        f"step 8 and 9; they are not run here.")
+    return 0
+
+
+def _describe(entry: dict) -> str:
+    kind = entry["op"]
+    if kind in ("move", "copy", "write"):
+        return f"{entry['src']} -> {entry['dst']}" if kind != "write" else entry["dst"]
+    if kind == "symlink":
+        return f"{entry['link']} -> {entry['target']}"
+    if kind in ("mkdir", "rewrite"):
+        return entry.get("path", "")
+    if kind == "own":
+        return f"{entry['path']} to {AGENTS}"
+    if kind == "remote":
+        return f"{entry['repo']} origin to {entry['after']}"
+    if kind == "daemons":
+        return ", ".join(entry["labels"]) or "no declared jobs"
+    return ""
+
+
+def root_invocation() -> str:
+    """The command a real migration is run with: the installed copy, by absolute path, under the root interpreter.
+
+    The copy is named from the record install-privileged writes, so the message shows the tree root
+    will run and not the checkout the operator happened to type from.
+    """
+    sha = installed_sha(_read_record(INSTALLED_RECORD), "shipwright") or "<sha>"
+    interpreter = ROOT_INTERPRETERS["darwin" if sys.platform == "darwin" else "linux"]
+    return f"sudo {interpreter} -I {PRIVILEGED_PREFIX}/src/shipwright@{sha}/bin/stand-up-backend"
+
+
+def run_migration_mode(args, chosen: str | None) -> int:
+    """`--migrate-from` and `--rollback-to`. 0 done, 1 failed, 2 refused.
+
+    **A REAL RUN IS ROOT'S.** Its file changes are made in Python as root, so the operator
+    runs it under sudo. A dry run changes nothing, so it runs as the operator.
+    """
+    try:
+        if chosen is None and os.geteuid() != 0:
+            raise Refused(f"the migration changes files that only root can change. Run it as root from "
+                          f"the installed copy, `{root_invocation()} --shape two --migrate-from …`, or "
+                          f"`--dry-run` first. Nothing was changed.")
+        if args.rollback_to is not None:
+            if chosen is not None:
+                print(f"{PROG}: --rollback-to takes no report mode; it reverses the "
+                      f"recorded migration or refuses. Nothing was changed.", file=sys.stderr)
+                return 2
+            return rollback(str(args.rollback_to), agents_home(), executor=SudoExecutor(args),
+                            labels=declared_labels())
+        # THE RECORD IS CHECKED BEFORE THE LABELS OR THE AGENTS HOME ARE READ, as the first step of a migration.
+        refused = record_refusal()
+        if refused is not None:
+            raise Refused(refused)
+        return run_migration(str(args.migrate_from), agents_home(), labels=declared_labels(),
+                             dry_run=chosen is not None, args=args)
+    except Refused as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 2
+
+
+def invoked_path(value: Path | None, start: str) -> Path | None:
+    """`value` as a path, a relative one taken from `start`, the directory the command was typed in.
+
+    Root changes to `/` before it parses its arguments, so a relative path has to be resolved
+    against `start`, which `main` captured before that change. An absolute path is returned as it is.
+    """
+    if value is None:
+        return None
+    return Path(start, value)
+
+
 def main(argv: list[str]) -> int:
+    # THE INVOKING DIRECTORY IS KEPT BEFORE ROOT LEAVES IT, so a relative path argument still names
+    # what the operator typed, and not `/`.
+    start = os.getcwd()
+    # ROOT STARTS IN `/`, BEFORE ANYTHING ELSE. The cwd is the operator's, and an agent may be able to write
+    # it: a relative path, or the interpreter's own sys.path[0], would resolve there as root.
+    if os.geteuid() == 0:
+        os.chdir("/")
     parser = argparse.ArgumentParser(
         prog=PROG,
         description="Stand Builder's backend up by running the four tools in order.",
@@ -757,6 +2840,18 @@ def main(argv: list[str]) -> int:
                              "for anyone installing from source but Convivy itself")
     parser.add_argument("--activate", action="store_true",
                         help="also start the jobs marked enabled-by-default")
+    parser.add_argument("--migrate-from", type=Path, default=None, metavar="OPERATOR_HOME",
+                        help="move the operator's Builder tree into the agents account (--shape two "
+                             "only). A real run is root's: run it from the installed copy, by absolute "
+                             "path, as the module usage shows; --dry-run plans it as the operator")
+    parser.add_argument("--rollback-to", type=Path, default=None, metavar="OPERATOR_HOME",
+                        help="reverse the migration recorded under the root-owned prefix, as root from "
+                             "the installed copy (--shape two only)")
+    parser.add_argument("--operator-name", default=None,
+                        help="the operator's display name, for making them the "
+                             "Library's first person (default: git config "
+                             "--global user.name, then the account's full "
+                             "name, then its login name)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--status", action="store_true",
                       help="what each step reports, changing nothing")
@@ -765,6 +2860,22 @@ def main(argv: list[str]) -> int:
     mode.add_argument("--check", action="store_true",
                       help="report only; 1 if work is left, 2 if a step refused")
     args = parser.parse_args(argv)
+    if os.geteuid() == 0:
+        # A PATH ARGUMENT UNDER ROOT NAMES WHAT THE OPERATOR TYPED, NOT `/`.
+        args.deploy = invoked_path(args.deploy, start)
+        args.jobs = invoked_path(args.jobs, start)
+        args.migrate_from = invoked_path(args.migrate_from, start)
+        args.rollback_to = invoked_path(args.rollback_to, start)
+
+    if os.geteuid() == 0:
+        # ROOT RUNS ONLY ITS OWN COPY, and checks that before it reads anything else: the record,
+        # the operator's files and the declarations all come after this.
+        problem = root_copy_problem(os.path.abspath(__file__))
+        if problem:
+            print(f"{PROG}: refusing to run as root from {__file__}: {problem}. Run the copy "
+                  f"install-privileged extracted, by its absolute path: {root_invocation()}. "
+                  f"Nothing was changed.", file=sys.stderr)
+            return 2
 
     chosen = "status" if args.status else "dry-run" if args.dry_run else \
              "check" if args.check else None
@@ -774,6 +2885,13 @@ def main(argv: list[str]) -> int:
         print(f"{PROG}: name the install shape; this never chooses one for you:\n"
               f"{shapes}", file=sys.stderr)
         return 2
+    if args.shape == "single" and os.geteuid() == 0:
+        # EVERY STEP OF THIS SHAPE WOULD RUN AS ROOT FROM THE OPERATOR'S CHECKOUTS AND COMMANDS, WHICH THE
+        # AGENTS ACCOUNT CAN WRITE ONCE A MIGRATION HAS MOVED THEM. THE SINGLE SHAPE RUNS WITHOUT SUDO.
+        print(f"{PROG}: --shape single runs every step as the operator. As root, its steps would run "
+              f"from the operator's checkouts, which the agents account can write after a migration. "
+              f"Run it without sudo. Nothing was changed.", file=sys.stderr)
+        return 2
     if args.shape == "two":
         # BEFORE ANY STEP, IN EVERY MODE. A reporting mode would otherwise
         # describe installing pieces the two-account shape cannot use.
@@ -782,19 +2900,38 @@ def main(argv: list[str]) -> int:
             print(f"{PROG}: {refuse_two_shape(lacks)}", file=sys.stderr)
             return 2
 
+    if args.migrate_from is not None or args.rollback_to is not None:
+        # A MIGRATION IS ITS OWN RUN. It shares the refusal above, not the steps:
+        # the steps place and supervise a backend, and a migration moves one that
+        # already exists.
+        if args.migrate_from is not None and args.rollback_to is not None:
+            print(f"{PROG}: name one of --migrate-from and --rollback-to, not both",
+                  file=sys.stderr)
+            return 2
+        if args.shape != "two":
+            print(f"{PROG}: the migration moves the backend into the `{AGENTS}` account, "
+                  f"which only --shape two has. Nothing was changed.", file=sys.stderr)
+            return 2
+        return run_migration_mode(args, chosen)
+
     results: list[dict] = []
     stopped = None
     best = None
     linger_note = None
-    for step in STEPS:
+    for step in steps_for(args.shape):
         # RE-PROBED UNTIL ONE IS FOUND, because `provision` is what installs it.
         # Resolved once before the loop, `best` was None on the very machine
         # this command is written for — a fresh 22.04 box whose `python3` is
         # 3.10 — so `supervise` refused and `place` built its venvs with the
         # stock interpreter, both AFTER provision had just installed 3.11.
         if best is None:
-            best = best_interpreter()
-        if step["name"] == "supervise" and supervision_skipped(args):
+            try:
+                best = best_interpreter()
+            except Refused as exc:
+                # ONLY ROOT RAISES FROM HERE: it names the interpreter it needed, and runs nothing.
+                print(f"{PROG}: {exc}", file=sys.stderr)
+                return 2
+        if step["name"] in ("supervise", "library-person") and supervision_skipped(args):
             continue
         if lingers_before(step, chosen, args.shape):
             # The name the process runs as, from its UID. `getpass.getuser()`

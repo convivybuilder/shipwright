@@ -3,7 +3,8 @@ description = "Serves Orient, which holds the control database the work queue is
 label = "com.convivy.orient"
 command = ["/bin/sh", "{deploy}/convivy-orient/serve.sh"]
 platforms = ["macos", "linux"]
-scope = "user"
+scope = "system"
+account = "agents"
 enabled-by-default = true
 working-directory = "{deploy}/convivy-orient"
 

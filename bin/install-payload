@@ -107,7 +107,11 @@ unset git_env GIT_ENV_NAMES 2>/dev/null || true
 
 PROG=$(basename "$0")
 REPO=""
-REF="main"
+# Empty means "work it out once $REPO is known": stable when the checkout
+# carries that branch, main when it does not. A clone made with `git clone
+# --branch stable` has no local main to fall back to, and a development
+# checkout has no stable branch at all, so the two cases never collide.
+REF=""
 # **THESE TWO READ THE INHERITED `$HOME` ON PURPOSE**, before the reassignment
 # below: they are where this script writes on behalf of whoever invoked it, which
 # is a different question from which account git should believe it is.
@@ -147,9 +151,11 @@ usage: install-payload [--ref=<git-ref>] [--repo=<path>] [--deploy=<dir>]
                        [--config=<file>] [--allow-non-main] [--force]
                        [--dry-run] [--status]
 
-  --ref=<git-ref>    Ref to install from (default: main). Anything other than
-                     main is refused unless --allow-non-main is given, because
-                     a deploy area serving a branch is the fault this script
+  --ref=<git-ref>    Ref to install from (default: stable when the checkout
+                     at --repo carries a stable branch, main when it does
+                     not). Anything other than main or stable is refused
+                     unless --allow-non-main is given, because a deploy area
+                     serving an arbitrary branch is the fault this script
                      exists to prevent.
   --repo=<path>      The shipwright checkout to read the ref from. Defaults to
                      the repository containing this script.
@@ -212,6 +218,27 @@ fi
 # checkout made that way is as much a checkout as the primary one.
 [ -d "$REPO/.git" ] || [ -f "$REPO/.git" ] || die "not a git checkout: $REPO"
 
+# **NO EXPLICIT --ref: STABLE WHEN THE CHECKOUT HAS IT, MAIN WHEN IT DOES
+# NOT.** A public clone made with `git clone --branch stable` carries a local
+# `refs/heads/stable`; one made without `--single-branch` also carries
+# `refs/remotes/origin/stable` even though `stable` was never checked out
+# locally. Either is enough to call this a release checkout. A development
+# checkout carries neither and falls through to main exactly as before.
+#
+# **THIS TRUSTS WHATEVER WRITES `stable`.** The one writer is `commit-export`,
+# which writes it into a clone of the public repository for a person to push.
+# A repository nothing publishes from has no `stable` branch. A local one
+# planted in a checkout is no new exposure, since the same hand could move the
+# local `main` this already reads first.
+if [ -z "$REF" ]; then
+  if git -C "$REPO" show-ref --verify --quiet refs/heads/stable \
+    || git -C "$REPO" show-ref --verify --quiet refs/remotes/origin/stable; then
+    REF="stable"
+  else
+    REF="main"
+  fi
+fi
+
 # Absolute only. A relative --deploy=deploy run from a directory that already
 # holds an unrelated `deploy/` is the same destructive case as a mistyped
 # absolute path, and `deploy` is an ordinary name for exactly that kind of
@@ -250,15 +277,24 @@ if [ "$ACTION" = "status" ]; then
   exit 0
 fi
 
-# A ref other than main is the fault this script exists to prevent, so it is
-# refused rather than warned about, and the override is recorded in the stamp
-# where a later reader will see what was deployed and on whose say-so.
-if [ "$REF" != "main" ] && [ "$ALLOW_NON_MAIN" -eq 0 ]; then
+# A ref other than main or stable is the fault this script exists to prevent,
+# so it is refused rather than warned about, and the override is recorded in
+# the stamp where a later reader will see what was deployed and on whose
+# say-so. stable needs no override: it is the release, exactly as main is.
+if [ "$REF" != "main" ] && [ "$REF" != "stable" ] && [ "$ALLOW_NON_MAIN" -eq 0 ]; then
   die "refusing to install from '$REF': pass --allow-non-main to override"
 fi
 
-COMMIT=$(git -C "$REPO" rev-parse --verify "$REF^{commit}" 2>/dev/null) \
-  || die "no such ref in $REPO: $REF"
+# Tried as a local branch first, then as the remote-tracking ref: a release
+# checkout cloned without `--single-branch` carries `refs/remotes/origin/stable`
+# even where `stable` itself was never checked out locally, and plain `stable`
+# does not resolve to that. The bare name is tried last so an explicit --ref
+# naming a tag or a commit still works exactly as before.
+COMMIT=""
+for candidate in "refs/heads/$REF" "refs/remotes/origin/$REF" "$REF"; do
+  COMMIT=$(git -C "$REPO" rev-parse --verify "${candidate}^{commit}" 2>/dev/null) && break
+done
+[ -n "$COMMIT" ] || die "no such ref in $REPO: $REF"
 
 # **WHERE THIS MACHINE'S PROJECTS LIVE, DECIDED BEFORE ANYTHING IS CHANGED**
 # Everything Builder owns lives under one root, `~/builder` unless the install
@@ -1121,9 +1157,20 @@ if [ -f "$CHARTER" ]; then
     fi
   else
     mkdir -p "$STEWARD_DIR"
-    cp "$CHARTER" "$target"
-    chmod u+w "$target"
-    echo "$PROG: placed the steward charter at $target; start a session in $STEWARD_DIR to meet the steward"
+    # CREATE-ONLY IN ONE STEP. The existence check above and a copy are two
+    # steps, and a file that appears between them would be overwritten. `set -C`
+    # makes the redirect fail on an existing file, so the kernel refuses it.
+    # THE SOURCE IS CHECKED FIRST, because the redirect creates the target before
+    # `cat` opens the source: an unreadable charter would leave an empty one that
+    # the next run finds and never fills.
+    if [ ! -r "$CHARTER" ]; then
+      echo "$PROG: left $target uninstalled: the shipped charter $CHARTER is not readable"
+    elif ( set -C; cat "$CHARTER" > "$target" ) 2>/dev/null; then
+      chmod u+w "$target"
+      echo "$PROG: placed the steward charter at $target; start a session in $STEWARD_DIR to meet the steward"
+    else
+      echo "$PROG: left $target untouched: it appeared while this ran, and an installed charter is never overwritten"
+    fi
   fi
 fi
 
@@ -1146,9 +1193,13 @@ if [ -f "$MACHINE_SOURCE" ]; then
     fi
   else
     mkdir -p "$(dirname "$MACHINE_FILE")"
-    cp "$MACHINE_SOURCE" "$MACHINE_FILE"
-    chmod u+w "$MACHINE_FILE"
-    echo "$PROG: placed the machine-wide instruction file at $MACHINE_FILE; every session started from now on reads it"
+    # CREATE-ONLY IN ONE STEP, for the reason the steward charter above gives.
+    if ( set -C; cat "$MACHINE_SOURCE" > "$MACHINE_FILE" ) 2>/dev/null; then
+      chmod u+w "$MACHINE_FILE"
+      echo "$PROG: placed the machine-wide instruction file at $MACHINE_FILE; every session started from now on reads it"
+    else
+      echo "$PROG: left $MACHINE_FILE untouched: it appeared while this ran, and an existing one is never overwritten"
+    fi
   fi
 fi
 

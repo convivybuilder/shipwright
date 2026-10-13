@@ -12,7 +12,8 @@ command = [
 # than the Builder root on an install whose root is `~/builder`, and the job
 # failed with `no knowledge repository at …` on its first run.
 platforms = ["macos", "linux"]
-scope = "user"
+scope = "system"
+account = "agents"
 enabled-by-default = true
 working-directory = "{deploy}/builder-payload"
 

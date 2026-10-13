@@ -5,6 +5,8 @@
     bin/provision-backend --dry-run       say what would happen, change nothing
     bin/provision-backend --check         report only; exit 1 if anything is missing
     bin/provision-backend --no-install    never sudo; exit 2 naming how to install what is missing
+    bin/provision-backend --operator-key <file.pub>
+                                          let the operator's key into the agents account
 
 **This is the provisioning half of standing the backend up**, and it is
 deliberately only that half. A clean Ubuntu 22.04 machine is missing `zsh`,
@@ -47,10 +49,15 @@ third.
 from __future__ import annotations
 
 import argparse
+import importlib.machinery
+import importlib.util
 import os
+import pwd
+import re
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 PROG = "provision-backend"
 
@@ -379,6 +386,103 @@ def refuse_missing(missing: list[dict], platform: str) -> Refused:
     )
 
 
+# An OpenSSH public key line: a key type, its base64 body and an optional comment.
+# Printable ASCII only, so no control character reaches authorized_keys.
+OPERATOR_KEY = re.compile(
+    r"(?:ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)"
+    r"|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)"
+    r" [A-Za-z0-9+/=]+(?: [ -~]*)?")
+AGENTS = "agents"
+SUDO = "/usr/bin/sudo"
+
+
+def read_operator_key(path: str) -> str:
+    """The one public key line in `path`, or a refusal. Never a private key.
+
+    **THE FILE MUST BE THE PUBLIC HALF, ONE KEY, NOT A LINK.** A private key
+    fails the pattern on its first line, and a file with two keys is refused
+    rather than having both let in: what the operator named is what gets in.
+    """
+    candidate = Path(path)
+    if candidate.is_symlink() or not candidate.is_file():
+        raise Refused(f"{path} is not a regular file. Name the public key file, "
+                      f"the one ending in .pub. Nothing was changed.")
+    lines = [line.strip() for line in candidate.read_text(encoding="utf-8").splitlines()
+             if line.strip()]
+    if len(lines) != 1 or not OPERATOR_KEY.fullmatch(lines[0]):
+        raise Refused(f"{path} does not hold exactly one OpenSSH public key. It is refused "
+                      f"when it holds a private key, several keys, or anything else. "
+                      f"Nothing was changed.")
+    return lines[0]
+
+
+def install_operator_key(key: str, run=subprocess.run) -> str:
+    """Add `key` to the agents account's authorized_keys unless it is there: 'added' or 'present'.
+
+    **THE KEY IS WRITTEN BY `agents`, INTO `agents`' OWN HOME.** The operator
+    cannot write there without the account, and `agents` is who the key is for.
+    The key arrives as a positional argument to a fixed script, never spliced
+    into the script text, so its comment cannot run anything.
+    """
+    script = (
+        'umask 077 && mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh" && '
+        'touch "$HOME/.ssh/authorized_keys" && '
+        'if grep -qxF -- "$1" "$HOME/.ssh/authorized_keys"; then echo present; '
+        'else printf "%s\\n" "$1" >> "$HOME/.ssh/authorized_keys" && echo added; fi'
+    )
+    done = run([SUDO, "-u", AGENTS, "-H", "/bin/sh", "-c", script, "sh", key],
+               capture_output=True, text=True, check=False, timeout=120)
+    verdict = done.stdout.strip()
+    if done.returncode != 0 or verdict not in ("added", "present"):
+        raise Refused(f"could not write the key to the `{AGENTS}` account's authorized_keys "
+                      f"(exit {done.returncode}): {(done.stderr or done.stdout).strip()[-300:]}")
+    return verdict
+
+
+def deck_lines(user: str = AGENTS) -> list[str]:
+    """The ssh line and Deck's host entry for the agents account, from the stand-up command.
+
+    The entry is stand-up-backend's own `pairing_lines`, so the fingerprint and the
+    address are the ones a pairing check reads, not a second copy of them.
+    """
+    loader = importlib.machinery.SourceFileLoader(
+        "standup", str(Path(__file__).resolve().with_name("stand-up-backend")))
+    standup = importlib.util.module_from_spec(importlib.util.spec_from_loader("standup", loader))
+    loader.exec_module(standup)
+    name = standup.tailnet_name()
+    host = name or "<the name that computer reaches this machine by>"
+    return [f"ssh {user}@{host}", *standup.pairing_lines(user)]
+
+
+def operator_key_step(args, parser) -> int:
+    """Validate the key, then add it, or in a report mode say what would be added.
+
+    **RUN AS THE OPERATOR, NEVER UNDER ROOT.** The key is written by `sudo -u agents`, which this
+    does itself, so root has nothing to add. Under root, `deck_lines` would load the checkout's
+    `stand-up-backend` and run whichever `tailscale` PATH finds, both as root.
+    """
+    if os.geteuid() == 0:
+        raise Refused("--operator-key runs as the operator and writes into the agents account with sudo "
+                      "itself. Run it without sudo. Nothing was changed.")
+    try:
+        pwd.getpwnam(AGENTS)
+    except KeyError:
+        raise Refused(f"the `{AGENTS}` account does not exist. Run `sudo bin/provision-accounts` "
+                      f"first. Nothing was changed.")
+    key = read_operator_key(args.operator_key)
+    if args.dry_run or args.check:
+        print(f"would add the key in {args.operator_key} to the `{AGENTS}` account's "
+              f"authorized_keys, and changes nothing else")
+        return 0
+    verdict = install_operator_key(key)
+    print("the key was already in the agents account's authorized_keys" if verdict == "present"
+          else "added the key to the agents account's authorized_keys")
+    print()
+    for line in deck_lines():
+        print(line)
+    return 0
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog=PROG, description="Install what Builder's backend needs from the platform."
@@ -397,11 +501,23 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="report only, and exit 1 if anything is missing",
     )
+    parser.add_argument(
+        "--operator-key",
+        metavar="FILE",
+        help="the operator's public key (a .pub file), added to the agents account's "
+             "authorized_keys so the operator can ssh in as agents. Runs sudo to write "
+             "into that account's home, so it cannot combine with --no-install",
+    )
     args = parser.parse_args(argv)
     if args.no_install and (args.check or args.dry_run):
         parser.error("--no-install changes nothing already; give it alone")
+    if args.no_install and args.operator_key:
+        parser.error("--operator-key writes into the agents account with sudo, which "
+                     "--no-install forbids; run it without --no-install")
 
     try:
+        if args.operator_key is not None:
+            return operator_key_step(args, parser)
         platform = detect_platform()
         items = plan(platform)
         missing = [item for item in items if item["state"] == "missing"]

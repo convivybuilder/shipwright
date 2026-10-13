@@ -3,7 +3,8 @@ description = "Serves the Library, which is how every session reaches the Refere
 label = "com.convivy.library"
 command = ["/bin/sh", "{deploy}/library/serve.sh"]
 platforms = ["macos", "linux"]
-scope = "user"
+scope = "system"
+account = "agents"
 enabled-by-default = true
 working-directory = "{deploy}/library"
 

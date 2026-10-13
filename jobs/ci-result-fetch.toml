@@ -6,7 +6,8 @@ command = [
   "{deploy}/library/bin/ci_result_fetch.py",
 ]
 platforms = ["macos", "linux"]
-scope = "user"
+scope = "system"
+account = "agents"
 enabled-by-default = false
 working-directory = "{deploy}/library"
 

@@ -6,7 +6,8 @@ command = [
   "{deploy}/library/cold_tier.py",
 ]
 platforms = ["macos", "linux"]
-scope = "user"
+scope = "system"
+account = "agents"
 enabled-by-default = true
 working-directory = "{deploy}/library"
 

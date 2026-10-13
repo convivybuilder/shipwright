@@ -73,7 +73,7 @@ settings on GitHub; the rule this guide prints has none.
 
 ## Before you start
 
-You need the install from [Installing Builder today](installing.md), a GitHub account of your own,
+You need the install from [Installing Builder](installing.md), a GitHub account of your own,
 and the repositories your crews work in. Run every command below in a terminal on the machine
 Builder runs on, as your own account.
 
@@ -162,6 +162,10 @@ It prints the rule as a file's worth of JSON, followed by where to import it. Sa
 file. In the repository on GitHub, open **Settings**, then **Rules**, **Rulesets**, **New ruleset**
 and **Import a ruleset**, and choose the file. Under a GitHub organisation, add `--org <name>` and
 import it once in the organisation's settings to cover every repository.
+
+While you're in the repository's **Settings**, under **General**, **Pull Requests**, also turn on
+**Automatically delete head branches**. Without it, a pull request stacked on another lands on
+main by itself only when GitHub deletes the base branch as part of merging it.
 
 ## 5. Check it
 

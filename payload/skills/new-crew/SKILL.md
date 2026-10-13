@@ -11,7 +11,7 @@ Create a crew: a working directory, a tmux session running `co` in it, and a spe
 
 Ask for anything you do not have. Do not guess a directory or invent a display name.
 
-- **`id`** — the tmux session name. Lowercase letters, digits, `-` and `_` only, 64 chars max. **No `.`**: tmux 3.3a renames a session `a.b` to `a_b`, so the session would not carry the crew's id, and `..` would put the crew's directory outside the builder root. **It must not be a prefix of an existing session name, and no existing name may be a prefix of it.** `shop` and `shop-mobile` are exactly this mistake, and it causes the wrong session's conversation to render (tmux resolves a bare `-t <name>` target by prefix). Check with the listing below before you commit to a name.
+- **`id`** — the tmux session name. Lowercase letters, digits and `-` only, starting with a letter, 64 chars max. **No `_`, and no leading digit**: the projects registry refuses either, so the crew could not be registered below. **No `.`**: tmux 3.3a renames a session `a.b` to `a_b`, so the session would not carry the crew's id, and `..` would put the crew's directory outside the builder root. **It must not be a prefix of an existing session name, and no existing name may be a prefix of it.** `shop` and `shop-mobile` are exactly this mistake, and it causes the wrong session's conversation to render (tmux resolves a bare `-t <name>` target by prefix). Check with the listing below before you commit to a name.
 - **`displayName`** — what a person reads on the rail. "Shop Mobile", not `shop-mobile`.
 - **`workingDirectory`** — an absolute path. **This field is load-bearing and must never be omitted.** Without it the session is created in `$HOME`, which is outside every crew directory, so nothing can ever group it and `bin/co` will not find the project. Propose `$(builder-root)/<id>` unless the person names another place: `agentctl spawn --on <id>` and `agentctl crew doctor` look for the crew's checkout at exactly that path, so a crew anywhere else cannot be dispatched to.
 - **`project`** and **`bead`** — optional. `bead` is a Library doc id, and it is PICKED rather than derived from the session id.
@@ -93,6 +93,44 @@ One file per crew, so two agents writing at once cannot collide:
 
 Omit a field you do not have rather than writing `null` or a placeholder. `sessions` is the crew's pinned children and starts empty; `new-subcrew` appends to it.
 
+## Register the crew in the projects registry
+
+**A crew that is not in the projects registry cannot file a work item.** The work queue checks a
+work item's `product` against `config/projects.json`, and `/write-bead` files the crew's first epics
+under its id. Register the crew now, before its bead:
+
+```bash
+agentctl crew register '<id>' --display '<displayName>'
+```
+
+Add `--home-dir '<workingDirectory>'` when the crew's directory is not `$(builder-root)/<id>`. Without
+it, the row records the crew's home as `<root>/<id>`, which is wrong for any other directory.
+
+**Single-quote the display name and the directory, as above.** Both are free text from the person,
+and inside double quotes the shell would still act on a `$`, a backtick or a `"` in them. Inside
+single quotes it acts on nothing. Write a single quote that is part of the value as `'\''`, so
+`Bob's Shop` becomes `'Bob'\''s Shop'`.
+
+It prints the row it wrote and exits `0`. The Library reads the registry again when the file
+changes, so the crew can file at once, with no restart. **It may also print a note that a running
+Library will not accept the crew's product until it restarts. Do not restart anything for it.** The
+note is out of date: the Library re-reads the file on its next request.
+
+It also refuses an id with an `_` or a leading digit, which the rule under "Before you start" already excludes. That refusal is about the id's form, not another crew.
+
+**It refuses, exits `1` and writes nothing when the id is already claimed** as another crew's slug,
+alias or repository name, and the refusal names that crew. Do not register under a different name to
+get past it, and do not edit `config/projects.json` by hand. Choose a new `id` with the person,
+remove what you made for this one, and start again from the top. Remove the session by the id
+you captured, which is exact where a name is not:
+
+```bash
+tmux kill-session -t '<the $N captured above>'
+rm ~/.config/convivy/deck/crews.d/<id>.json
+```
+
+Leave the directory for the person to remove, since they may have put something in it.
+
 ## Register the crew's agent prefix with the Bosun, or the crew is not done
 
 A crew's agents carry a prefix (`shop-coder`, `atlas-coder`), and dispatch strips it to find the
@@ -159,11 +197,11 @@ Each line reads one of four ways:
 It exits `0` when no line reads `MISSING` or `UNKNOWN`, `1` when any does, and `2` when it could not
 run at all.
 
-**Run it once the crew's bead is written.** The doctor finds a crew through `projects/<id>/` in the
-knowledge repository, and the bead is what creates that directory. Before the bead exists, the doctor
-prints one line, `MISSING registry entry (config/projects.json) [Bosun] — no unit named '<id>'`, and
-checks nothing else. That line means only that the bead is not written yet. Do not route it to the
-Bosun. Say the crew is waiting on its bead, and run the doctor again after `/write-bead`.
+**Run it once the crew's bead is written.** The doctor finds a crew's knowledge sites through
+`projects/<id>/` in the knowledge repository, and the bead is what creates that directory. If the
+doctor prints `MISSING registry entry (config/projects.json) [Bosun] — no unit named '<id>'`, the
+registration step above did not take. Do not route that line to the Bosun. Run the registration step
+again, and run the doctor after it.
 
 **A site owned by `this crew` is yours to fix.** It is the crew's own directory, and it reads
 `MISSING` for one of two reasons, which the line's detail tells apart:

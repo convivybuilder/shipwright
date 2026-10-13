@@ -3,7 +3,8 @@ description = "Pulls the knowledge repository every ten minutes so a merged docu
 label = "com.convivy.knowledge-autopull"
 command = ["{deploy}/agent-platform/bin/knowledge-autopull"]
 platforms = ["macos", "linux"]
-scope = "user"
+scope = "system"
+account = "agents"
 enabled-by-default = true
 working-directory = "{deploy}/agent-platform"
 

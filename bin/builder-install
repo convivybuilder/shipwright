@@ -1,0 +1,311 @@
+#!/bin/sh
+# builder-install — install Builder end to end, with no prior clone.
+#
+#     curl -fsSL https://convivybuilder.org/install.sh | sh
+#     curl -fsSL https://convivybuilder.org/install.sh | sh -s -- --role laptop
+#     sh bin/builder-install [--role server|laptop] [--src-dir DIR] [--release vX.Y.Z]
+#
+# WHY POSIX sh. `curl ... | sh` has to work on whatever shell Debian, Ubuntu
+# and macOS each run as `/bin/sh`, before anything else is known to be on the
+# machine. Nothing below reaches for python3 until the prerequisite check has
+# confirmed one worth reaching for.
+#
+# WHY THIS SCRIPT RESOLVES ITS OWN RELEASE RATHER THAN TAKING ONE FOR GRANTED.
+# A copy obtained by `git clone` at a tag ships `release.json` beside `bin/`,
+# so a run from that checkout reads its own version there — "the release the
+# script ships in". A copy obtained by `curl | sh` is a single file piped to
+# a shell with no `release.json` anywhere near it, and "$0" is not a path
+# worth trusting either. `tools/build-site.py` closes that gap for the copy
+# served at /install.sh by rewriting BAKED_RELEASE below when it has been told
+# the release the site should currently install; until it has been told one
+# — which is the state of this repository before any release exists — the
+# placeholder ships untouched and this refuses, naming --release, rather than
+# installing something nobody chose.
+#
+# WHY A TAG IS CONFIRMED ON THE REMOTE BEFORE ANYTHING IS CLONED. Whatever
+# names the release — BAKED_RELEASE, a sibling release.json, or --release
+# typed by hand — can be wrong: stale, mistyped, or a release the public
+# mirror has not caught up to yet. `git ls-remote` against the tag is the one
+# check that is right by construction, because it asks the repository this
+# install is about to trust rather than trusting the input a second time.
+set -eu
+
+# **THE WHOLE BODY IS ONE FUNCTION, CALLED ON THE LAST LINE.** Piped from curl,
+# the shell runs each statement as it arrives, so a download cut off midway
+# would run whatever prefix arrived, ending in a truncated command. A function
+# runs only once its closing brace has been read, so a cut-off copy runs
+# nothing. The body is left unindented so the BAKED_RELEASE line keeps the
+# exact text tools/build-site.py rewrites.
+main() {
+
+# The installers are Python run from the clones; keep their caches out of them.
+PYTHONDONTWRITEBYTECODE=1
+export PYTHONDONTWRITEBYTECODE
+
+PROG=builder-install
+REPOS_BASE="https://github.com/convivybuilder"
+# The five repositories a release names a commit for, plus write-better, which
+# ships no release and is always installed at its own main. Order matters only
+# for the printed log; nothing here depends on it.
+TAGGED_REPOS="shipwright agent-platform library convivy-orient convivy-deck"
+
+# tools/build-site.py replaces this exact line when it builds the copy served
+# at /install.sh and has been told the release to pin. Left untouched, it
+# means no release is baked in: see the docstring above.
+BAKED_RELEASE="@RELEASE@"
+
+ROLE=server
+SRC_DIR="${HOME:-}/src"
+RELEASE=""
+
+die() {
+    echo "$PROG: refusing — $*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<EOF
+usage: $PROG [--role server|laptop] [--src-dir DIR] [--release vX.Y.Z]
+
+  --role server     install Builder's backend here (default)
+  --role laptop     install Deck here, to work from
+  --src-dir DIR     clone the six repositories into DIR (default ~/src)
+  --release vX.Y.Z  the release to install, when this copy carries none
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --role) [ $# -ge 2 ] || { usage >&2; exit 2; }; ROLE=$2; shift 2 ;;
+        --role=*) ROLE=${1#--role=}; shift ;;
+        --src-dir) [ $# -ge 2 ] || { usage >&2; exit 2; }; SRC_DIR=$2; shift 2 ;;
+        --src-dir=*) SRC_DIR=${1#--src-dir=}; shift ;;
+        --release) [ $# -ge 2 ] || { usage >&2; exit 2; }; RELEASE=$2; shift 2 ;;
+        --release=*) RELEASE=${1#--release=}; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "$PROG: unrecognised argument: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+case "$ROLE" in
+    server|laptop) ;;
+    *) die "--role must be 'server' or 'laptop', not '$ROLE'" ;;
+esac
+
+case "$(uname -s)" in
+    Linux) PLATFORM=linux ;;
+    Darwin) PLATFORM=macos ;;
+    *) die "$(uname -s) is neither Linux nor macOS, and Builder installs on only those two" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Prerequisites. Checked together and named together, the way provision-
+# backend reports a plan before changing anything — the operator reads one
+# list rather than fixing one thing to discover the next.
+# ---------------------------------------------------------------------------
+
+PYTHON3=""
+find_python311() {
+    if command -v python3.11 >/dev/null 2>&1; then
+        PYTHON3=python3.11
+        return 0
+    fi
+    if command -v python3 >/dev/null 2>&1 \
+        && python3 -c 'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 11) else 1)' 2>/dev/null
+    then
+        PYTHON3=python3
+        return 0
+    fi
+    return 1
+}
+
+MISSING=""
+note_missing() {
+    MISSING="$MISSING
+  $1"
+}
+
+if ! command -v git >/dev/null 2>&1; then
+    if [ "$PLATFORM" = linux ]; then
+        note_missing "git — install it with \`sudo apt-get install git\`, or ask whoever administers this machine to"
+    else
+        note_missing "git — install Apple's Command Line Tools with \`xcode-select --install\`"
+    fi
+fi
+
+if ! find_python311; then
+    if [ "$PLATFORM" = linux ]; then
+        note_missing "python3.11 — install it with \`sudo apt-get install python3.11\`, or ask whoever administers this machine to"
+    else
+        note_missing "python3.11 — install it with \`brew install python@3.11\`, or your own copy with \`curl -LsSf https://astral.sh/uv/install.sh | sh\` and then \`uv python install 3.11\`"
+    fi
+fi
+
+if ! command -v claude >/dev/null 2>&1; then
+    note_missing "Claude Code — install it and sign in with \`curl -fsSL https://claude.ai/install.sh | bash\`, then run \`claude\` once"
+fi
+
+if [ "$PLATFORM" = macos ] && ! command -v tmux >/dev/null 2>&1; then
+    note_missing "tmux — install it with \`brew install tmux\`"
+fi
+
+if [ -n "$MISSING" ]; then
+    die "this machine is missing what Builder needs:$MISSING"
+fi
+
+# ---------------------------------------------------------------------------
+# Which release to install.
+# ---------------------------------------------------------------------------
+
+if [ -z "$RELEASE" ] && [ -n "$BAKED_RELEASE" ] && [ "$BAKED_RELEASE" != "@RELEASE@" ]; then
+    RELEASE=$BAKED_RELEASE
+fi
+
+if [ -z "$RELEASE" ] && [ -f "$0" ]; then
+    # A real file, rather than a pipe: $0 can be trusted to name where this
+    # script sits, so a release checkout's own release.json, beside bin/, is
+    # "the release the script ships in".
+    SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+    CANDIDATE="$SCRIPT_DIR/../release.json"
+    if [ -f "$CANDIDATE" ]; then
+        RELEASE=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$CANDIDATE" | head -n 1)
+    fi
+fi
+
+if [ -z "$RELEASE" ]; then
+    die "this copy of $PROG carries no release: it was not run from a release checkout (no release.json beside it), and none is baked into this copy. Pass --release vX.Y.Z naming the release to install."
+fi
+
+# Accept "0.6.1" or "v0.6.1" alike; the tag is always written with the v.
+#
+# **THE SHAPE IS CHECKED BEFORE THE VERSION REACHES GIT**, because `git
+# ls-remote` reads its ref argument as a pattern: `--release '*'` made the
+# tag check below match any release tag, and the clone after it then failed
+# with git's own error instead of a refusal. The shape is the union of what
+# commit-export tags (`-rc1`) and what build-site accepts (`-rc.1`).
+VERSION=${RELEASE#v}
+case "$VERSION" in
+    *"
+"*) VERSION_OK= ;;
+    *) VERSION_OK=$(printf '%s\n' "$VERSION" \
+        | sed -n -E '/^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)(\.?[0-9]+)?)?$/p') ;;
+esac
+if [ -z "$VERSION_OK" ]; then
+    die "'$RELEASE' is not a release version. Pass --release with a version such as 1.2.3 or v1.2.3-rc1."
+fi
+TAG="v$VERSION"
+
+if ! git ls-remote --tags --exit-code "$REPOS_BASE/shipwright" "refs/tags/$TAG" >/dev/null 2>&1; then
+    die "$TAG is not on $REPOS_BASE/shipwright yet, so there is nothing real to install at that release. This can happen when this script is fetched before a release is published; wait for one, or pass --release naming a release that already exists."
+fi
+
+echo "$PROG: installing release $TAG into $SRC_DIR"
+mkdir -p "$SRC_DIR"
+
+# ---------------------------------------------------------------------------
+# Cloning the six repositories. Idempotent: an existing clone already at the
+# right ref, and clean, is left alone and reused.
+# ---------------------------------------------------------------------------
+
+clone_or_verify() {
+    NAME=$1
+    REF=$2
+    DEST="$SRC_DIR/$NAME"
+    URL="$REPOS_BASE/$NAME"
+
+    if [ -e "$DEST" ] && [ ! -d "$DEST/.git" ]; then
+        die "$DEST exists and is not a git checkout; move it aside and run again"
+    fi
+
+    if [ -d "$DEST/.git" ]; then
+        # Only changes to tracked files count. The installers read each release
+        # with `git archive`, so an untracked file cannot reach an install, and the
+        # published trees ship no .gitignore: a first run's __pycache__ would
+        # otherwise make every rerun refuse its own clone.
+        if [ -n "$(git -C "$DEST" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+            die "$DEST has uncommitted changes to its files; $PROG will not touch a clone that is not clean. Commit, discard or move it aside, then run again."
+        fi
+        if [ "$REF" = main ]; then
+            CURRENT_BRANCH=$(git -C "$DEST" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+            if [ "$CURRENT_BRANCH" != main ]; then
+                die "$DEST is checked out at '$CURRENT_BRANCH', not main; $PROG will not move a clone that is already somewhere else. Check it out at main yourself, or move it aside, then run again."
+            fi
+            echo "$PROG: reusing $DEST (write-better tracks main)"
+            return 0
+        fi
+        # A release tag is annotated (commit-export writes it with -a), so the tag
+        # itself names a tag object; ^{commit} peels it to the commit HEAD is at.
+        WANTED_COMMIT=$(git -C "$DEST" rev-parse "refs/tags/$REF^{commit}" 2>/dev/null || echo "")
+        if [ -z "$WANTED_COMMIT" ]; then
+            die "$DEST has no tag $REF; fetch it there yourself with \`git -C $DEST fetch origin tag $REF\`, or move the clone aside and run again"
+        fi
+        CURRENT_COMMIT=$(git -C "$DEST" rev-parse HEAD)
+        if [ "$CURRENT_COMMIT" != "$WANTED_COMMIT" ]; then
+            die "$DEST is checked out at $CURRENT_COMMIT, not the release $REF ($WANTED_COMMIT); $PROG will not move a clone that is at another release. Move it aside, or check out $REF there yourself, then run again."
+        fi
+        echo "$PROG: reusing $DEST at $REF"
+        return 0
+    fi
+
+    echo "$PROG: cloning $NAME at $REF into $DEST"
+    git clone --branch "$REF" "$URL" "$DEST"
+}
+
+for REPO_NAME in $TAGGED_REPOS; do
+    clone_or_verify "$REPO_NAME" "$TAG"
+done
+clone_or_verify write-better main
+
+SHIPWRIGHT="$SRC_DIR/shipwright"
+
+# ---------------------------------------------------------------------------
+# Running the installers, in the order their own documentation gives them.
+# ---------------------------------------------------------------------------
+
+run_step() {
+    STEP_NAME=$1
+    shift
+    echo "$PROG: running $STEP_NAME"
+    STATUS=0
+    "$@" || STATUS=$?
+    if [ "$STATUS" -ne 0 ]; then
+        die "$STEP_NAME refused (exit $STATUS). See https://convivybuilder.org/installing.html#when-something-goes-wrong, or installing.md in this checkout, for what to do next."
+    fi
+}
+
+can_use_sudo() {
+    [ "$(id -u)" -eq 0 ] && return 0
+    command -v sudo >/dev/null 2>&1 || return 1
+    SUDO_PROBE=$(sudo -n true 2>&1) && return 0
+    case "$SUDO_PROBE" in
+        *password*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+if [ "$ROLE" = server ]; then
+    if [ "$(id -u)" -eq 0 ]; then
+        run_step provision-backend "$PYTHON3" "$SHIPWRIGHT/bin/provision-backend"
+    elif [ "$PLATFORM" = linux ] && can_use_sudo; then
+        echo "$PROG: provision-backend needs root once; this will ask for your account's password"
+        run_step provision-backend sudo "$PYTHON3" "$SHIPWRIGHT/bin/provision-backend"
+    else
+        run_step provision-backend "$PYTHON3" "$SHIPWRIGHT/bin/provision-backend" --no-install
+    fi
+    run_step install-payload sh "$SHIPWRIGHT/bin/install-payload"
+    run_step stand-up-backend "$PYTHON3" "$SHIPWRIGHT/bin/stand-up-backend" \
+        --shape single --seed-registry --activate
+    echo
+    echo "$PROG: done. Open a new login shell (or log out and back in), then check:"
+    echo "    command -v co agentctl"
+    echo "Both should print a path under ~/.local/bin. On your Mac laptop, install Deck:"
+    echo "    curl -fsSL https://convivybuilder.org/install.sh | sh -s -- --role laptop"
+    echo "Open Deck and add this server; Deck opens the steward."
+else
+    run_step install-deck "$PYTHON3" "$SHIPWRIGHT/bin/install-deck" --ref "$TAG"
+    echo
+    echo "$PROG: done. Deck is in ~/Applications; open it and add this server. Deck opens the steward."
+fi
+}
+
+main "$@"

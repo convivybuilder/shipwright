@@ -8,9 +8,27 @@ An AI agent is an AI model, such as Claude, given a role and the tools it may us
 on a task. The steward is the first one you meet, and it explains each part of Builder when your
 work reaches it, so you can start without having written a program before.
 
-Builder is free and open source, under the Apache 2.0 licence. This site describes Builder as it is
-designed to work; [Installing Builder today](installing.md) describes its first public release as it
-runs now.
+Builder is free and open source, under the Apache 2.0 licence. Its first public release, 0.6.0, is
+out, and [Installing Builder](installing.md) takes you through installing it. The rest of this site
+describes Builder as it is designed to work.
+
+## Install Builder
+
+Builder runs its sessions on a server that stays on, and you work from Deck on your laptop.
+[Installing Builder](installing.md) explains that layout and how to clone the repositories, then
+sends you to the page for your server:
+
+- **[Installing on Linux, with administrator access](install-linux.md)**
+- **[Installing on Linux, without administrator access](install-linux-without-sudo.md)**
+- **[Installing on a Mac](install-mac.md)**
+
+Builder's source is public, in the [convivybuilder organisation on
+GitHub](https://github.com/convivybuilder): [shipwright](https://github.com/convivybuilder/shipwright),
+[agent-platform](https://github.com/convivybuilder/agent-platform),
+[library](https://github.com/convivybuilder/library),
+[convivy-orient](https://github.com/convivybuilder/convivy-orient),
+[convivy-deck](https://github.com/convivybuilder/convivy-deck) and
+[write-better](https://github.com/convivybuilder/write-better).
 
 ## Start here
 
@@ -19,6 +37,8 @@ straight to the one you need.
 
 - **[Why Builder](why-builder.md)** explains what goes wrong when people build with AI today, and
   what Builder does about it.
+- **[Tips from Builder's author](jays-tips.md)** collects advice on working with Builder day to
+  day.
 - **[Glossary](glossary.md)** explains, one at a time, the words Builder uses.
 - **[How Builder works](how-builder-works.md)** shows how the parts fit together.
 - **[Documentation](documentation.md)** covers getting started and guides for particular jobs.

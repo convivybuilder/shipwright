@@ -9,7 +9,7 @@ Fork Builder when you want to change its code: the installers, the services, the
 what your agents are told or what they may do, you need no fork; [Customizing
 Builder](customizing.md) covers that. You can use Builder fully without ever forking it.
 
-Like [Installing Builder today](installing.md), this page describes Builder as it runs now.
+Like [Installing Builder](installing.md), this page describes Builder as it runs now.
 **Builder's first published release is 0.6.0**, but every command on this page was run before that
 release, on a test machine, against two releases built the same way: `0.9.0` and `0.9.1`. The output
 shown is what that machine printed.
@@ -70,16 +70,19 @@ git clone <Builder's convivy-orient> convivy-orient
 git clone <Builder's write-better> write-better
 ```
 
-Then install as [Installing Builder today](installing.md) says for your machine and account, with
+Then install as [Installing Builder](installing.md) says for your machine and account, with
 its commands as written. On the
 test machine, the forks of `shipwright` and `agent-platform` each carried one commit of their own, the
 install ended with `every step reported success (5 of 5 ran)`, and both forks' commits were what it
 placed.
 
-**Push a change to your fork before you install it.** `install-payload` installs `shipwright` from
-its `main` branch, and the backend is installed from each repository's `origin/main`, which is your
-fork's `main` as your clone last fetched it. A change that exists only in your working files, or
-only on another branch, is not installed.
+**Push a change to your fork before you install it.** The install takes each repository from its
+`stable` branch when your clone has one, and from `main` when it does not: `install-payload` reads
+the local branch, and the backend reads `origin/stable` or `origin/main`, as your clone last fetched
+it. A fork GitHub makes with its default settings copies only `main`, so it installs from `main`. If
+your fork also has a `stable` branch, the install takes that one, so push your change there. A
+change that exists only in your working files, or only on another branch, is not
+installed.
 
 ## How upstream changes reach a fork
 

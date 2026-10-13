@@ -384,7 +384,8 @@ def session_hook(dest: Path, max_age_hours: int) -> int:
                 f"{said}\n"
                 f"Tell the operator this before anything else. A backup runs "
                 f"every six hours on its own; `{PROG}` takes one now, and its "
-                f"log is `builder-backup.log` beside the backup directory."
+                f"log is `builder-backup.log` beside the backup directory on a single-account install, and "
+                f"`/opt/builder/var/log/com.convivy.builder-backup.out` on a two-account one."
             ),
         },
     }))

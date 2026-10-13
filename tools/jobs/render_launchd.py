@@ -49,7 +49,7 @@ def _calendar_entry(time: CalendarTime) -> dict[str, int]:
 ACCOUNT_UMASK = 0o027
 
 
-def to_plist_dict(job: Job, directory: accounts.Directory = accounts.lookup) -> dict:
+def to_plist_dict(job: Job, directory: accounts.Directory | None = None) -> dict:
     """The property list as a dictionary, for rendering or for comparison.
 
     A job with an `account` reads that account from `directory` and refuses
@@ -66,7 +66,7 @@ def to_plist_dict(job: Job, directory: accounts.Directory = accounts.lookup) -> 
     }
     environment = dict(job.environment)
     if job.account is not None:
-        account = accounts.require(job.account, job.source, directory)
+        account = accounts.require(job.account, job.source, directory or accounts.lookup)
         plist["UserName"] = account.name
         plist["GroupName"] = account.group
         plist["Umask"] = ACCOUNT_UMASK
@@ -117,7 +117,7 @@ def to_plist_dict(job: Job, directory: accounts.Directory = accounts.lookup) -> 
     return plist
 
 
-def render(job: Job, directory: accounts.Directory = accounts.lookup) -> bytes:
+def render(job: Job, directory: accounts.Directory | None = None) -> bytes:
     return plistlib.dumps(to_plist_dict(job, directory), sort_keys=True)
 
 

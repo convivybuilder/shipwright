@@ -6,7 +6,8 @@ command = [
   "{deploy}/agent-platform/bin/session-follow-watchdog",
 ]
 platforms = ["macos", "linux"]
-scope = "user"
+scope = "system"
+account = "agents"
 enabled-by-default = false
 working-directory = "{deploy}/agent-platform"
 

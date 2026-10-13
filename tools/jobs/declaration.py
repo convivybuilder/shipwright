@@ -632,14 +632,17 @@ def parse(text: str, source: str = "<memory>") -> Job:
     prepare = [_parse_prepare_step(entry, index, source) for index, entry in enumerate(raw_prepare)]
     # A PREPARE STEP RUNS SOMEWHERE THE JOB NAMES, AS THE ACCOUNT THAT RUNS THE
     # JOB. Without a working-directory it would run wherever the installer
-    # happened to be invoked from. And a system-scope job is installed as
-    # root, so its steps would run as root on every install with no opt-in:
-    # nothing needs that, so it is refused rather than gated (security review).
-    if (directories or prepare) and scope == "system":
+    # happened to be invoked from. A system-scope job with no `account` is
+    # installed as root, so its steps would run as root on every install with
+    # no opt-in: nothing needs that, so it is refused rather than gated (security
+    # review). One that names an account has its steps run as that account, which
+    # is how the Library's database and credentials come to be the account's.
+    if (directories or prepare) and scope == "system" and table.get("account") is None:
         raise DeclarationError(
             source,
-            "directories and prepare are for user-scope jobs only; a system-scope "
-            "job is installed as root, and nothing it needs has to be prepared",
+            "directories and prepare are for user-scope jobs, or for system-scope "
+            "jobs that name an account; a system-scope job with no account is "
+            "installed as root, and its steps would run as root",
         )
     if prepare and not working_directory:
         raise DeclarationError(

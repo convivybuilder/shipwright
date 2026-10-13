@@ -61,7 +61,7 @@ delay-seconds = 10
 | `scope` | `user` or `system`; decides LaunchAgents against LaunchDaemons, and a user unit against a system one |
 | `enabled-by-default` | whether a fresh install starts this job |
 | `working-directory` | optional |
-| `[log]` | `stdout` and `stderr` paths; both optional |
+| `[log]` | `stdout` and `stderr` paths; both optional. On a two-account install a system-scope job that runs as an account ignores them and logs to `/opt/builder/var/log/<label>.out` and `<label>.err` |
 | `[environment]` | string to string |
 | `[schedule]` | `at-load`, `every-seconds`, and `[[schedule.calendar]]` entries |
 | `[restart]` | `policy` of `always`, `on-failure` or `never`, and `delay-seconds` |
@@ -100,9 +100,12 @@ The installer checks `creates` before each run, reading a relative path from the
 has to refuse to damage anything it finds half-made. The Library's credential mints are the case this
 exists for: an install may generate a new local credential and never overwrite one.
 
-Both are for user-scope jobs only, and `prepare` needs a `working-directory`. A system-scope job is
-installed as root, so its steps would run as root on every install; nothing needs that, so the parser
-refuses it. A step with no working directory would run wherever the installer was invoked from.
+Both are for user-scope jobs, and for system-scope jobs that name an `account`. A system-scope job with
+no account is installed as root, so its steps would run as root on every install; the parser refuses
+that. A job that names an account has its directories handed to the account and its steps run as that
+account, so a database or credential a step creates belongs to the account and not to root. `prepare`
+needs a `working-directory`. A step with no working directory would run wherever the installer was
+invoked from.
 
 ### stop-timeout-seconds
 
@@ -148,8 +151,13 @@ using `{root}` needs `--root`. A render for an account the directory service doe
 says to run `provision-accounts`.
 
 `account` on a user-scope job is refused, since that job already runs as the account that installed it.
-A system-scope job without one renders as before and runs as root. `jobs-lint import` reads `UserName`
+A system-scope job without one renders as before and runs as root. A system-scope job with one runs its
+`directories` and `prepare` steps as that account, under root's install. `jobs-lint import` reads `UserName`
 from a property list as `account` on a system-scope job.
+
+A run as root leaves out a user-scope job that names no account. The two-account shape runs `install-jobs`
+as root with `--home` set to the agents account's home, so such a job would be written there. `install-jobs`
+names each job it leaves out and installs nothing for it. `--single-account` installs it for the operator.
 
 ### Calendar times
 

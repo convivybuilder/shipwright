@@ -143,7 +143,8 @@ to, GitHub asks for no code owner's review and would count an agent's approval, 
 still allows](connecting-github.md#what-enforced-still-allows) explains. In **Instruction only**, nothing on GitHub stops an
 agent from merging, so the rule that you merge is held by the machine-wide instruction every session
 reads, `~/.claude/CLAUDE.md`. That instruction stands in both modes. The install writes that file
-only when you have none, and [Where everything runs](where-everything-runs.md#the-single-account-install)
+only when you have none, and [One account vs. multiple accounts on the
+server](accounts-on-the-server.md#the-single-account-install)
 says what to do if you had one.
 
 The decision to merge is yours. On the two-account install the review checks say a change may merge;
@@ -156,8 +157,7 @@ single-account install that refusal covers only merges made through those comman
 mode GitHub refuses the rest without your approval, except on a pull request you opened, where only
 the instruction stops an agent approving; in Instruction only, an agent could merge
 another way, and the `~/.claude/CLAUDE.md` instruction above is the rule against it. A merge you start from Deck or Orient takes a separate path, through a merge check in
-the Library, and that check approves every merge it is asked about for now, as [Installing
-Builder](installing.md) says.
+the Library, and that check approves every merge it is asked about for now, as [What works and what does not yet](install-status.md) says.
 
 ## The Bosun: how an agent is put to work
 
@@ -209,5 +209,6 @@ one step away.
 ## Where to go next
 
 - **[Getting started](getting-started.md)** takes you from installing Builder to your first crew.
-- **[Where everything runs](where-everything-runs.md)** shows which parts can live on which machine.
+- **[How many machines Builder runs on](where-everything-runs.md)** covers one machine or
+  several, and what a second machine buys you.
 - **[The glossary](glossary.md)** explains each word Builder uses.

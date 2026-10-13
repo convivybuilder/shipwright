@@ -4,7 +4,7 @@ Builder's agents work from documents you own: what each agent is told, the rules
 crew's instructions, which documents a crew starts with, and what agents may do without you. This
 page names each of those documents, says what it controls, and walks through one change to each.
 
-Like [Installing Builder today](installing.md), this page describes Builder as it runs now, on a
+Like [Installing Builder](installing.md), this page describes Builder as it runs now, on a
 machine installed from that page. Every change on it was made on a test machine, and the result
 shown is what that machine did.
 
@@ -256,7 +256,7 @@ The agent policy is where you decide what agents may do without asking you. Out 
 nothing they may merge. `agentctl kb merge`, the command the Library merges through, reads the
 policy and refuses anything it does not permit. A merge you start from Deck or Orient takes a
 separate path, through a merge check in the Library, and that check approves every merge it is asked
-about for now, as [Installing Builder](installing.md) says.
+about for now, as [What works and what does not yet](install-status.md) says.
 
 `projects/platform/policy/agent-policy.yaml` holds its own rules in its comments. Each setting is a
 line of exactly `key: value`, and a file that breaks any rule is read as the defaults it names, with

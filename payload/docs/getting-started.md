@@ -2,7 +2,7 @@
 
 This page takes you from installing Builder to your first crew. Like a bead, which is a project's
 short description of where it is going, the page describes Builder as it is designed to work.
-[Installing Builder today](installing.md) covers the install itself, as Builder's first public
+[Installing Builder](installing.md) covers the install itself, as Builder's first public
 release runs it.
 
 There are four stages, and this page takes them in order. You gather what Builder needs, you
@@ -12,12 +12,16 @@ not need to have written a program before.
 
 ## What you need
 
-- **A Mac**, and a terminal you are comfortable opening. A terminal is a window where you type
+- **Two machines.** This release needs a server, which stays on and runs every session, and a Mac
+  laptop, which runs Deck, the app you work from. The server can be a Linux machine, a virtual
+  machine in the cloud, or a Mac left plugged in.
+- **A terminal you are comfortable opening** on each machine. A terminal is a window where you type
   commands, and on a Mac the application is called Terminal.
-- **The Mac's administrator password, for the two-account install**, which uses it to create the
-  two accounts Builder runs as. This release installs only the single-account shape; the
-  two-account install comes in a later release. Without one, choose the single-account install.
-  Both are explained under Install, below.
+- **An account of your own on each machine.** This release installs only the single-account shape,
+  which runs Builder on the server as one account, yours; Deck runs on the laptop as your account
+  there. The two-account install, which comes in a later release, runs Builder on the server under
+  two accounts of its own and needs the server's administrator password to create them. Both are
+  explained under Install, below.
 - **Claude Code, signed in to your Claude account.** Claude Code is the program that lets you talk
   with Claude, an AI model, in a terminal. Every Builder session is a conversation with Claude in a
   terminal.
@@ -36,7 +40,7 @@ can live.
 
 Builder installs from a terminal with a single Homebrew command, which this page will give once
 Builder is public, and you name the install's shape as you run it. The shape decides which user
-account on your Mac Builder runs as, and there are two.
+account on the server Builder runs as, and there are two.
 
 - **The two-account install** creates two accounts, `agents`, which runs Builder, and `reviewers`,
   which runs the agents that review a change, and asks you to turn on Remote Login for `agents` if
@@ -48,8 +52,8 @@ account on your Mac Builder runs as, and there are two.
 Today the single-account install is the only shape built, and [Installing Builder](installing.md)
 gives its steps. Once the two-account install is built, choose it when you have the administrator
 password, because it keeps the agents away from your own files and credentials. The first install
-names the folder where you meet the steward. [Where everything
-runs](where-everything-runs.md#two-install-shapes) says how the two shapes differ, and why the
+names the folder where you meet the steward. [One account vs. multiple
+accounts on the server](accounts-on-the-server.md) says how the two shapes differ, and why the
 two-account install does not run Builder as you.
 
 ## Meet the steward
@@ -57,23 +61,10 @@ two-account install does not run Builder as you.
 The steward is the first session you meet, and it owns no project of its own. It asks what you want
 to build, then gets the smallest real version of that running with you.
 
-To meet it, you open a terminal, go to the steward's folder and start Claude there. On the
-two-account install, Builder's sessions run as `agents`, so you first reach that account over SSH,
-a standard way to open a terminal as another account or on another machine. On the single-account
-install, leave out the `ssh` line:
-
-```
-ssh agents@localhost
-cd ~/builder/steward
-claude
-```
-
-The first line opens a terminal as `agents` on this same Mac, which is what `localhost` means. The
-second moves into the steward's folder. The third starts Claude, and the conversation that opens is
-the steward. Tell it, in plain language, what you want to build.
-
-From another machine, use the Mac's address in place of `localhost`. Deck, Builder's desktop
-application, does the same for you once you have added the Mac to it.
+To meet it, open Deck on your laptop and add the server to it: [After the
+install](after-installing.md#meet-the-steward) gives the exact steps. Once the server is added, Deck
+creates the steward and shows it on the rail. Click its row to open a terminal attached to it, and
+tell it, in plain language, what you want to build.
 
 ## Your first crew
 
@@ -104,7 +95,7 @@ recommendation. You can decide some merges in advance: the agent policy,
 request an agent may merge once review passes. Out of the box it names none. `agentctl kb merge`,
 the command the Library merges through, reads the policy and refuses anything it does not permit. A
 merge you start from Deck or Orient takes a separate path, through a merge check in the Library, and
-that check approves every merge it is asked about for now, as [Installing Builder](installing.md)
+that check approves every merge it is asked about for now, as [What works and what does not yet](install-status.md)
 says. Your knowledge repository holds the Reference Room, Builder's store of what your projects hold
 to be true, which many systems call a knowledge base.
 
@@ -119,5 +110,6 @@ a long list is how you notice you have stopped finishing things.
 ## Where to go next
 
 - **[How Builder works](how-builder-works.md)** shows how the parts fit together.
-- **[Where everything runs](where-everything-runs.md)** shows which parts can live on which machine.
+- **[How many machines Builder runs on](where-everything-runs.md)** covers one machine or
+  several, and what a second machine buys you.
 - **[The glossary](glossary.md)** explains each word Builder uses.
