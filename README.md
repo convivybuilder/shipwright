@@ -26,6 +26,8 @@ These pages assume you have never seen Builder, and each one explains its terms 
 
 - **[Why Builder](payload/docs/why-builder.md)** explains what goes wrong when people build with AI today,
   and what a different shape would have to do about it.
+- **[Choosing a tool](payload/docs/choosing-a-tool.md)** compares the tools for building software with AI
+  agents, Builder among them, and names the cases where another tool will serve you better.
 - **[How Builder works](payload/docs/how-builder-works.md)** explains the model, and where things are kept.
 - **[Getting started](payload/docs/getting-started.md)** shows what a first session looks like.
 - **[What you need](payload/docs/what-you-need.md)** lists what has to exist before you begin.

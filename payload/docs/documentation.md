@@ -5,7 +5,8 @@ they describe Builder as it is designed to work.
 
 Every page assumes you are new to Builder and explains its terms as it goes. If a word stops you,
 [the glossary](glossary.md) has it. If you want the reasons behind Builder before the steps,
-[Why Builder](why-builder.md) is the place to begin.
+[Why Builder](why-builder.md) is the place to begin, and [Choosing a tool](choosing-a-tool.md)
+compares Builder with other tools for building with AI agents.
 
 ## Getting started
 

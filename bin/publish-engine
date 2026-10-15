@@ -884,6 +884,16 @@ def main(argv: list[str]) -> int:
     commit = payload.commit_of(root, args.ref)
     if commit is None:
         raise Refused(f"{args.ref} names no commit in {root}, so there is nothing to export")
+    # --ref keeps defaulting to refs/remotes/origin/main regardless of what
+    # the checkout has on disk, so a checkout sitting on another commit is
+    # told so before the scan result. HEAD that cannot be read — a bare
+    # repository, an unborn branch — prints nothing extra.
+    head = payload.commit_of(root)
+    if head is not None and head != commit:
+        print(
+            f"{PROG}: the checkout's HEAD is at {head[:9]}, but this run scans "
+            f"{args.ref} at {commit[:9]}; pass --ref HEAD to scan the checkout instead."
+        )
     # The licence files are read at the exported commit, never the working
     # tree, and a missing or linked one is refused before anything is written.
     payload.licence_blobs(args.name, root, commit)
@@ -928,8 +938,9 @@ def main(argv: list[str]) -> int:
                 lines.append(f"{title} ({len(items)}):")
                 lines += [f"  {item}" for item in items]
             raise Refused(
-                f"{args.name} at {commit} cannot be exported as it stands. The tree "
-                f"was DISCARDED. No value is printed; open each file to judge it.\n  "
+                f"{args.name} at {args.ref} ({commit[:9]}) cannot be exported as it "
+                f"stands. The tree was DISCARDED. No value is printed; open each file "
+                f"to judge it.\n  "
                 + "\n  ".join(lines)
             )
         # The manifest and marker are written inside the same cleanup, so a
@@ -958,7 +969,7 @@ def main(argv: list[str]) -> int:
         shutil.rmtree(out)
         raise
 
-    print(f"{PROG}: built {len(files)} file(s) of {args.name} at {commit[:9]} for v{args.version} at {out}")
+    print(f"{PROG}: built {len(files)} file(s) of {args.name} at {args.ref} ({commit[:9]}) for v{args.version} at {out}")
     print("  symlinks, .example siblings, content scan: nothing found")
     print(f"  secret-shaped keys: {len(report)} classified, none inline")
     for line in report:

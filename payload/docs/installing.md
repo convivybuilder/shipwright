@@ -1,6 +1,6 @@
 # Installing Builder
 
-These pages install Builder 0.6.0, the first public release. Builder ships from five public
+These pages install Builder's current release; the first public release was 0.6.0. Builder ships from five public
 repositories, each cloned at its `stable` branch: `shipwright`, `agent-platform`, `library`,
 `convivy-orient` and `convivy-deck`. A sixth, `write-better`, ships no release and is cloned at its
 own `main`. [Before you start](#before-you-start) shows how to clone all six.
@@ -32,8 +32,20 @@ On your laptop, to install Deck instead, add `--role laptop`:
 curl -fsSL https://convivybuilder.org/install.sh | sh -s -- --role laptop
 ```
 
-A Homebrew tap, `brew install convivybuilder/tap/builder`, is coming in this same release for a
-Mac; it is not available yet.
+The laptop needs `git`, Python 3.11 and `swift`, which Apple's Command Line Tools provide
+(`xcode-select --install`); it needs neither Claude Code nor `tmux`.
+
+On a Mac with Homebrew, you can install the same installer through Homebrew instead, and then run
+it:
+
+```
+brew install convivybuilder/tap/builder
+builder-install
+```
+
+On your laptop, run `builder-install --role laptop` instead. Homebrew installs only the installer,
+pinned to the current release, along with Python 3.11 and `tmux`; `brew upgrade` moves it
+to each new release.
 
 The rest of this page, and the pages under [Which install is yours](#which-install-is-yours), show
 the manual route: the same steps, one at a time, for anyone who wants to see or do each one

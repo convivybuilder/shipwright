@@ -141,12 +141,18 @@ if ! find_python311; then
     fi
 fi
 
-if ! command -v claude >/dev/null 2>&1; then
-    note_missing "Claude Code — install it and sign in with \`curl -fsSL https://claude.ai/install.sh | bash\`, then run \`claude\` once"
-fi
+# The server runs the sessions, so it needs Claude Code and tmux. The laptop
+# only builds Deck, which install-deck does with python3.11, git and `swift`.
+if [ "$ROLE" = server ]; then
+    if ! command -v claude >/dev/null 2>&1; then
+        note_missing "Claude Code — install it and sign in with \`curl -fsSL https://claude.ai/install.sh | bash\`, then run \`claude\` once"
+    fi
 
-if [ "$PLATFORM" = macos ] && ! command -v tmux >/dev/null 2>&1; then
-    note_missing "tmux — install it with \`brew install tmux\`"
+    if [ "$PLATFORM" = macos ] && ! command -v tmux >/dev/null 2>&1; then
+        note_missing "tmux — install it with \`brew install tmux\`"
+    fi
+elif [ "$PLATFORM" = macos ] && ! command -v swift >/dev/null 2>&1; then
+    note_missing "swift — install Apple's Command Line Tools with \`xcode-select --install\`"
 fi
 
 if [ -n "$MISSING" ]; then

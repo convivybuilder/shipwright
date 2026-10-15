@@ -37,6 +37,8 @@ straight to the one you need.
 
 - **[Why Builder](why-builder.md)** explains what goes wrong when people build with AI today, and
   what Builder does about it.
+- **[Choosing a tool](choosing-a-tool.md)** compares the tools for building software with AI
+  agents, Builder among them, and names the cases where another tool will serve you better.
 - **[Tips from Builder's author](jays-tips.md)** collects advice on working with Builder day to
   day.
 - **[Glossary](glossary.md)** explains, one at a time, the words Builder uses.

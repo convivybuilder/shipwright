@@ -140,5 +140,7 @@ part built on that, and Builder will change as people use it.
 
 ## Where to go next
 
+- **[Choosing a tool](choosing-a-tool.md)** compares Builder with other tools for building with AI
+  agents, and says when another one will suit you better.
 - **[The glossary](glossary.md)** explains each word Builder uses.
 - **[How Builder works](how-builder-works.md)** shows how the parts fit together.
