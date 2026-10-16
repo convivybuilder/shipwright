@@ -1,6 +1,9 @@
 # Installing Builder
 
-These pages install Builder's current release; the first public release was 0.6.0. Builder ships from five public
+_Last checked against Builder 0.6.3, on 2026-10-16._
+
+These pages install Builder's current release; the first public release was 0.6.0, and [the release
+notes](release-notes.md) say what each release changed. Builder ships from five public
 repositories, each cloned at its `stable` branch: `shipwright`, `agent-platform`, `library`,
 `convivy-orient` and `convivy-deck`. A sixth, `write-better`, ships no release and is cloned at its
 own `main`. [Before you start](#before-you-start) shows how to clone all six.
@@ -36,7 +39,8 @@ The laptop needs `git`, Python 3.11 and `swift`, which Apple's Command Line Tool
 (`xcode-select --install`); it needs neither Claude Code nor `tmux`.
 
 On a Mac with Homebrew, you can install the same installer through Homebrew instead, and then run
-it:
+it. This has not been rehearsed: the formula is published and pins the release archive by its
+sha256, but nobody has yet run `brew install` on a clean Mac.
 
 ```
 brew install convivybuilder/tap/builder
@@ -359,5 +363,5 @@ it.
 - **[How Builder works](how-builder-works.md)** explains the parts the install put in place.
 - **[The glossary](glossary.md)** explains each word Builder uses.
 
-Last, read [What works and what does not yet](install-status.md), which lists what 0.6.0 has been
+Last, read [What works and what does not yet](install-status.md), which lists what Builder has been
 seen doing on each test machine, and what it cannot do yet.

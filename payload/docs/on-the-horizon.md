@@ -3,7 +3,7 @@
 
 Convivy Builder is itself only partially built -- perhaps perpetually so. At some point in late summer 2026, it crossed a threshold of becoming complete enough to me (Jay) that it became the only development platform I want to use. And thus it became the platform used to build itself, along with some other things.
 
-Because I find it helpful in its current state, and others might find it helpful too, I'm sharing it despite it being far from perfect. It has some UI wonkiness, a couple features in Deck that don't really make sense (I have no idea what "Promote to crew..." means exactly and how it differs from pinning a crew to the rail), and some important configurations that haven't shipped yet -- specifically, 1) sessions and the Keel running on a Linux server instead of a Mac server, and 2) multiple user accounts for different types of agents, as a way to control each agent-type's permissions.
+Because I find it helpful in its current state, and others might find it helpful too, I'm sharing it despite it being far from perfect. It has some UI wonkiness, a couple of features in Deck that don't really make sense (I have no idea what "Promote to crew..." means exactly and how it differs from pinning a crew to the rail), and some important configurations that haven't shipped yet -- specifically, 1) sessions and the Keel running on a Linux server instead of a Mac server, and 2) multiple user accounts for different types of agents, as a way to control each agent-type's permissions.
 
 Finishing those issues is first on the roadmap.
 

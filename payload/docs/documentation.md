@@ -32,6 +32,7 @@ fifth.
   later release, and how to meet the steward, and covers backups.
 - **[What works and what does not yet](install-status.md)** lists what release 0.6.0 has been seen
   doing on each test machine, and what it cannot do yet.
+- **[Release notes](release-notes.md)** says what changed in each release, newest first.
 
 ## Guides
 

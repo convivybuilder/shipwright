@@ -45,6 +45,10 @@ owner has to decide about. A bare hostname is not detected: no shape
 distinguishes one from any other word, and the purity checker keeps names as a
 closed list for that reason.
 
+`--scan-only` RUNS THE SAME DETECTORS AND BUILDS NOTHING, for a push-time
+gate: exit 0 clean, 1 findings, 2 refused. It also accepts write-better, which
+is public as it stands and ships in no release. See scan_only() below.
+
 WHAT THIS REFUSES TO DO. It does not push, create a repository, or change any
 repository's visibility. It writes a directory. Publishing is a separate,
 deliberate act by a person, because content once fetched stays fetched.
@@ -99,10 +103,16 @@ run = payload.run
 
 # Every engine repository: all of publish-payload's but the one it exports.
 ENGINES = tuple(name for name in payload.KNOWN_REPOSITORIES if name != "shipwright")
+# **A REPOSITORY THAT IS SCANNED BUT NEVER EXPORTED.** write-better is public as
+# it stands and ships in no release, so no release scan ever reads it, and a
+# push-time scan is the only gate it has. `--scan-only` accepts it; an export
+# refuses it, since there is no release tree to build.
+SCAN_ONLY = ("write-better",)
+SCANNED = ENGINES + SCAN_ONLY
 
 # PATHS LEFT OUT OF EACH EXPORT, as git pathspecs. Empty to start: each owner
 # decides what crosses, and until they do the gate refuses what is not clean.
-EXCLUDE: dict[str, tuple[str, ...]] = {name: () for name in ENGINES}
+EXCLUDE: dict[str, tuple[str, ...]] = {name: () for name in SCANNED}
 # agent-platform's `config/projects.json` is Convivy's own projects registry: it
 # names the company's crews, its private crews and the people behind them, and
 # the private-crew rule keeps all of that off an adopter's machine. Its owner
@@ -121,7 +131,7 @@ EXCLUDE["convivy-deck"] = ("inbox", ".github/workflows/ci.yml")
 # a machine's name in it, so a path that carries one is pinned by its hash the
 # way an ALLOW entry pins a value. Each entry is one file, never a directory,
 # and is matched against the paths tracked at the exported commit.
-EXCLUDE_HASHED: dict[str, tuple[tuple[str, str], ...]] = {name: () for name in ENGINES}
+EXCLUDE_HASHED: dict[str, tuple[tuple[str, str], ...]] = {name: () for name in SCANNED}
 # Four tools set up one operator's own pair of Macs (volume mounts, and an ssh
 # config naming that operator's tailnet hosts and user), and the fifth is a
 # bash test that pins the ssh tool's hostnames and cannot run without it. An
@@ -169,7 +179,17 @@ def hashed_exclusions(name: str, root: Path, commit: str) -> list[str]:
 # beside the fixture, or swapped in for it, shipped with no finding (security
 # review: convivy-orient's main held a different address on the very line its
 # allowance covers). The hash stores no value in this public file.
-ALLOW: dict[str, tuple[tuple[str, str, str, str], ...]] = {name: () for name in ENGINES}
+ALLOW: dict[str, tuple[tuple[str, str, str, str], ...]] = {name: () for name in SCANNED}
+
+# **A PAGE THE OPERATOR HAS RULED HAND-WRITTEN WITHOUT MARKING IT.** A page
+# whose first line is the authorship mark is hand-written, and the content
+# scan reports what it finds there as a notice rather than a refusal; the other
+# three detectors still apply. A path listed here gets the same treatment in
+# a repository whose files carry no mark. write-better's style guide credits
+# its author by name, and he ruled on 2026-10-15 that it counts as a
+# hand-written page and keeps the name.
+HAND_WRITTEN: dict[str, tuple[str, ...]] = {name: () for name in SCANNED}
+HAND_WRITTEN["write-better"] = ("style-guide.md",)
 
 # THE CONTENT SCAN'S PATTERNS ARE THE PURITY CHECKER'S, SELECTED BY LABEL, so
 # a pattern fixed there is fixed here. A label missing from the checker is a
@@ -643,7 +663,7 @@ def located(text: str, textual: bool, start: int) -> str:
 
 def content_scan(
     tree: Path, files: list[Path], patterns: list[tuple[re.Pattern[str], str]],
-    allow: tuple[tuple[str, str, str, str], ...],
+    allow: tuple[tuple[str, str, str, str], ...], hand_written_paths: tuple[str, ...] = (),
 ) -> tuple[list[str], list[str]]:
     """Detector 3: (findings, notices) — credentials, addresses and machine
     paths, by location and kind.
@@ -663,8 +683,8 @@ def content_scan(
     findings: list[str] = []
     notices: list[str] = []
     for path in files:
-        hand_written = payload.is_hand_written(path)
         rel = path.relative_to(tree).as_posix()
+        hand_written = payload.is_hand_written(path) or rel in hand_written_paths
         where = shown(rel)
         for segment in rel.split("/"):
             for pattern, label in patterns:
@@ -835,20 +855,108 @@ def classifier(
     return findings, report
 
 
+def detect(
+    name: str, tree: Path, allow: tuple[tuple[str, str, str, str], ...],
+    patterns: list[tuple[re.Pattern[str], str]],
+) -> tuple[list[Path], list[tuple[str, list[str]]], list[str], list[str]]:
+    """Run the four detectors over `tree`: (files, findings by detector, key report, notices)."""
+    files, links = walk(tree)
+    classified, report = classifier(tree, files, allow)
+    content_findings, content_notices = content_scan(tree, files, patterns, allow, HAND_WRITTEN[name])
+    detectors = (
+        ("symlinks", symlinks(tree, links)),
+        (".example siblings", example_siblings(tree, files)),
+        ("content scan", content_findings),
+        ("secret-shaped keys", classified),
+    )
+    found = [(title, items) for title, items in detectors if items]
+    return files, found, report, content_notices
+
+
+def finding_lines(found: list[tuple[str, list[str]]]) -> list[str]:
+    """Each detector's findings under its title and count, never a value."""
+    lines = []
+    for title, items in found:
+        lines.append(f"{title} ({len(items)}):")
+        lines += [f"  {item}" for item in items]
+    return lines
+
+
+# **--scan-only ANSWERS ONE QUESTION FOR A PUSH: WOULD A RELEASE REFUSE THIS?**
+# It exports the commit into a temporary directory, runs the same four
+# detectors with the same exclusions and allowances, and deletes the directory,
+# so its verdict is the release's. It skips the licence-file check, which is a
+# property of a published release and which the release still runs, because
+# write-better has no NOTICE and would otherwise be refused on every push.
+# Its exit codes are the contract a caller reads:
+SCAN_CLEAN = 0      # every detector found nothing
+SCAN_FINDINGS = 1   # at least one finding, printed as location and kind
+SCAN_REFUSED = 2    # the scan could not run: a name list, the purity checker or the ref is missing
+
+
+def scan_only(name: str, root: Path, ref: str, commit: str,
+              allow: tuple[tuple[str, str, str, str], ...],
+              patterns: list[tuple[re.Pattern[str], str]]) -> int:
+    """Scan `name` at `commit` by the export's rules, building nothing that outlives the run."""
+    try:
+        with tempfile.TemporaryDirectory(prefix=f"{PROG}-scan-") as tmp:
+            tree = Path(tmp) / name
+            tree.mkdir()
+            export(name, root, commit, tree)
+            files, found, _, notices = detect(name, tree, allow, patterns)
+    except Refused:
+        raise
+    except Exception as exc:
+        # AN UNEXPECTED ERROR IS A REFUSAL, NOT A FINDING. Python exits 1 on an
+        # uncaught exception, which is SCAN_FINDINGS, so a file the scan could
+        # not read would be reported to the push gate as content it found. Only
+        # the class is named, since an error's text can quote what it read.
+        raise Refused(
+            f"the scan of {name} at {commit[:9]} could not finish "
+            f"({exc.__class__.__name__}), so it reached no verdict") from None
+    if found:
+        print(f"{PROG}: {name} at {ref} ({commit[:9]}) would be refused by a release. "
+              f"No value is printed; open each file to judge it.")
+        for line in finding_lines(found):
+            print(f"  {line}")
+        return SCAN_FINDINGS
+    print(f"{PROG}: {name} at {ref} ({commit[:9]}): scanned {len(files)} file(s); "
+          f"symlinks, .example siblings, content scan, secret-shaped keys: nothing found")
+    if notices:
+        print(f"  {len(notices)} notice(s) on a hand-written page, not refused:")
+        for n in notices:
+            print(f"    {n}")
+    return SCAN_CLEAN
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog=PROG, description="Build the public tree of one of Builder's engine repositories.",
     )
-    parser.add_argument("name", choices=ENGINES, help="the repository to export")
-    parser.add_argument("--version", required=True, help="release version, e.g. 0.6.0")
-    parser.add_argument("--out", type=Path, required=True, help="directory to build into")
+    parser.add_argument("name", choices=SCANNED,
+                        help="the repository to export, or with --scan-only to scan")
+    parser.add_argument("--version", help="release version, e.g. 0.6.0")
+    parser.add_argument("--out", type=Path, help="directory to build into")
     parser.add_argument("--from", dest="source", type=Path, default=None,
                         help="the repository's checkout (default: beside this one's primary checkout)")
     parser.add_argument("--ref", default=payload.PUBLISHED_REF,
                         help=f"ref to export (default: {payload.PUBLISHED_REF})")
     parser.add_argument("--force", action="store_true",
                         help="replace a directory this tool built before")
+    parser.add_argument("--scan-only", action="store_true",
+                        help="scan by the export's rules and build nothing; exit 0 clean, "
+                             "1 findings, 2 refused")
     args = parser.parse_args(argv)
+
+    if args.scan_only:
+        if args.version is not None or args.out is not None or args.force:
+            raise Refused("--scan-only builds nothing, so it takes no --version, --out or --force")
+    else:
+        if args.name in SCAN_ONLY:
+            raise Refused(f"{args.name} ships in no release, so it can only be scanned: pass --scan-only")
+        missing = [flag for flag, value in (("--version", args.version), ("--out", args.out)) if value is None]
+        if missing:
+            raise Refused(f"an export needs {' and '.join(missing)}")
 
     # EVERYTHING CHECKABLE WITHOUT TOUCHING DISK IS CHECKED FIRST, so a refusal
     # leaves no partial tree.
@@ -859,7 +967,7 @@ def main(argv: list[str]) -> int:
         )
     # The version is written into release.json after every detector has run,
     # so it takes a release's identifiers rather than free text.
-    if not re.fullmatch(r"\d+\.\d+\.\d+(?:-(?:alpha|beta|rc)(?:\.\d+)?)?", args.version):
+    if not args.scan_only and not re.fullmatch(r"\d+\.\d+\.\d+(?:-(?:alpha|beta|rc)(?:\.\d+)?)?", args.version):
         raise Refused(
             f"{args.version!r} is not a version of the form MAJOR.MINOR.PATCH, "
             f"optionally followed by -alpha, -beta or -rc and a number"
@@ -894,6 +1002,9 @@ def main(argv: list[str]) -> int:
             f"{PROG}: the checkout's HEAD is at {head[:9]}, but this run scans "
             f"{args.ref} at {commit[:9]}; pass --ref HEAD to scan the checkout instead."
         )
+    if args.scan_only:
+        return scan_only(args.name, root, args.ref, commit, allow, patterns)
+
     # The licence files are read at the exported commit, never the working
     # tree, and a missing or linked one is refused before anything is written.
     payload.licence_blobs(args.name, root, commit)
@@ -922,21 +1033,9 @@ def main(argv: list[str]) -> int:
                     f"{filename} is not in the built tree as a regular file; an "
                     f"exclusion must not remove a licence file"
                 )
-        files, links = walk(out)
-        classified, report = classifier(out, files, allow)
-        content_findings, content_notices = content_scan(out, files, patterns, allow)
-        detectors = (
-            ("symlinks", symlinks(out, links)),
-            (".example siblings", example_siblings(out, files)),
-            ("content scan", content_findings),
-            ("secret-shaped keys", classified),
-        )
-        found = [(title, items) for title, items in detectors if items]
+        files, found, report, content_notices = detect(args.name, out, allow, patterns)
         if found:
-            lines = []
-            for title, items in found:
-                lines.append(f"{title} ({len(items)}):")
-                lines += [f"  {item}" for item in items]
+            lines = finding_lines(found)
             raise Refused(
                 f"{args.name} at {args.ref} ({commit[:9]}) cannot be exported as it "
                 f"stands. The tree was DISCARDED. No value is printed; open each file "

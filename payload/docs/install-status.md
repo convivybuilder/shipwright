@@ -1,7 +1,9 @@
 # What works and what does not yet
 
-This page lists what has been seen working in Builder 0.6.0, on which test machine, and what does not
-work yet. [Installing Builder](installing.md) links here from its end.
+_Last checked against Builder 0.6.3, on 2026-10-16._
+
+This page lists what has been seen working in Builder, on which test machine, and what does not work
+yet. [Installing Builder](installing.md) links here from its end.
 
 **Working on Debian, seen in the Linux container rehearsals** (an account with no `sudo`, run
 2026-09-25 and again 2026-10-02/03): `install-payload` and `stand-up-backend --shape single
@@ -43,15 +45,26 @@ This release fixes two defects that rehearsal found: GitHub's host keys are now 
 now works when run with the App's own token. Not yet seen: Deck on a second Mac, reaching the first
 over SSH, with a session started there.
 
-**Not working yet, on any machine:**
+**The one command, seen working on Debian** (a clean Debian 12 container, with the published 0.6.1):
+`curl -fsSL https://convivybuilder.org/install.sh | sh` completed a single-account install.
 
-- **The one command has not been rehearsed yet.** `bin/builder-install`, served at
-  `https://convivybuilder.org/install.sh`, has its own planted-failure test suite, but nobody has
-  yet run `curl -fsSL https://convivybuilder.org/install.sh | sh` against a real, empty machine the
-  way the manual steps above have been. Follow the pages under [Which install is
-  yours](installing.md#which-install-is-yours) until it has.
-- **Orient's pages.** Orient answers every page with `403 Forbidden`, a web server's way of
-  refusing, until the way it identifies a person is built.
+- The first run stopped, named Claude Code as missing, and installed nothing.
+- Once Claude Code was installed, the second run exited 0, and `command -v co agentctl` printed both
+  commands.
+- A third run changed nothing.
+
+**Not working yet, or not yet seen, on any machine:**
+
+- **The one command on a Mac.** It has been seen working on Debian, as described above, but nobody
+  has yet run it against a clean Mac. On a Mac, follow [Installing on a Mac](install-mac.md) until
+  it has.
+- **Homebrew has not been rehearsed.** The `convivybuilder/tap/builder` formula, added in 0.6.2, is
+  published and pins the release archive by its sha256, but nobody has yet run `brew install
+  convivybuilder/tap/builder` against a clean Mac.
+- **Orient's pages.** On the tailnet listener, Orient asks the local Tailscale daemon, by `whois`,
+  which login owns the connecting peer, and serves that viewer only the projects it may see; a peer
+  `whois` cannot name, including a tagged node with no user, gets `403 Forbidden`, the same refusal an
+  unidentified loopback request gets. This has not been seen on a rehearsal machine.
 - **The merge check.** A merge is the acceptance of a proposed change into a project. A merge you
   start from Deck or Orient asks the Library first, and the Library approves every one, its log
   saying `merge admission STUBBED (always approves)`, so it does not yet stop a merge that nobody
@@ -59,10 +72,12 @@ over SSH, with a session started there.
   merge`, and each of those refuses anything your agent policy does not permit.
 - **An updater.** To move to a later release, pull `stable` in each clone, as [Moving to a later
   release](after-installing.md#moving-to-a-later-release) describes; no command does that for you.
-- **A way to check that a release is genuine.** The `v0.6.0` tag and the `stable` branch are not
-  signed, so a clone is only as trustworthy as your connection to GitHub and the `convivybuilder`
+- **A way to check that a release is genuine.** Release tags and the `stable` branch are not signed,
+  so a clone is only as trustworthy as your connection to GitHub and the `convivybuilder`
   organisation's control of its repositories.
-- **The two-account install.** 0.6.0 installs only the single-account shape these pages describe.
+- **The two-account install.** `stand-up-backend --shape two` exists and its code is merged, but
+  nobody has yet run it end to end on a real machine; these pages describe only the single-account
+  shape.
 - **Deck's steps for adding a server have not been rehearsed end to end.** [After the
   install](after-installing.md#meet-the-steward) gives them; nobody has yet run them against a real
   server and a real laptop.
