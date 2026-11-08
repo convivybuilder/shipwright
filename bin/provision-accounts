@@ -1,17 +1,28 @@
 #!/usr/bin/env python3
-"""Create the two accounts Builder runs as, and prove they have the right shape.
+"""Create the service accounts Builder runs as, and prove they have the right shape.
 
-    sudo bin/provision-accounts                 create what is missing
-    sudo bin/provision-accounts --dry-run       say what would happen, change nothing
-    sudo bin/provision-accounts --check         report only; exit 1 on any failing row
-    sudo bin/provision-accounts --remove [--purge-homes]
+    sudo bin/provision-accounts --shape two|three                 create what is missing
+    sudo bin/provision-accounts --shape two|three --dry-run       say what would happen, change nothing
+    sudo bin/provision-accounts --shape two|three --check         report only; exit 1 on any failing row
+    sudo bin/provision-accounts --shape two|three --remove [--purge-homes]
 
-**Builder runs as `agents`, and its reviews run as `reviewers`.** Neither may
-hold anything of the operator's: no admin rights, no `staff` membership, and a
-home the other service account cannot read. The operator joins both accounts'
-groups, which is how they read session output without sudo, and `agents` joins
-the group that macOS's Remote Login admits, which is how the operator reaches
-sessions over ssh.
+**The operator names the shape, and this command never falls back.** `--shape
+two` creates `agents` alone. `--shape three` creates `agents` and `reviewers`.
+No run without `--shape` is accepted.
+
+**Builder runs as `agents`, and on the three-account shape its reviews run as
+`reviewers`.** Neither may hold anything of the operator's: no admin rights, no
+`staff` membership, and a home the other service account cannot read. The
+operator joins the service account's group, which is how they read session
+output without sudo, and `agents` joins the group that macOS's Remote Login
+admits, which is how the operator reaches sessions over ssh.
+
+**The isolation check runs before any grant that would let `agents` in.** After
+the account and its home exist, this command signs in as `agents` and tries to
+list the operator's home. A refusal is required before the operator is added to
+the account's group or `agents` is admitted to the ssh group. When the check
+fails, the run stops with a refusal that names the operator's home and its
+mode, and `agents` is left with no group membership and no ssh access.
 
 **An account of the wrong shape is refused, never corrected.** A primary group
 of `staff`, an admin membership, or a home readable by others means something
@@ -57,6 +68,11 @@ HOME_MODE = 0o750
 # User and group IDs for a new macOS account. Below 500, so macOS treats it as
 # a service account; below 450, because 450 to 499 is the role-account range.
 MAC_ID_RANGE = range(401, 450)
+
+SHAPES = {
+    "two": ("agents",),
+    "three": ("agents", "reviewers"),
+}
 
 
 class Refused(Exception):
@@ -188,7 +204,8 @@ class System:
         except OSError as exc:
             raise Refused(
                 f"`{' '.join(argv)}` could not run ({exc.strerror}), so the isolation "
-                f"check did not run. It needs sudo at /usr/bin/sudo.") from exc
+                f"check did not run. It needs sudo at /usr/bin/sudo."
+            ) from exc
         if done.returncode == 0:
             return True
         if "Permission denied" in done.stderr:
@@ -403,23 +420,24 @@ def system_for_platform() -> System:
     raise Refused(f"{sys.platform} is neither macos nor linux. Nothing was changed.")
 
 
-def inspect(system: System, operator: str) -> tuple[Report, list[str]]:
+def inspect(system: System, operator: str, shape: str) -> tuple[Report, list[str]]:
     """The verification table, and the accounts that do not exist yet.
 
     Computed before anything changes, so `--dry-run`, `--check` and the real
     run answer the same question and a refusal names every problem at once.
     """
+    accounts = SHAPES[shape]
     report = Report()
     missing: list[str] = []
-    accounts: dict[str, Account] = {}
+    present: dict[str, Account] = {}
 
-    for name in SERVICE_ACCOUNTS:
+    for name in accounts:
         account = system.account(name)
         if account is None:
             report.add(f"{name} exists", False, "this command creates it", addable=True)
             missing.append(name)
             continue
-        accounts[name] = account
+        present[name] = account
         report.add(f"{name} exists", True)
 
         primary = system.group_name(account.gid)
@@ -491,7 +509,7 @@ def inspect(system: System, operator: str) -> tuple[Report, list[str]]:
                 f"Remote Login on with access for \"Only these users\", then run "
                 f"this again. Nothing was changed."
             )
-        for name, account in accounts.items():
+        for name, account in present.items():
             member = system.is_member(name, system.ssh_group)
             if name == SSH_ACCOUNT:
                 report.add(f"{name} is a member of {system.ssh_group}", member,
@@ -503,8 +521,8 @@ def inspect(system: System, operator: str) -> tuple[Report, list[str]]:
     # Isolation, asked by running `ls` as the account, so the row is about what
     # the account can do rather than what the modes say it should.
     operator_account = system.account(operator)
-    if SSH_ACCOUNT in accounts:
-        others = [(n, a.home) for n, a in accounts.items() if n != SSH_ACCOUNT]
+    if SSH_ACCOUNT in present:
+        others = [(n, a.home) for n, a in present.items() if n != SSH_ACCOUNT]
         if operator_account is not None:
             others.append((operator, operator_account.home))
         for other, path in others:
@@ -569,17 +587,42 @@ def refuse_wrong(report: Report) -> None:
         )
 
 
-def provision(system: System, operator: str) -> list[str]:
+def isolation_failure(system: System, operator: str) -> tuple[str, str] | None:
+    """The operator home path and its mode if `agents` can list it, else None."""
+    operator_account = system.account(operator)
+    if operator_account is None:
+        return None
+    path = operator_account.home
+    if system.home_stat(path) is None:
+        return None
+    if not system.can_list(SSH_ACCOUNT, path):
+        return None
+    st = system.home_stat(path)
+    mode = stat.filemode(st.st_mode) if st else "unknown"
+    return path, mode
+
+
+def provision(system: System, operator: str, shape: str) -> list[str]:
     """Create what is missing and add what is addable. Returns what changed."""
-    report, missing = inspect(system, operator)
+    accounts = SHAPES[shape]
+    report, missing = inspect(system, operator, shape)
     refuse_wrong(report)
+
+    if shape == "two" and system.account("reviewers") is not None:
+        raise Refused(
+            "a `reviewers` account exists, so this machine already has the "
+            "three-account shape. Use --shape three, or remove it first. "
+            "Nothing was changed."
+        )
+
     changed: list[str] = []
 
-    for name in missing:
-        system.create_account(name)
-        changed.append(f"created {name}")
-
-    for name in SERVICE_ACCOUNTS:
+    # Step 1: the account, its own primary group, a home with mode 750, and the
+    # hidden flag.
+    for name in accounts:
+        if name in missing:
+            system.create_account(name)
+            changed.append(f"created {name}")
         account = system.account(name)
         if account is None:
             raise Refused(f"{name} was created and the directory service does not have it.")
@@ -587,16 +630,29 @@ def provision(system: System, operator: str) -> list[str]:
         if name in missing or st is None:
             system.make_home(account)
             changed.append(f"set {name}'s home {account.home} to drwxr-x---")
-        if not system.is_member(operator, name):
-            system.add_member(operator, name)
-            changed.append(f"added {operator} to {name}")
         if system.hidden(name) is False:
             system.hide(name)
             changed.append(f"hid {name}")
 
+    # Step 2: the isolation check, before any grant that would let agents in.
+    failure = isolation_failure(system, operator)
+    if failure is not None:
+        path, mode = failure
+        raise Refused(
+            f"the isolation check failed: signed in as {SSH_ACCOUNT}, listing {path} "
+            f"succeeded (mode {mode}). The operator's home must be unreadable to "
+            f"{SSH_ACCOUNT} before {operator} joins its group or it gains ssh access. "
+            f"Nothing was changed."
+        )
+
+    # Step 3: the operator added to each account's group.
+    for name in accounts:
+        if not system.is_member(operator, name):
+            system.add_member(operator, name)
+            changed.append(f"added {operator} to {name}")
+
+    # Step 4: ssh group membership, only after an empty password is refused.
     if system.ssh_group is not None and not system.is_member(SSH_ACCOUNT, system.ssh_group):
-        # Asked again here, after any creation, so Remote Login never admits
-        # an account that an empty password would open.
         if system.refuses_empty_password(SSH_ACCOUNT) is False:
             raise Refused(
                 f"{SSH_ACCOUNT} accepts an empty password, so it is not added to "
@@ -609,9 +665,10 @@ def provision(system: System, operator: str) -> list[str]:
     return changed
 
 
-def remove(system: System, purge_homes: bool) -> list[str]:
+def remove(system: System, shape: str, purge_homes: bool) -> list[str]:
+    accounts = SHAPES[shape]
     changed: list[str] = []
-    present = [n for n in SERVICE_ACCOUNTS if system.account(n) is not None]
+    present = [n for n in accounts if system.account(n) is not None]
     # A home the account does not own is not this command's to delete: an
     # account of that name whose home points at the shared folder or the
     # operator's home would otherwise have that path deleted as root
@@ -668,12 +725,14 @@ def resolve_operator(given: str | None) -> str:
 
 def main(argv: list[str], system: System | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog=PROG, description="Create the agents and reviewers accounts Builder runs as."
+        prog=PROG, description="Create the service accounts Builder runs as."
     )
+    parser.add_argument("--shape", required=True, choices=tuple(SHAPES),
+                        help="the account shape to create, check or remove")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="say what would happen, change nothing")
     mode.add_argument("--check", action="store_true", help="report only; exit 1 on any failing row")
-    mode.add_argument("--remove", action="store_true", help="delete both accounts and their groups")
+    mode.add_argument("--remove", action="store_true", help="delete the accounts this shape uses")
     parser.add_argument("--purge-homes", action="store_true",
                         help="with --remove, delete homes that are not empty")
     parser.add_argument("--operator", help="the operator's login (default: the user who ran sudo)")
@@ -690,15 +749,16 @@ def main(argv: list[str], system: System | None = None) -> int:
             raise Refused(f"this needs root. Run: sudo {sys.argv[0]} {' '.join(argv)}".rstrip())
 
         if args.remove:
-            changed = remove(system, args.purge_homes)
+            changed = remove(system, args.shape, args.purge_homes)
             print("\n".join(changed) or "nothing to remove")
             return 0
 
         operator = resolve_operator(args.operator)
-        report, _ = inspect(system, operator)
+        report, _ = inspect(system, operator, args.shape)
         if args.check or args.dry_run:
             control = controls(system, operator)
-            print_table(f"{PROG}: {system.platform}, operator {operator}", report, control)
+            print_table(f"{PROG}: {system.platform}, shape {args.shape}, operator {operator}",
+                        report, control)
             if args.dry_run:
                 refuse_wrong(report)
                 for row in report.to_add:
@@ -706,14 +766,15 @@ def main(argv: list[str], system: System | None = None) -> int:
                 return 0
             return 1 if any(not r.ok for r in report.rows + control.rows) else 0
 
-        changed = provision(system, operator)
+        changed = provision(system, operator, args.shape)
         # Asked again rather than assumed: the table printed after a change is
         # what the directory service now says.
-        after, _ = inspect(system, operator)
+        after, _ = inspect(system, operator, args.shape)
         control = controls(system, operator)
-        print_table(f"{PROG}: {system.platform}, operator {operator}", after, control)
+        print_table(f"{PROG}: {system.platform}, shape {args.shape}, operator {operator}",
+                    after, control)
         print()
-        print("\n".join(changed) or "nothing to do: both accounts already had the right shape")
+        print("\n".join(changed) or f"nothing to do: {args.shape}-account shape already correct")
         failing = [r for r in after.rows + control.rows if not r.ok]
         if failing:
             print(f"\n{PROG}: {len(failing)} row(s) still fail after the change:", file=sys.stderr)

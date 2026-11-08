@@ -1,6 +1,6 @@
 ---
 name: new-crew
-description: Create a new crew — its directory, its tmux session, and the crew spec Deck reads to draw it on the rail. Use when someone asks for a new crew, a new product session, or "set me up a session for X". The steward owns this; a product co that needs a CHILD session under its own crew uses new-subcrew instead.
+description: Create a new crew — its directory, its tmux session, and the crew spec Deck reads to draw it on the rail. Use when someone asks for a new crew, a new product session, or "set me up a session for X". The steward owns this. A request for a second session for the same work is also a new crew; Builder no longer uses child sessions.
 ---
 
 Create a crew: a working directory, a tmux session running `co` in it, and a spec file Deck reads to draw the rail row.
@@ -86,41 +86,47 @@ One file per crew, so two agents writing at once cannot collide:
   "sessionId": "<the $N captured above>",
   "host": "<this machine's hostname — the value Deck lists the session under; `hostname -s` gives it>",
   "project": "<optional>",
-  "bead": "<optional Library doc id>",
-  "sessions": []
+  "bead": "<optional Library doc id>"
 }
 ```
 
-Omit a field you do not have rather than writing `null` or a placeholder. `sessions` is the crew's pinned children and starts empty; `new-subcrew` appends to it.
+Omit a field you do not have rather than writing `null` or a placeholder.
 
 ## Register the crew in the projects registry
 
 **A crew that is not in the projects registry cannot file a work item.** The work queue checks a
-work item's `product` against `config/projects.json`, and `/write-bead` files the crew's first epics
-under its id. Register the crew now, before its bead:
+work item's `product` against the Library's own registry table, and `/write-bead` files the crew's
+first epics under its id. Register the crew now, before its bead:
 
 ```bash
 agentctl crew register '<id>' --display '<displayName>'
 ```
 
-Add `--home-dir '<workingDirectory>'` when the crew's directory is not `$(builder-root)/<id>`. Without
-it, the row records the crew's home as `<root>/<id>`, which is wrong for any other directory.
+Add `--home-dir` when the crew's directory is not `$(builder-root)/<id>`. Without it, the row
+records the crew's home as `<root>/<id>`, which is wrong for any other directory. Pass the directory
+relative to the builder root, written with the literal word `<root>`, never the absolute
+`<workingDirectory>`: a crew at `$(builder-root)/shop/shop-mobile` takes
+`--home-dir '<root>/shop/shop-mobile'`. `register` accepts an absolute path, but the registry then
+refuses the row ("must start with '<root>/' or '~/'") and `agentctl crew doctor` fails on it. The
+single quotes keep the shell from reading `<` as a redirect.
 
 **Single-quote the display name and the directory, as above.** Both are free text from the person,
 and inside double quotes the shell would still act on a `$`, a backtick or a `"` in them. Inside
 single quotes it acts on nothing. Write a single quote that is part of the value as `'\''`, so
 `Bob's Shop` becomes `'Bob'\''s Shop'`.
 
-It prints the row it wrote and exits `0`. The Library reads the registry again when the file
-changes, so the crew can file at once, with no restart. **It may also print a note that a running
-Library will not accept the crew's product until it restarts. Do not restart anything for it.** The
-note is out of date: the Library re-reads the file on its next request.
+It prints the row it wrote and exits `0`. `agentctl crew register` sends the row to the Library
+directly, which records it in its own table, so the crew can file at once, with no restart. **It
+may also print a note that a running Library will not accept the crew's product until it
+restarts. Do not restart anything for it.** The note is out of date: the Library already holds the
+new row, since registration reached it directly rather than through a file it would otherwise have
+to notice changed.
 
 It also refuses an id with an `_` or a leading digit, which the rule under "Before you start" already excludes. That refusal is about the id's form, not another crew.
 
 **It refuses, exits `1` and writes nothing when the id is already claimed** as another crew's slug,
 alias or repository name, and the refusal names that crew. Do not register under a different name to
-get past it, and do not edit `config/projects.json` by hand. Choose a new `id` with the person,
+get past it, and there is no registry file to edit by hand. Choose a new `id` with the person,
 remove what you made for this one, and start again from the top. Remove the session by the id
 you captured, which is exact where a name is not:
 
@@ -130,6 +136,122 @@ rm ~/.config/convivy/deck/crews.d/<id>.json
 ```
 
 Leave the directory for the person to remove, since they may have put something in it.
+
+## Mint the crew's ops credential pair
+
+**A crew with no ops credential has no work-queue tools.** `bin/mcp-ops-server` refuses every call
+unless it is given a readable file naming its crew, and nothing mints that file until this step.
+Run it now that the crew is registered, so its first session already has it:
+
+```bash
+mint-crew-ops-credentials
+```
+
+It is idempotent: it mints the pair this crew is missing and leaves every other crew's pair, and
+anything already minted, alone. It exits `0` even when there is nothing to do. If it exits `1`, it
+has already named which credential failed and, when the cause is a stale store entry with no file,
+the exact command to recover it; route that to the Library rather than guessing.
+
+## Give the crew's repository its GitHub remote, when the install uses GitHub
+
+**On an install connected to GitHub, a crew whose repository does not exist there cannot be
+dispatched to.** Dispatch mints a GitHub credential limited to the crew's repositories, and GitHub
+refuses the whole credential when any of them is missing: `agentctl spawn --on <id>` exits `2` with
+`GitHub refused an installation token (422): There is at least one repository that does not exist or
+is not accessible to the parent installation`. A worktree also needs `origin/main` to start from.
+
+Check whether the install uses GitHub, by whether the install's GitHub App key is in place. Dispatch
+and `agentctl gh` both mint their GitHub credential from that key, so an install without it cannot
+dispatch to a GitHub repository at all:
+
+```bash
+test -s ~/.config/convivy/github-app/app.pem && echo connected || echo "no GitHub"
+```
+
+This shows that the install was set up for GitHub, not that GitHub answers now. The repository check
+in step 2 makes the first call, and a revoked key, an App removed from the account or an unreachable
+GitHub all fail there. The first two print a message naming the key or the installation; an
+unreachable GitHub can end in a Python traceback naming a network error instead. Show whichever you
+get to the person. Do not replace this test with a call: a
+call here has no repository to name yet, and a failed call would skip this section and report that
+the install has no GitHub when it has.
+
+This prints `no GitHub` on an install that was never connected, which is a supported way to run
+Builder for work that is not software. Skip this section and say in your report that the crew has no
+GitHub repository because the install has none. Do not test with bare `gh`, such as `gh api
+rate_limit`: on a machine where no person has logged in to `gh`, it fails although the App reaches
+GitHub, and the test would skip this section on exactly the install that needs it.
+
+Otherwise, do this for the crew's own repository, whose checkout is `<workingDirectory>`. The
+registration above named it `<id>` unless you passed `--repo`.
+
+1. **Find the owner**, the GitHub account or organisation that holds the person's other crews'
+   repositories. Read it from another crew's remote with `git -C '<another crew directory>' remote
+   get-url origin`, and confirm it with the person. Ask them when no other crew has a remote.
+2. **Have the person create the repository, unless it already exists.** Check with:
+
+   ```bash
+   agentctl gh -R '<owner>/<repo>' repo view '<owner>/<repo>' >/dev/null && echo exists || echo missing
+   ```
+
+   `agentctl gh` mints a read-only credential from the install's App for that one repository and
+   runs `gh` under it. Run it this way, never as bare `gh repo view`: bare `gh` uses whatever login
+   the account holds, and with none it prints `missing` for a repository that exists, which would
+   send the person to create it again. When the App cannot see the repository, GitHub refuses the
+   credential and `agentctl gh` exits `2`, saying `does not exist or is not accessible`. A message
+   naming the App key or its installation, or a traceback naming a network error, means the
+   install's GitHub connection is broken; show it to the person rather than asking them to create
+   anything.
+
+   When it prints `missing`, **never run `gh repo create` yourself**. Agents act on GitHub as the
+   install's GitHub App, and that App holds no administration permission, so it cannot create a
+   repository. A create that succeeds from your session has used a person's credential, which is
+   the person acting through you.
+
+   `missing` means the App cannot see the repository: either it does not exist, or it exists and
+   is outside the repositories the App is installed on. Ask the person to open
+   `https://github.com/<owner>/<repo>` in their browser, signed in as themselves:
+
+   - **If GitHub says the page is not found**, ask them to create `<owner>/<repo>` there, private and
+     empty, with no README.
+   - **If the App is installed on selected repositories only**, ask them to add `<owner>/<repo>` to
+     its installation, under the App's settings on GitHub, whether they just created it or it
+     already existed.
+
+   Do not hand them a `gh` command for this: on an install connected by `connect-github`, `gh` acts
+   as the App for everyone on the account, so it would be refused for them too. Carry on once
+   the check above prints `exists`.
+3. **Point the checkout at it**, over HTTPS, since the install's credential helper answers only for
+   HTTPS:
+
+   ```bash
+   git -C '<workingDirectory>' remote get-url origin 2>/dev/null ||
+     git -C '<workingDirectory>' remote add origin 'https://github.com/<owner>/<repo>.git'
+   ```
+
+   If `origin` already names another URL, stop and show it to the person rather than replacing it.
+4. **Give it a first commit and push it as `main`**, unless GitHub already has a `main`:
+
+   ```bash
+   git -C '<workingDirectory>' rev-parse --verify -q HEAD >/dev/null ||
+     git -C '<workingDirectory>' commit --allow-empty -m 'Start <id>'
+   git -C '<workingDirectory>' ls-remote --exit-code origin main >/dev/null ||
+     git -C '<workingDirectory>' push -u origin HEAD:main
+   ```
+
+   `HEAD:main` pushes whatever branch the checkout is on as `main`, so a directory that was already
+   a repository on another branch still gives GitHub the `main` a worktree starts from.
+
+   If the commit is refused with `Please tell me who you are`, the account has no git identity. Ask
+   the person for the name and email they want on Builder's commits, and set them with `git config
+   --global user.name` and `user.email`.
+5. **Confirm both, by their output.** `agentctl gh -R '<owner>/<repo>' repo view '<owner>/<repo>'`
+   prints the repository, and
+   `git -C '<workingDirectory>' ls-remote origin main` prints one line ending `refs/heads/main`. An
+   empty `ls-remote` means `main` never reached GitHub, so the crew cannot be dispatched to yet.
+
+Each further `--repo` you registered names a checkout the person already has. Run step 5 against
+it, and if it has no remote or no `main` on GitHub, take it through the steps above with the person.
 
 ## Register the crew's agent prefix with the Bosun, or the crew is not done
 
@@ -199,7 +321,7 @@ run at all.
 
 **Run it once the crew's bead is written.** The doctor finds a crew's knowledge sites through
 `projects/<id>/` in the knowledge repository, and the bead is what creates that directory. If the
-doctor prints `MISSING registry entry (config/projects.json) [Bosun] — no unit named '<id>'`, the
+doctor prints `MISSING  registry entry  [Bosun]  — no unit named '<id>'`, the
 registration step above did not take. Do not route that line to the Bosun. Run the registration step
 again, and run the doctor after it.
 
@@ -236,7 +358,9 @@ knowledge document, so it changes only through the Library's `kb` tools.
 
 ## Report
 
-Tell the person the crew id, the directory, and that the session is running.
+Tell the person the crew id, the directory, that the session is running, and the crew's GitHub
+repository with the `ls-remote` line that shows its `main`, or that it has none because the install
+does not use GitHub.
 
 **A new crew's session stops at questions only the person may answer.** Claude Code asks whether to
 trust the crew's folder, once per folder. `co` starts it in bypass-permissions mode, so on the first

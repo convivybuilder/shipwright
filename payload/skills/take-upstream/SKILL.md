@@ -46,11 +46,24 @@ python3 "<this skill's directory>/upstream.py" apply <change-id> [<change-id> ..
 
 Each change becomes one branch, `upstream/<release>-<title>`, built from `main` with one commit carrying the change's What and Why. With `--open-prs` each branch is pushed to `origin` and gets one pull request against `main` on the fork's own GitHub repository, which `apply` reads from `origin`'s URL. The fork's working tree and current branch are not touched.
 
-Pass `--open-prs` only when `origin` is on GitHub and `gh` is signed in. Without it, the branches are made locally and you tell the operator their names.
+Pass `--open-prs` only when `origin` is on GitHub and bare `gh` is signed in, since `apply` runs `gh pr create` itself. Without it, the branches are made locally. Where `agentctl` is installed, push and open each one through it, as the next paragraph shows; otherwise tell the operator their names.
 
 `apply` refuses a change that is not CLEAN. Do not work around that refusal.
 
-`apply` also refuses a change whose branch already exists. Check whether that branch has a pull request (`gh pr list --head <branch>`). If it does, the change is already in review. If it does not, an earlier push or `gh pr create` failed: push the branch and open its pull request, or delete the branch and apply again.
+To push a branch and open its pull request through `agentctl`, give the branch a worktree, write the pull request's body where `agentctl pr-open` reads it, and name that worktree to `agentctl publish` and then `agentctl pr-open`. The branch's one commit carries the change's What and Why, so its message is the body:
+
+```bash
+git worktree add '<worktree path>' '<branch>'
+git -C '<worktree path>' log -1 --format=%B > "$(git -C '<worktree path>' rev-parse --path-format=absolute --git-path pr-body.md)"
+agentctl publish '<worktree path>'
+agentctl pr-open '<worktree path>' --title '<title>' --base main
+```
+
+`agentctl pr-open` refuses to open a pull request when that body file is missing or empty.
+
+`agentctl` acts as the install's GitHub App, which needs no person's `gh` login.
+
+`apply` also refuses a change whose branch already exists. Check whether that branch has a pull request with `agentctl gh -R '<owner>/<repo>' pr list --head '<branch>'`, naming the fork's own repository from `origin`'s URL; use bare `gh pr list --head '<branch>'` only where `agentctl` is not installed. If it has one, the change is already in review. If it does not, an earlier push or pull request failed: push the branch and open its pull request as shown above, or delete the branch and apply again.
 
 When two chosen changes touch the same file, each branch is built from `main` without the other, so the second pull request conflicts once the first merges. Take them in release order, and apply the later one after the earlier one has merged.
 

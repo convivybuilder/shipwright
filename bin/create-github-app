@@ -5,6 +5,9 @@ manifest the operator confirms in the browser.
     bin/create-github-app [--org <name>] [--port <n>]   open the page this prints, confirm on GitHub
     bin/create-github-app --code <code>                 finish with the code from the address bar
     bin/create-github-app --read-only ...               the optional second App, read-only
+    bin/create-github-app --if-missing                  do nothing when a key already exists
+    bin/create-github-app --code-from-tty               also accept the whole redirect address
+                                                         pasted at the terminal
 
 **THE MANIFEST FIXES THE PERMISSIONS, AND THE OPERATOR ONLY CONFIRMS THEM.**
 The App gets contents write, pull requests write, checks read, actions read
@@ -14,11 +17,39 @@ metadata read alone, for repositories agents read and never write.
 
 **HOW THE CODE COMES BACK.** This serves a page on 127.0.0.1 that posts the
 manifest to GitHub. After the operator clicks Create, GitHub redirects the
-browser to this listener with a one-time code, which is exchanged for the
-App's id and private key. Over SSH, forward the port first
-(`ssh -L <port>:127.0.0.1:<port> <host>`, with the same `--port` here). When
-the redirect cannot reach the listener, the browser's address bar still holds
-`?code=...`: run again with `--code`.
+browser to this listener with a one-time code and this run's own state, which
+is exchanged for the App's id and private key. Over SSH, forward the port
+first (`ssh -L <port>:127.0.0.1:<port> <host>`, with the same `--port` here).
+When the redirect cannot reach the listener, the browser is left at the
+address GitHub redirected it to even though the page never loaded: run again
+with `--code <that code>`, the value after `code=` in that address, or run
+with `--code-from-tty` and paste the whole address at the terminal when
+prompted, since that still reads from this machine's own controlling terminal
+even when the redirect cannot reach it.
+
+**--if-missing MAKES THIS SAFE TO RUN FROM ANOTHER TOOL.** Builder's own
+installer runs this at the end of a server install. When a key is already
+there, `--if-missing` prints where it is and where to manage the App's
+installations, and exits 0 without opening a listener or touching anything;
+a fresh install still waits for the browser click as usual. The
+installations address comes from the App's slug, stored beside its key when
+it was created, so this never contacts GitHub to produce it; an App created
+before this stored a slug falls back to naming where to find it on
+github.com by hand.
+
+**--code-from-tty OFFERS A SECOND WAY FOR THE CODE TO ARRIVE.** While the
+listener waits for GitHub's redirect, this also reads lines from `/dev/tty`,
+the terminal this is running in, piped install or not. Each line is read as
+the whole address the browser was left at after the failed redirect —
+`http://127.0.0.1:<port>/callback?code=...&state=...` — never a bare code: a
+line that is not shaped like that address, or whose `state` does not match
+this run's own, is refused with a message explaining why, and this keeps
+waiting for another line. Whichever arrives first with a matching state —
+the redirect, or a pasted address followed by enter — wins, and the other
+stops. When `/dev/tty` cannot be opened, this falls back to waiting on the
+redirect alone. Over SSH, with no port forwarded, the browser's redirect
+cannot reach the listener, but the address bar still ends up holding that
+address: copy the whole thing and paste it here.
 
 **IT NEVER REPLACES A KEY.** The id and key are written to the `github-app`
 directory under Builder's configuration directory, `~/.config/convivy`
@@ -38,6 +69,7 @@ import json
 import os
 import pathlib
 import secrets
+import select
 import sys
 import threading
 import urllib.error
@@ -67,6 +99,12 @@ def config_dir(read_only: bool) -> pathlib.Path:
     base = os.environ.get("BUILDER_CONFIG_DIR")
     root = pathlib.Path(base) if base else pathlib.Path.home() / ".config" / "convivy"
     return root / ("github-app-read-only" if read_only else "github-app")
+
+
+def tty_path() -> str:
+    # Overridable so the tests drive --code-from-tty with a pipe or pty of
+    # their own, never the real /dev/tty.
+    return os.environ.get("BUILDER_GITHUB_APP_TTY", "/dev/tty")
 
 
 def manifest(kind: str, redirect: str, name: str) -> dict:
@@ -104,6 +142,11 @@ class Listener(http.server.ThreadingHTTPServer):
     state: str
     code: str | None = None
     done: threading.Event
+    # Guards the check-then-set of `code` and `done` below, since the HTTP
+    # callback and the tty reader each run on their own thread and either
+    # could arrive first: without this, both could pass "not done yet" and
+    # the second to write `code` would silently overwrite the first's.
+    lock: threading.Lock
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -130,15 +173,75 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not code or not secrets.compare_digest(state, self.server.state):
                 self.reply(400, b"This is not the redirect this run is waiting for.")
                 return
-            self.server.code = code
+            with self.server.lock:
+                if not self.server.done.is_set():
+                    self.server.code = code
+                    self.server.done.set()
             self.reply(200, b"Done. Return to the terminal.")
-            self.server.done.set()
             return
         self.reply(404, b"")
 
 
+def _parse_pasted_address(line: str) -> tuple[str, str] | None:
+    """(code, state) from a whole `http://127.0.0.1:<port>/callback?code=
+    ...&state=...` address copied from the browser's address bar, or None
+    when the line is not shaped like one."""
+    parsed = urllib.parse.urlsplit(line)
+    if not parsed.path.endswith("/callback") or not parsed.query:
+        return None
+    query = urllib.parse.parse_qs(parsed.query)
+    code, state = query.get("code", [""])[0], query.get("state", [""])[0]
+    if not code or not state:
+        return None
+    return code, state
+
+
+def _read_code_from_tty(server: "Listener", fd: int) -> None:
+    """Fill in `server.code` from a pasted address read off `fd`, polling so
+    this stops as soon as the redirect wins instead of blocking forever on a
+    terminal nobody is typing at. A line that is not the whole address GitHub
+    redirected the browser to, or whose state does not match this run, is
+    refused with a message and this keeps waiting for another line."""
+    buf = b""
+    try:
+        while not server.done.is_set():
+            ready, _, _ = select.select([fd], [], [], 0.2)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                return
+            if not chunk:
+                return
+            buf += chunk
+            while b"\n" in buf:
+                raw, buf = buf.split(b"\n", 1)
+                text = raw.decode(errors="replace").strip()
+                if not text or server.done.is_set():
+                    continue
+                parsed = _parse_pasted_address(text)
+                if not parsed:
+                    print(f"{PROG}: that is not the whole address. Paste the address the browser "
+                          f"was left at after the failed redirect, the whole "
+                          f"http://127.0.0.1:<port>/callback?code=...&state=... line.", flush=True)
+                    continue
+                code, state = parsed
+                if not secrets.compare_digest(state, server.state):
+                    print(f"{PROG}: that address's state does not match this run; paste the "
+                          f"address this run's own browser page was redirected to.", flush=True)
+                    continue
+                with server.lock:
+                    if not server.done.is_set():
+                        server.code = code
+                        server.done.set()
+                return
+    except OSError:
+        return
+
+
 def wait_for_code(kind: str, org: str | None, port: int, name: str,
-                  wait: float = WAIT_SECONDS, ready=None) -> str:
+                  wait: float = WAIT_SECONDS, ready=None, code_from_tty: bool = False) -> str:
     try:
         server = Listener(("127.0.0.1", port), Handler)
     except OSError as e:
@@ -146,14 +249,31 @@ def wait_for_code(kind: str, org: str | None, port: int, name: str,
                       f"--port, or finish with --code.")
     server.state = secrets.token_urlsafe(24)
     server.done = threading.Event()
+    server.lock = threading.Lock()
     bound = server.server_address[1]
     redirect = f"http://127.0.0.1:{bound}/callback"
     server.page = form_page(create_url(org, server.state), manifest(kind, redirect, name))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+
+    tty_fd = None
+    if code_from_tty:
+        try:
+            tty_fd = os.open(tty_path(), os.O_RDONLY | os.O_NONBLOCK)
+        except OSError:
+            tty_fd = None
+    tty_thread = None
+    if tty_fd is not None:
+        tty_thread = threading.Thread(target=_read_code_from_tty, args=(server, tty_fd), daemon=True)
+        tty_thread.start()
+
     try:
         print(f"Open http://127.0.0.1:{bound}/ in a browser on this machine, then create "
               f"the App on GitHub. Waiting up to {int(wait // 60)} minutes.", flush=True)
+        if tty_fd is not None:
+            print("Over SSH, the redirect will fail in your browser: copy the whole address it "
+                  "was left at (http://127.0.0.1:<port>/callback?code=...&state=...) and paste "
+                  "it here, then press enter.", flush=True)
         if ready:
             ready(bound)
         if not server.done.wait(wait):
@@ -163,6 +283,13 @@ def wait_for_code(kind: str, org: str | None, port: int, name: str,
     finally:
         server.shutdown()
         server.server_close()
+        if tty_thread is not None:
+            tty_thread.join(1)
+        if tty_fd is not None:
+            try:
+                os.close(tty_fd)
+            except OSError:
+                pass
 
 
 def convert(code: str, opener=urllib.request.urlopen) -> dict:
@@ -214,11 +341,29 @@ def store(app: dict, cfg: pathlib.Path) -> None:
     with os.fdopen(fd, "w") as f:
         f.write(app["pem"])
     (cfg / "app-id").write_text(f"{app['id']}\n")
+    slug = app.get("slug")
+    if slug:
+        (cfg / "app-slug").write_text(f"{slug}\n")
     for stale in ("installation-id", "token.json"):
         try:
             (cfg / stale).unlink()
         except FileNotFoundError:
             pass
+
+
+def manage_installations_line(cfg: pathlib.Path) -> str:
+    """Where to install or manage the App's installations, read from what
+    store() left on disk, never from GitHub: a stored slug gives the exact
+    address; an App stored before this saved one falls back to naming where
+    to find it on github.com by hand."""
+    try:
+        slug = (cfg / "app-slug").read_text().strip()
+    except FileNotFoundError:
+        slug = ""
+    if slug:
+        return f"Manage its installations at https://github.com/apps/{slug}/installations/new"
+    return ("Manage its installations from github.com: Settings, then Developer settings, "
+            "then GitHub Apps.")
 
 
 def main(argv: list[str], opener=urllib.request.urlopen) -> int:
@@ -231,14 +376,25 @@ def main(argv: list[str], opener=urllib.request.urlopen) -> int:
     parser.add_argument("--read-only", action="store_true",
                         help="create the second App, which reads and never writes")
     parser.add_argument("--name", help="the App's name on GitHub (must be unique there)")
+    parser.add_argument("--if-missing", action="store_true",
+                        help="when a key already exists, print where and exit 0, touching nothing")
+    parser.add_argument("--code-from-tty", action="store_true",
+                        help="while waiting for the redirect, also accept the whole redirect "
+                             "address pasted at the terminal")
     args = parser.parse_args(argv)
     kind = "read-only" if args.read_only else "write"
     cfg = config_dir(args.read_only)
+    key = cfg / "app.pem"
     name = args.name or ("Builder agents (read-only)" if args.read_only else "Builder agents")
+    if args.if_missing and os.path.lexists(key):
+        print(f"{PROG}: the App already exists; its id and key are in {cfg}.")
+        print(manage_installations_line(cfg))
+        return 0
     try:
-        if os.path.lexists(cfg / "app.pem"):
-            raise Refused(f"{cfg / 'app.pem'} already exists, and this never replaces a key.")
-        code = args.code or wait_for_code(kind, args.org, args.port, name)
+        if os.path.lexists(key):
+            raise Refused(f"{key} already exists, and this never replaces a key.")
+        code = args.code or wait_for_code(kind, args.org, args.port, name,
+                                          code_from_tty=args.code_from_tty)
         app = convert(code, opener)
         problem = permission_problem(app, kind)
         if problem:

@@ -28,7 +28,7 @@ right after `provision` and before `place` so the file exists for both.
 one of them, this one included, runs as whoever invoked it, and the backend
 services a later step installs are user-scope jobs for that same account.
 On the single-account shape that is the operator's own login. The
-two-account shape's `agents` account is where "`agents` runs everything
+three-account shape's `agents` account is where "`agents` runs everything
 Builder does" (`payload/docs/where-everything-runs.md`), so there the file
 belongs to `agents`'s home — which is exactly what writing to the invoking
 account's `$HOME` already gives, once an administrator or the account

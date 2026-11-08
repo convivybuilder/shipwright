@@ -3,7 +3,10 @@
 #
 #     curl -fsSL https://convivybuilder.org/install.sh | sh
 #     curl -fsSL https://convivybuilder.org/install.sh | sh -s -- --role laptop
-#     sh bin/builder-install [--role server|laptop] [--src-dir DIR] [--release vX.Y.Z]
+#     curl -fsSL https://convivybuilder.org/install.sh | sh -s -- --shape three
+#     sh bin/builder-install [--role server|laptop] [--shape single|two|three]
+#         [--src-dir DIR] [--release vX.Y.Z] [--no-github-app]
+#     sh bin/builder-install --verify vX.Y.Z [--manifest FILE] [--src-dir DIR]
 #
 # WHY POSIX sh. `curl ... | sh` has to work on whatever shell Debian, Ubuntu
 # and macOS each run as `/bin/sh`, before anything else is known to be on the
@@ -28,6 +31,34 @@
 # mirror has not caught up to yet. `git ls-remote` against the tag is the one
 # check that is right by construction, because it asks the repository this
 # install is about to trust rather than trusting the input a second time.
+#
+# WHY --verify IS A SEPARATE MODE THAT NEVER INSTALLS ANYTHING. It checks a
+# signed release manifest against this copy's own trust list, then checks
+# each of six clones' commit and each archive's sha256 against what that
+# manifest names, and prints one line per item. It always runs in the copy
+# of this script that is already executing — never a copy read from, or a
+# file run from, a clone it is checking, because a verifier trusting the
+# thing it verifies would be vouching for itself. --manifest FILE takes a
+# local copy, with FILE.sig beside it, for an offline check — every route
+# that already has one on disk before calling --verify (the site's
+# install.sh, the Homebrew formula, the updater) passes it. Omitted,
+# --verify fetches the release's manifest and its .sig from the site over
+# HTTPS into a temporary directory, verifies them exactly as a local copy,
+# and removes them afterwards; a fetch that fails is "could not check",
+# never a pass.
+#
+# WHY A NORMAL INSTALL VERIFIES THE RELEASE BEFORE RUNNING ANY OF IT. The
+# installers at the end of this script are run from the clones, so the last
+# moment a check can refuse before any of that code runs is after the clones
+# exist and before the first installer. It calls the same verify_release
+# --verify calls, in this same executing copy and against this copy's own
+# trust list, for the same reason: a verifier read from a clone would be
+# vouching for itself. write-better's commit also comes from the release's
+# manifest, read before the clone because clone_or_verify refuses to move an
+# existing clone; that read is never trusted, since verify_release fetches
+# and signature-checks its own copy and refuses unless every clone matches
+# it. A non-zero result, exit 3 included, stops the install here, and
+# nothing skips it.
 set -eu
 
 # **THE WHOLE BODY IS ONE FUNCTION, CALLED ON THE LAST LINE.** Piped from curl,
@@ -44,9 +75,14 @@ export PYTHONDONTWRITEBYTECODE
 
 PROG=builder-install
 REPOS_BASE="https://github.com/convivybuilder"
-# The five repositories a release names a commit for, plus write-better, which
-# ships no release and is always installed at its own main. Order matters only
-# for the printed log; nothing here depends on it.
+# The site --verify fetches a release manifest from when none is given with
+# --manifest, and the same host every curl example above installs from.
+SITE_BASE="https://convivybuilder.org"
+# The five repositories a release tags the same way, each cloned at that tag.
+# write-better ships no release of its own, so it is not here: the release's
+# signed manifest names the commit to clone it at, and read_write_better_commit
+# below reads it. Order matters only for the printed log; nothing here depends
+# on it.
 TAGGED_REPOS="shipwright agent-platform library convivy-orient convivy-deck"
 
 # tools/build-site.py replaces this exact line when it builds the copy served
@@ -54,9 +90,31 @@ TAGGED_REPOS="shipwright agent-platform library convivy-orient convivy-deck"
 # means no release is baked in: see the docstring above.
 BAKED_RELEASE="@RELEASE@"
 
+# tools/build-site.py replaces this exact line too, with this repository's own
+# release-signers, the way it rewrites BAKED_RELEASE above. Left untouched,
+# --verify falls back to a release checkout's own release-signers, found
+# beside this script the same way release.json is.
+BAKED_RELEASE_SIGNERS='@RELEASE_SIGNERS@'
+
+# What --verify asks ssh-keygen to check a signature against. Fixed here and
+# never read from the manifest, the signature or the command line, so that
+# nothing a release itself carries can widen who it trusts.
+TRUST_PRINCIPAL=release@convivy
+TRUST_NAMESPACE=builder-release
+
 ROLE=server
+SHAPE=single
 SRC_DIR="${HOME:-}/src"
 RELEASE=""
+VERIFY_VERSION=""
+MANIFEST_PATH=""
+NO_GITHUB_APP=no
+# The organisation every repository is cloned from, read off REPOS_BASE
+# rather than written a second time, for install-privileged's --org.
+ORG=${REPOS_BASE##*/}
+# `--shape three`'s backend account, named once rather than written as a
+# literal at every `sudo -u agents` below.
+AGENTS=agents
 
 die() {
     echo "$PROG: refusing — $*" >&2
@@ -65,23 +123,398 @@ die() {
 
 usage() {
     cat <<EOF
-usage: $PROG [--role server|laptop] [--src-dir DIR] [--release vX.Y.Z]
+usage: $PROG [--role server|laptop] [--shape single|two|three] [--src-dir DIR]
+       $PROG [--release vX.Y.Z]
+       $PROG --verify vX.Y.Z [--manifest FILE] [--src-dir DIR]
 
   --role server     install Builder's backend here (default)
   --role laptop     install Deck here, to work from
+  --shape single    one account, this one, with no administrator (default)
+  --shape two       not built yet in this release
+  --shape three     the agents and reviewers accounts and a root-owned
+                    privileged half; needs administrator rights on a
+                    supported server platform (see supported-setups.md)
   --src-dir DIR     clone the six repositories into DIR (default ~/src)
   --release vX.Y.Z  the release to install, when this copy carries none
+  --no-github-app   on a server install, skip creating the operator's
+                    GitHub App; connecting-github.md shows how to create
+                    it by hand later
+  --verify vX.Y.Z   check a signed release manifest and this machine's
+                    clones against it; installs nothing
+  --manifest FILE   the release manifest --verify reads, with FILE.sig
+                    beside it, for an offline check; omitted, --verify
+                    fetches both from $SITE_BASE
 EOF
+}
+
+first_link_or_gitlink() {
+    # Reads `git ls-tree -r <sha>` lines on stdin and prints the first whose
+    # mode is a symbolic link (120000) or a submodule/gitlink (160000), or
+    # nothing when none is found. A top-level function, never a `case`
+    # nested inside a command substitution: /bin/sh is bash 3.2 on macOS,
+    # whose parser cannot read a `case` directly inside `$(...)`.
+    while IFS= read -r LS_LINE; do
+        case "${LS_LINE%% *}" in
+            120000|160000) printf '%s\n' "$LS_LINE"; return 0 ;;
+        esac
+    done
+}
+
+can_use_sudo() {
+    [ "$(id -u)" -eq 0 ] && return 0
+    command -v sudo >/dev/null 2>&1 || return 1
+    SUDO_PROBE=$(sudo -n true 2>&1) && return 0
+    case "$SUDO_PROBE" in
+        *password*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# A Mac without Apple's Command Line Tools still has /usr/bin/git, /usr/bin/swift
+# and /usr/bin/python3: stubs that `command -v` finds, that exit 1, and that open
+# Apple's install dialog when run. So a tool found there counts only once
+# `xcode-select -p` succeeds, and the stub itself is never run to find out.
+# The directory is overridable for this suite's tests, which cannot write to the
+# real /usr/bin.
+have_dev_tool() {
+    DEV_TOOL_PATH=$(command -v "$1" 2>/dev/null) || return 1
+    [ "$PLATFORM" = macos ] || return 0
+    [ "$DEV_TOOL_PATH" = "${BUILDER_APPLE_STUB_DIR:-/usr/bin}/$1" ] || return 0
+    xcode-select -p >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# --verify. Defined here, called once option parsing and platform detection
+# are done, and never reached by a normal install. See the WHY block near
+# the top of this file for what it does and does not do.
+# ---------------------------------------------------------------------------
+
+sha256_of() {
+    # $1: a file to hash. Prints nothing when no sha256 tool was found.
+    [ -n "$SHA256_CMD" ] || return 1
+    $SHA256_CMD "$1" | cut -d ' ' -f1
+}
+
+verify_clone() {
+    # $1: a repository name, as it sits under $3. $2: the commit the manifest
+    # names for it, or empty when the manifest named none. $3: the directory
+    # holding the clones to check.
+    CHECK_NAME=$1
+    CHECK_WANT=$2
+    CHECK_SRC_DIR=$3
+    if [ -z "$CHECK_WANT" ]; then
+        echo "$PROG: $CHECK_NAME: the manifest names no commit for it" >&2
+        [ "$VERIFY_STATUS" -ge 1 ] || VERIFY_STATUS=1
+        return
+    fi
+    CHECK_DIR="$CHECK_SRC_DIR/$CHECK_NAME"
+    if [ "$GIT_OK" != yes ] || [ ! -d "$CHECK_DIR/.git" ]; then
+        printf '%s: %-16s could not check: no clone at %s\n' "$PROG" "$CHECK_NAME" "$CHECK_DIR"
+        [ "$VERIFY_STATUS" -ge 1 ] || VERIFY_STATUS=3
+        return
+    fi
+    CHECK_HAVE=$(git -C "$CHECK_DIR" rev-parse HEAD 2>/dev/null) || CHECK_HAVE=""
+    if [ -z "$CHECK_HAVE" ]; then
+        printf '%s: %-16s could not check: could not read its commit\n' "$PROG" "$CHECK_NAME"
+        [ "$VERIFY_STATUS" -ge 1 ] || VERIFY_STATUS=3
+        return
+    fi
+    if [ "$CHECK_HAVE" = "$CHECK_WANT" ]; then
+        printf '%s: %-16s %s  matches\n' "$PROG" "$CHECK_NAME" "$(printf '%s' "$CHECK_HAVE" | cut -c1-8)"
+    else
+        echo "$PROG: refusing — $CHECK_NAME: this clone is checked out at $CHECK_HAVE, and the signed manifest names $CHECK_WANT. This clone is not the release Convivy signed; do not run it." >&2
+        VERIFY_STATUS=1
+    fi
+}
+
+in_git_checkout() {
+    # $1: a directory to search upward from, the way git itself finds a
+    # repository: this directory, then each ancestor, until a `.git` entry
+    # (file or directory — a worktree's is a file) is found or the
+    # filesystem root is reached.
+    CHECK_DIR=$1
+    while :; do
+        [ -e "$CHECK_DIR/.git" ] && return 0
+        [ "$CHECK_DIR" = / ] && return 1
+        CHECK_DIR=$(CDPATH= cd -- "$CHECK_DIR/.." && pwd)
+    done
+}
+
+verify_release() {
+    # $1: the release, as --verify or the main flow names it. $2: the
+    # directory holding the clones to check, default $SRC_DIR — named
+    # explicitly by the three-account shape's second call, to check the
+    # agents account's own clones rather than the operator's.
+    V=$1
+    VERIFY_SRC_DIR=${2:-$SRC_DIR}
+    VV=${V#v}
+    case "$VV" in
+        *"
+"*) VV_OK= ;;
+        *) VV_OK=$(printf '%s\n' "$VV" \
+            | sed -n -E '/^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)(\.?[0-9]+)?)?$/p') ;;
+    esac
+    [ -n "$VV_OK" ] || {
+        echo "$PROG: '$V' is not a release version. Pass --verify with a version such as 1.2.3 or v1.2.3-rc1." >&2
+        exit 2
+    }
+
+    if ! command -v ssh-keygen >/dev/null 2>&1; then
+        echo "$PROG: could not check: ssh-keygen is not on PATH" >&2
+        exit 3
+    fi
+
+    SHA256_CMD=""
+    if [ "$PLATFORM" = linux ] && command -v sha256sum >/dev/null 2>&1; then
+        SHA256_CMD="sha256sum"
+    elif [ "$PLATFORM" = macos ] && command -v shasum >/dev/null 2>&1; then
+        SHA256_CMD="shasum -a 256"
+    fi
+
+    GIT_OK=no
+    have_dev_tool git && GIT_OK=yes
+
+    # Every temporary path this function may create, cleaned up on return
+    # whichever way it returns.
+    SIGNERS_TMP=""
+    VERIFY_OUT=""
+    MANIFEST_FETCH_DIR=""
+    trap 'rm -f "${SIGNERS_TMP:-}" "${VERIFY_OUT:-}"; [ -z "${MANIFEST_FETCH_DIR:-}" ] || rm -rf "${MANIFEST_FETCH_DIR:-}"' EXIT
+
+    # --manifest FILE takes a local copy, for an offline check; every route
+    # that already has one on disk before calling --verify passes it.
+    # Omitted, this fetches the release's manifest and its .sig from the
+    # site into MANIFEST_FETCH_DIR, removed by the trap above. A fetch that
+    # fails is "could not check", never a silent pass.
+    MANIFEST_WAS_FETCHED=no
+    if [ -z "$MANIFEST_PATH" ]; then
+        if ! command -v curl >/dev/null 2>&1; then
+            echo "$PROG: could not check: no --manifest given, and curl is not on PATH to fetch one" >&2
+            exit 3
+        fi
+        MANIFEST_FETCH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/.builder-install-manifest.XXXXXX")
+        MANIFEST_URL="$SITE_BASE/releases/$VV/release-manifest"
+        if ! curl -fsSL -o "$MANIFEST_FETCH_DIR/release-manifest" "$MANIFEST_URL" \
+                || ! curl -fsSL -o "$MANIFEST_FETCH_DIR/release-manifest.sig" "$MANIFEST_URL.sig"
+        then
+            echo "$PROG: could not check: could not fetch the $V release manifest from $SITE_BASE" >&2
+            exit 3
+        fi
+        MANIFEST_PATH="$MANIFEST_FETCH_DIR/release-manifest"
+        MANIFEST_WAS_FETCHED=yes
+    fi
+    if [ ! -f "$MANIFEST_PATH" ]; then
+        echo "$PROG: could not check: $MANIFEST_PATH does not exist" >&2
+        exit 3
+    fi
+    SIGFILE="$MANIFEST_PATH.sig"
+    if [ ! -f "$SIGFILE" ]; then
+        echo "$PROG: could not check: $SIGFILE does not exist" >&2
+        exit 3
+    fi
+
+    # WHICH TRUST LIST. A copy with BAKED_RELEASE_SIGNERS baked in (the
+    # site's install.sh) uses that, written to a private temporary file for
+    # ssh-keygen to read. Otherwise this is the formula's copy, extracted by
+    # Homebrew from the archive the tap pins, and it uses the release-signers
+    # beside bin/ from that same archive.
+    #
+    # THIS COPY CANNOT VOUCH FOR WHERE IT CAME FROM. Whoever supplied this
+    # directory supplied this script too, and a script they edited prints
+    # "genuine" with no key at all, so no test made here can tell the pinned
+    # Homebrew archive from a downloaded zip or an extracted fork. The trust
+    # in the sibling list is the tap's pin, which sits outside this script.
+    # Checking clones by hand is the site's install.sh --verify, never a copy
+    # run from a directory the adopter fetched themselves. Inside a git
+    # checkout the sibling list is refused outright, since that layout is
+    # never the Homebrew one.
+    SIGNERS_FILE=""
+    if [ "$BAKED_RELEASE_SIGNERS" != '@RELEASE_SIGNERS@' ]; then
+        SIGNERS_TMP=$(mktemp "${TMPDIR:-/tmp}/.builder-install-signers.XXXXXX")
+        printf '%s\n' "$BAKED_RELEASE_SIGNERS" > "$SIGNERS_TMP"
+        SIGNERS_FILE="$SIGNERS_TMP"
+    elif [ -f "$0" ]; then
+        VERIFY_SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+        if in_git_checkout "$VERIFY_SCRIPT_DIR"; then
+            echo "$PROG: could not check: this copy is running from inside a git checkout, and a checkout's own release-signers cannot vouch for itself. Check a clone by hand with the site's install.sh --verify instead." >&2
+            exit 3
+        fi
+        if [ -f "$VERIFY_SCRIPT_DIR/../release-signers" ]; then
+            SIGNERS_FILE="$VERIFY_SCRIPT_DIR/../release-signers"
+        fi
+    fi
+    if [ -z "$SIGNERS_FILE" ]; then
+        echo "$PROG: could not check: no trust list of release signers is available to this copy" >&2
+        exit 3
+    fi
+
+    VERIFY_OUT=$(mktemp "${TMPDIR:-/tmp}/.builder-install-verify.XXXXXX")
+    if ! ssh-keygen -Y verify -f "$SIGNERS_FILE" -I "$TRUST_PRINCIPAL" -n "$TRUST_NAMESPACE" \
+            -s "$SIGFILE" < "$MANIFEST_PATH" >"$VERIFY_OUT" 2>&1
+    then
+        cat "$VERIFY_OUT" >&2
+        echo "$PROG: refusing — the $V release manifest's signature does not verify against the trust list" >&2
+        exit 1
+    fi
+    FINGERPRINT=$(sed -n 's/.*with [A-Za-z0-9-]* key \(SHA256:[^ ]*\).*/\1/p' "$VERIFY_OUT" | head -n 1)
+    echo "$PROG: the $V release manifest is signed by the release key ${FINGERPRINT:-(unreported fingerprint)}"
+
+    # THE MANIFEST'S OWN FORMAT: one line per item, as tools/release writes
+    # it. Read as a whole rather than with a pipe into this loop, so each
+    # field set below is still visible to the rest of this function —
+    # `grep ... | while read` would run the loop in a subshell and lose
+    # every assignment the moment it exited.
+    VERIFY_STATUS=0
+    M_VERSION="" M_shipwright="" M_agentplatform="" M_library=""
+    M_convivyorient="" M_convivydeck="" M_writebetter=""
+    ARCHIVE_URL="" ARCHIVE_SHA=""
+    while read -r KEY V1 V2; do
+        case "$KEY" in
+            version) M_VERSION=$V1 ;;
+            shipwright) M_shipwright=$V1 ;;
+            agent-platform) M_agentplatform=$V1 ;;
+            library) M_library=$V1 ;;
+            convivy-orient) M_convivyorient=$V1 ;;
+            convivy-deck) M_convivydeck=$V1 ;;
+            write-better) M_writebetter=$V1 ;;
+            # Today's manifest carries exactly one archive line; a release
+            # naming more than one would need a list here instead of one slot.
+            archive) ARCHIVE_URL=$V1; ARCHIVE_SHA=$V2 ;;
+        esac
+    done < "$MANIFEST_PATH"
+
+    if [ "$M_VERSION" != "$VV" ]; then
+        echo "$PROG: refusing — the manifest names version ${M_VERSION:-(none)}, not $VV" >&2
+        exit 1
+    fi
+
+    verify_clone shipwright "$M_shipwright" "$VERIFY_SRC_DIR"
+    verify_clone agent-platform "$M_agentplatform" "$VERIFY_SRC_DIR"
+    verify_clone library "$M_library" "$VERIFY_SRC_DIR"
+    verify_clone convivy-orient "$M_convivyorient" "$VERIFY_SRC_DIR"
+    verify_clone convivy-deck "$M_convivydeck" "$VERIFY_SRC_DIR"
+    verify_clone write-better "$M_writebetter" "$VERIFY_SRC_DIR"
+
+    # A FETCHED MANIFEST NAMES AN ARCHIVE WITH NOTHING LOCAL TO HASH IT
+    # AGAINST, so a fetch that stopped here could only ever report "could not
+    # check" and never a genuine release. Fetched into MANIFEST_FETCH_DIR,
+    # beside the manifest, so the generic check below — which already looks
+    # beside the manifest for the archive — finds it the same way it finds
+    # one a caller placed there by hand. Only after the signature above has
+    # verified, since nothing this downloads is trusted until then. --proto
+    # and --proto-redir pin both the request and any redirect to https, so a
+    # manifest naming (or a redirect landing on) another scheme is refused
+    # rather than fetched.
+    if [ "$MANIFEST_WAS_FETCHED" = yes ] && [ -n "$ARCHIVE_URL" ]; then
+        ARCHIVE_NAME=${ARCHIVE_URL##*/}
+        if ! curl -fsSL --proto '=https' --proto-redir '=https' \
+                -o "$MANIFEST_FETCH_DIR/$ARCHIVE_NAME" "$ARCHIVE_URL"
+        then
+            echo "$PROG: could not check: could not fetch $ARCHIVE_NAME from $ARCHIVE_URL" >&2
+            exit 3
+        fi
+    fi
+
+    if [ -n "$ARCHIVE_URL" ]; then
+        ARCHIVE_NAME=${ARCHIVE_URL##*/}
+        ARCHIVE_FOUND=""
+        for ARCHIVE_DIR in "$(dirname -- "$MANIFEST_PATH")" .; do
+            if [ -f "$ARCHIVE_DIR/$ARCHIVE_NAME" ]; then
+                ARCHIVE_FOUND="$ARCHIVE_DIR/$ARCHIVE_NAME"
+                break
+            fi
+        done
+        if [ -z "$ARCHIVE_FOUND" ] || [ -z "$SHA256_CMD" ]; then
+            printf '%s: %-16s could not check: no local copy of the archive to hash\n' "$PROG" "$ARCHIVE_NAME"
+            [ "$VERIFY_STATUS" -ge 1 ] || VERIFY_STATUS=3
+        else
+            ARCHIVE_HAVE=$(sha256_of "$ARCHIVE_FOUND")
+            if [ "$ARCHIVE_HAVE" = "$ARCHIVE_SHA" ]; then
+                printf '%s: %-16s matches\n' "$PROG" "$ARCHIVE_NAME"
+            else
+                echo "$PROG: refusing — $ARCHIVE_NAME: its sha256 is $ARCHIVE_HAVE, and the signed manifest names $ARCHIVE_SHA. This archive is not the release Convivy signed; do not run it." >&2
+                VERIFY_STATUS=1
+            fi
+        fi
+    fi
+
+    if [ "$VERIFY_STATUS" -eq 0 ]; then
+        # The commit this manifest, signature-checked above, names for
+        # write-better, shipwright, agent-platform and library. A normal
+        # install hands the write-better one to the backend installer, and
+        # the other three to install-privileged's anonymous, tag-pinned
+        # fetch on the three-account bootstrap, so what each places is what
+        # this run checked — never a later, untrusted re-read of a clone a
+        # root step in between could have moved.
+        VERIFIED_WRITE_BETTER_COMMIT=$M_writebetter
+        VERIFIED_SHIPWRIGHT_COMMIT=$M_shipwright
+        VERIFIED_AGENT_PLATFORM_COMMIT=$M_agentplatform
+        VERIFIED_LIBRARY_COMMIT=$M_library
+        echo "$PROG: genuine: every clone is the release Convivy signed as v$VV"
+    fi
+    return "$VERIFY_STATUS"
+}
+
+# ---------------------------------------------------------------------------
+# The commit the release pins write-better to, read before it is cloned.
+# clone_or_verify refuses to move an existing clone, so the clone has to be
+# made at the right commit the first time. The manifest is read here without
+# being trusted: verify_release, called after the clones exist, fetches and
+# signature-checks its own copy and refuses unless write-better's HEAD is the
+# commit that copy names. A tampered read can therefore only select a commit
+# the check then refuses. The commit handed to the backend installer is the
+# one that check verified, never this read.
+# ---------------------------------------------------------------------------
+read_write_better_commit() {
+    WB_VERSION=$1
+    WB_MANIFEST=$MANIFEST_PATH
+    WB_DIR=""
+    if [ -z "$WB_MANIFEST" ]; then
+        if ! command -v curl >/dev/null 2>&1; then
+            echo "$PROG: could not check: no --manifest given, and curl is not on PATH to fetch the $TAG release manifest that names write-better's commit" >&2
+            exit 3
+        fi
+        WB_DIR=$(mktemp -d "${TMPDIR:-/tmp}/.builder-install-write-better.XXXXXX")
+        WB_MANIFEST="$WB_DIR/release-manifest"
+        if ! curl -fsSL -o "$WB_MANIFEST" "$SITE_BASE/releases/$WB_VERSION/release-manifest"; then
+            rm -rf "$WB_DIR"
+            echo "$PROG: could not check: could not fetch the $TAG release manifest from $SITE_BASE to learn write-better's commit" >&2
+            exit 3
+        fi
+    fi
+    if [ ! -f "$WB_MANIFEST" ]; then
+        [ -z "$WB_DIR" ] || rm -rf "$WB_DIR"
+        echo "$PROG: could not check: $WB_MANIFEST does not exist" >&2
+        exit 3
+    fi
+    WRITE_BETTER_COMMIT=$(sed -n 's/^write-better[[:space:]]\{1,\}\([^[:space:]]*\).*$/\1/p' "$WB_MANIFEST" | head -n 1)
+    [ -z "$WB_DIR" ] || rm -rf "$WB_DIR"
+    case "$WRITE_BETTER_COMMIT" in
+        ""|*[!0-9a-f]*)
+            echo "$PROG: could not check: the $TAG release manifest names no git commit for write-better" >&2
+            exit 3 ;;
+    esac
+    if [ ${#WRITE_BETTER_COMMIT} -ne 40 ]; then
+        echo "$PROG: could not check: the $TAG release manifest names '$WRITE_BETTER_COMMIT' for write-better, which is not a git commit id" >&2
+        exit 3
+    fi
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --role) [ $# -ge 2 ] || { usage >&2; exit 2; }; ROLE=$2; shift 2 ;;
         --role=*) ROLE=${1#--role=}; shift ;;
+        --shape) [ $# -ge 2 ] || { usage >&2; exit 2; }; SHAPE=$2; shift 2 ;;
+        --shape=*) SHAPE=${1#--shape=}; shift ;;
         --src-dir) [ $# -ge 2 ] || { usage >&2; exit 2; }; SRC_DIR=$2; shift 2 ;;
         --src-dir=*) SRC_DIR=${1#--src-dir=}; shift ;;
         --release) [ $# -ge 2 ] || { usage >&2; exit 2; }; RELEASE=$2; shift 2 ;;
         --release=*) RELEASE=${1#--release=}; shift ;;
+        --verify) [ $# -ge 2 ] || { usage >&2; exit 2; }; VERIFY_VERSION=$2; shift 2 ;;
+        --verify=*) VERIFY_VERSION=${1#--verify=}; shift ;;
+        --manifest) [ $# -ge 2 ] || { usage >&2; exit 2; }; MANIFEST_PATH=$2; shift 2 ;;
+        --manifest=*) MANIFEST_PATH=${1#--manifest=}; shift ;;
+        --no-github-app) NO_GITHUB_APP=yes; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "$PROG: unrecognised argument: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -92,11 +525,38 @@ case "$ROLE" in
     *) die "--role must be 'server' or 'laptop', not '$ROLE'" ;;
 esac
 
+case "$SHAPE" in
+    single|two|three) ;;
+    *) die "--shape must be 'single', 'two' or 'three', not '$SHAPE'" ;;
+esac
+
+# BEFORE ANYTHING ELSE, IN EVERY MODE: stand-up-backend refuses --shape two
+# the same way, and this never silently substitutes --shape three or single
+# for the shape the operator named.
+if [ "$SHAPE" = two ]; then
+    die "the two-account install is not built yet in this release. The install with a reviewers account is \`--shape three\`. Nothing was installed or changed."
+fi
+
 case "$(uname -s)" in
     Linux) PLATFORM=linux ;;
     Darwin) PLATFORM=macos ;;
     *) die "$(uname -s) is neither Linux nor macOS, and Builder installs on only those two" ;;
 esac
+
+if [ -n "$VERIFY_VERSION" ]; then
+    verify_release "$VERIFY_VERSION"
+    exit $?
+fi
+
+# BEFORE ANYTHING IS INSTALLED OR CLONED: the single shape runs every step as
+# the operator, and stand-up-backend refuses that shape as root. Run as root,
+# this used to install packages and Claude Code, clone every repository and
+# run two steps before stand-up-backend refused, pointing at an
+# install-privileged copy the single shape never makes. Found by the 0.7.0
+# install rehearsal, as root in a fresh Debian container.
+if [ "$ROLE" = server ] && [ "$SHAPE" = single ] && [ "$(id -u)" -eq 0 ]; then
+    die "this is running as root, and the one-account install runs as the account Builder will run in, which root is not. Sign in as that account and run this again without sudo; it asks for sudo itself where it needs it. Nothing was installed or changed."
+fi
 
 # ---------------------------------------------------------------------------
 # Prerequisites. Checked together and named together, the way provision-
@@ -110,7 +570,7 @@ find_python311() {
         PYTHON3=python3.11
         return 0
     fi
-    if command -v python3 >/dev/null 2>&1 \
+    if have_dev_tool python3 \
         && python3 -c 'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 11) else 1)' 2>/dev/null
     then
         PYTHON3=python3
@@ -125,34 +585,272 @@ note_missing() {
   $1"
 }
 
-if ! command -v git >/dev/null 2>&1; then
-    if [ "$PLATFORM" = linux ]; then
-        note_missing "git — install it with \`sudo apt-get install git\`, or ask whoever administers this machine to"
-    else
-        note_missing "git — install Apple's Command Line Tools with \`xcode-select --install\`"
+# build_missing is called twice: once to learn what this machine lacks, and
+# once more after install_missing_prereqs has tried to fix what it can, so
+# the die below names only what is still actually absent — never what apt
+# or brew merely claimed to have installed. GIT_MISSING_NOTE, PY311_MISSING_
+# NOTE and TMUX_MISSING_NOTE, set by install_missing_prereqs when a route
+# exists but could not run (no /dev/tty for Homebrew's installer), replace
+# the default line for that program on the second call.
+build_missing() {
+    MISSING=""
+
+    if ! have_dev_tool git; then
+        if [ -n "${GIT_MISSING_NOTE:-}" ]; then
+            note_missing "$GIT_MISSING_NOTE"
+        elif [ "$PLATFORM" = linux ]; then
+            note_missing "git — install it with \`sudo apt-get install git\`, or ask whoever administers this machine to"
+        else
+            note_missing "git — install Apple's Command Line Tools with \`xcode-select --install\`"
+        fi
     fi
+
+    if ! find_python311; then
+        if [ -n "${PY311_MISSING_NOTE:-}" ]; then
+            note_missing "$PY311_MISSING_NOTE"
+        elif [ "$PLATFORM" = linux ]; then
+            note_missing "python3.11 — install it with \`sudo apt-get install python3.11\`, or ask whoever administers this machine to"
+        else
+            note_missing "python3.11 — install it with \`brew install python@3.11\`, or your own copy with \`curl -LsSf https://astral.sh/uv/install.sh | sh\` and then \`uv python install 3.11\`"
+        fi
+    fi
+
+    # The server runs the sessions, so it needs Claude Code and tmux. The laptop
+    # only builds Deck, which install-deck does with python3.11, git and `swift`.
+    if [ "$ROLE" = server ]; then
+        if ! command -v claude >/dev/null 2>&1; then
+            note_missing "Claude Code — install it and sign in with \`curl -fsSL https://claude.ai/install.sh | bash\`, then run \`claude\` once"
+        fi
+
+        if [ "$PLATFORM" = macos ] && ! command -v tmux >/dev/null 2>&1; then
+            if [ -n "${TMUX_MISSING_NOTE:-}" ]; then
+                note_missing "$TMUX_MISSING_NOTE"
+            else
+                note_missing "tmux — install it with \`brew install tmux\`"
+            fi
+        fi
+    elif [ "$PLATFORM" = macos ] && ! have_dev_tool swift; then
+        note_missing "swift — install Apple's Command Line Tools with \`xcode-select --install\`"
+    fi
+
+    # `--shape three` CHECKS ADMINISTRATOR RIGHTS AND THE PLATFORM BEFORE
+    # ANYTHING IS CLONED OR CHANGED. provision-accounts and install-privileged
+    # both need root, and this shape is only rehearsed on the three platforms
+    # supported-setups.md lists; quietly falling back to the single-account
+    # shape on a machine that lacks either would hand the operator a boundary
+    # they did not choose. Neither item below has an install route, so this
+    # part of the list is the same on both calls to build_missing.
+    if [ "$ROLE" = server ] && [ "$SHAPE" = three ]; then
+        if ! can_use_sudo; then
+            note_missing "administrator rights — this account cannot use sudo, and \`--shape three\` needs it to create the \`agents\` and \`reviewers\` accounts and the root-owned privileged half"
+        fi
+        THREE_PLATFORM_OK=no
+        OS_ID=""
+        OS_VERSION_ID=""
+        MACOS_VERSION=""
+        if [ "$PLATFORM" = linux ]; then
+            # Overridable only for this suite's own tests, which cannot make the
+            # machine running them Debian or Ubuntu to prove the check the other way.
+            OS_RELEASE_FILE="${BUILDER_OS_RELEASE_FILE:-/etc/os-release}"
+            if [ -r "$OS_RELEASE_FILE" ]; then
+                . "$OS_RELEASE_FILE" 2>/dev/null || true
+                OS_ID=${ID:-}
+                OS_VERSION_ID=${VERSION_ID:-}
+                case "$OS_ID/$OS_VERSION_ID" in
+                    debian/12|ubuntu/22.04) THREE_PLATFORM_OK=yes ;;
+                esac
+            fi
+        else
+            MACOS_VERSION=$(sw_vers -productVersion 2>/dev/null) || MACOS_VERSION=""
+            case "$MACOS_VERSION" in
+                26|26.*) THREE_PLATFORM_OK=yes ;;
+            esac
+        fi
+        if [ "$THREE_PLATFORM_OK" != yes ]; then
+            note_missing "a supported server platform for \`--shape three\` — it installs on Debian 12, Ubuntu 22.04 or macOS 26 (see supported-setups.md), and this machine is ${OS_ID:-$PLATFORM}${OS_VERSION_ID:+ $OS_VERSION_ID}${MACOS_VERSION:+ $MACOS_VERSION}"
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Installing what is missing, where this machine has a route to do it. Never
+# reached by --verify, which returns above. Nothing here is cloned yet, and
+# nothing here replaces the die below: whatever is still absent once this
+# has done what it can reaches it exactly as if this step did not exist.
+# ---------------------------------------------------------------------------
+
+# Homebrew's own installer reads its confirmation from stdin, so it alone gets
+# the terminal. Overridable so this suite's tests can point it at a file they
+# control, since the machine running them may have no controlling terminal.
+INSTALL_TTY="${BUILDER_INSTALL_TTY:-/dev/tty}"
+
+# In a subshell because a failed redirection on `:`, a special builtin, exits the
+# whole script under dash, which is /bin/sh on Debian and Ubuntu.
+have_tty() {
+    ( : < "$INSTALL_TTY" ) 2>/dev/null
+}
+
+mac_is_admin() {
+    case " $(id -Gn 2>/dev/null) " in
+        *" admin "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+linux_install_prereqs() {
+    NEED_GIT=no
+    command -v git >/dev/null 2>&1 || NEED_GIT=yes
+    NEED_PY311=no
+    find_python311 || NEED_PY311=yes
+
+    # curl is what the rest of this script, and claude.ai's own installer,
+    # need, and a copy fetched by hand rather than through `curl | sh` may not
+    # have it; ca-certificates is what makes apt's own https fetches trusted,
+    # checked by the file the package installs rather than dpkg, which this
+    # script otherwise never needs. Overridable so this suite's tests can
+    # point the check at a file they control instead of the real one.
+    NEED_CURL=no
+    command -v curl >/dev/null 2>&1 || NEED_CURL=yes
+    NEED_CACERTS=no
+    CACERTS_FILE="${BUILDER_CACERTS_FILE:-/etc/ssl/certs/ca-certificates.crt}"
+    [ -f "$CACERTS_FILE" ] || NEED_CACERTS=yes
+
+    APT_PKGS=""
+    [ "$NEED_GIT" = yes ] && APT_PKGS="$APT_PKGS git"
+    [ "$NEED_PY311" = yes ] && APT_PKGS="$APT_PKGS python3.11"
+    [ "$NEED_CURL" = yes ] && APT_PKGS="$APT_PKGS curl"
+    [ "$NEED_CACERTS" = yes ] && APT_PKGS="$APT_PKGS ca-certificates"
+    APT_PKGS=${APT_PKGS# }
+    [ -n "$APT_PKGS" ] || return 0
+    command -v apt-get >/dev/null 2>&1 || return 0
+    if [ "$(id -u)" -ne 0 ] && ! can_use_sudo; then
+        return 0
+    fi
+
+    # Every child gets /dev/null for stdin. Under `curl | sh`, stdin is the rest
+    # of this script, and a child that read it would eat what has yet to run.
+    # sudo opens /dev/tty itself for its password prompt, whatever its stdin is,
+    # and needs no terminal at all when the account has passwordless sudo.
+    if [ "$(id -u)" -eq 0 ]; then
+        echo "$PROG: installing $APT_PKGS with apt-get"
+        apt-get update </dev/null || true
+        env DEBIAN_FRONTEND=noninteractive apt-get install -y $APT_PKGS </dev/null || true
+    else
+        echo "$PROG: installing $APT_PKGS with apt-get; this may ask for your account's password"
+        sudo apt-get update </dev/null || true
+        sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y $APT_PKGS </dev/null || true
+    fi
+}
+
+mac_install_prereqs() {
+    # Overridable so this suite's tests can bootstrap Homebrew into a tmp
+    # prefix rather than the real /opt/homebrew.
+    HOMEBREW_PREFIX="${BUILDER_HOMEBREW_PREFIX:-/opt/homebrew}"
+
+    # Homebrew refuses to run as root, and nothing below has a route then.
+    [ "$(id -u)" -ne 0 ] || return 0
+
+    # Homebrew's `/etc/paths.d` file reaches a login shell only. Over plain ssh
+    # PATH was `/usr/bin:/bin:/usr/sbin:/sbin` on a test Mac, so an installed brew,
+    # tmux and python3.11 all read as absent, and this would run Homebrew's
+    # installer again, or refuse for want of a terminal.
+    if [ -x "$HOMEBREW_PREFIX/bin/brew" ]; then
+        PATH="$HOMEBREW_PREFIX/bin:$PATH"
+        export PATH
+    fi
+
+    NEED_GIT=no
+    have_dev_tool git || NEED_GIT=yes
+    NEED_PY311=no
+    find_python311 || NEED_PY311=yes
+    NEED_TMUX=no
+    if [ "$ROLE" = server ]; then
+        command -v tmux >/dev/null 2>&1 || NEED_TMUX=yes
+    fi
+    if [ "$NEED_GIT" = no ] && [ "$NEED_PY311" = no ] && [ "$NEED_TMUX" = no ]; then
+        return 0
+    fi
+
+    NAMES=""
+    [ "$NEED_GIT" = yes ] && NAMES="$NAMES git"
+    [ "$NEED_PY311" = yes ] && NAMES="$NAMES python3.11"
+    [ "$NEED_TMUX" = yes ] && NAMES="$NAMES tmux"
+    NAMES=${NAMES# }
+
+    if ! command -v brew >/dev/null 2>&1; then
+        if ! mac_is_admin; then
+            return 0
+        fi
+        if ! have_tty; then
+            NOTE="needs Homebrew, and Homebrew's installer needs a terminal to run; install Homebrew yourself at https://brew.sh, or ask an administrator to, then run again"
+            [ "$NEED_GIT" = yes ] && GIT_MISSING_NOTE="git — $NOTE"
+            [ "$NEED_PY311" = yes ] && PY311_MISSING_NOTE="python3.11 — $NOTE"
+            [ "$NEED_TMUX" = yes ] && TMUX_MISSING_NOTE="tmux — $NOTE"
+            return 0
+        fi
+        echo "$PROG: installing Homebrew to get $NAMES, which also brings Apple's Command Line Tools; this will ask for a password and confirmation"
+        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" < "$INSTALL_TTY" || true
+        if [ -x "$HOMEBREW_PREFIX/bin/brew" ]; then
+            PATH="$HOMEBREW_PREFIX/bin:$PATH"
+            export PATH
+        fi
+    fi
+
+    if command -v brew >/dev/null 2>&1; then
+        BREW_PKGS=""
+        have_dev_tool git || BREW_PKGS="$BREW_PKGS git"
+        find_python311 || BREW_PKGS="$BREW_PKGS python@3.11"
+        if [ "$ROLE" = server ]; then
+            command -v tmux >/dev/null 2>&1 || BREW_PKGS="$BREW_PKGS tmux"
+        fi
+        BREW_PKGS=${BREW_PKGS# }
+        if [ -n "$BREW_PKGS" ]; then
+            echo "$PROG: installing $BREW_PKGS with brew install"
+            brew install $BREW_PKGS </dev/null || true
+        fi
+    fi
+}
+
+install_claude_code() {
+    echo "$PROG: installing Claude Code with \`curl -fsSL https://claude.ai/install.sh | bash\`"
+    curl -fsSL https://claude.ai/install.sh | bash || true
+    # Last on PATH: the running account's own programs land here, and a later
+    # `sudo mkdir` searches PATH on a sudoers with no secure_path, as on a Mac.
+    PATH="$PATH:${HOME:-}/.local/bin"
+    export PATH
+    # An `if`, since a bare `command -v ... && ...` returns non-zero when the
+    # install failed, and `set -eu` would end the script here with no message
+    # instead of letting it reach the refusal that names Claude Code.
+    if command -v claude >/dev/null 2>&1; then
+        CLAUDE_INSTALLED_NOW=yes
+    fi
+}
+
+install_missing_prereqs() {
+    if [ "$PLATFORM" = linux ]; then
+        linux_install_prereqs
+    else
+        mac_install_prereqs
+    fi
+    # Any platform; never through sudo; signing in stays a person's own act,
+    # so this only installs the CLI and leaves the done message to say so.
+    if [ "$ROLE" = server ] && ! command -v claude >/dev/null 2>&1; then
+        install_claude_code
+    fi
+}
+
+# Claude Code's own installer puts it in ~/.local/bin, which plain ssh's PATH omits.
+# On a test Mac, each run over ssh reinstalled it and told a signed-in person to sign in.
+# Last on PATH, for the reason install_claude_code gives.
+if [ -x "${HOME:-}/.local/bin/claude" ]; then
+    PATH="$PATH:${HOME:-}/.local/bin"
+    export PATH
 fi
 
-if ! find_python311; then
-    if [ "$PLATFORM" = linux ]; then
-        note_missing "python3.11 — install it with \`sudo apt-get install python3.11\`, or ask whoever administers this machine to"
-    else
-        note_missing "python3.11 — install it with \`brew install python@3.11\`, or your own copy with \`curl -LsSf https://astral.sh/uv/install.sh | sh\` and then \`uv python install 3.11\`"
-    fi
-fi
-
-# The server runs the sessions, so it needs Claude Code and tmux. The laptop
-# only builds Deck, which install-deck does with python3.11, git and `swift`.
-if [ "$ROLE" = server ]; then
-    if ! command -v claude >/dev/null 2>&1; then
-        note_missing "Claude Code — install it and sign in with \`curl -fsSL https://claude.ai/install.sh | bash\`, then run \`claude\` once"
-    fi
-
-    if [ "$PLATFORM" = macos ] && ! command -v tmux >/dev/null 2>&1; then
-        note_missing "tmux — install it with \`brew install tmux\`"
-    fi
-elif [ "$PLATFORM" = macos ] && ! command -v swift >/dev/null 2>&1; then
-    note_missing "swift — install Apple's Command Line Tools with \`xcode-select --install\`"
+build_missing
+if [ -n "$MISSING" ]; then
+    install_missing_prereqs
+    build_missing
 fi
 
 if [ -n "$MISSING" ]; then
@@ -205,6 +903,11 @@ if ! git ls-remote --tags --exit-code "$REPOS_BASE/shipwright" "refs/tags/$TAG" 
     die "$TAG is not on $REPOS_BASE/shipwright yet, so there is nothing real to install at that release. This can happen when this script is fetched before a release is published; wait for one, or pass --release naming a release that already exists."
 fi
 
+# Before anything is cloned, because write-better's clone cannot be moved once
+# it exists. See read_write_better_commit(): this read selects a commit and
+# never vouches for it; the check after the clones is what decides.
+read_write_better_commit "$VERSION"
+
 echo "$PROG: installing release $TAG into $SRC_DIR"
 mkdir -p "$SRC_DIR"
 
@@ -216,6 +919,9 @@ mkdir -p "$SRC_DIR"
 clone_or_verify() {
     NAME=$1
     REF=$2
+    # `tag` for the five released repositories; `commit` for write-better,
+    # whose ref is the commit its release's manifest names rather than a tag.
+    KIND=${3:-tag}
     DEST="$SRC_DIR/$NAME"
     URL="$REPOS_BASE/$NAME"
 
@@ -231,12 +937,12 @@ clone_or_verify() {
         if [ -n "$(git -C "$DEST" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
             die "$DEST has uncommitted changes to its files; $PROG will not touch a clone that is not clean. Commit, discard or move it aside, then run again."
         fi
-        if [ "$REF" = main ]; then
-            CURRENT_BRANCH=$(git -C "$DEST" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-            if [ "$CURRENT_BRANCH" != main ]; then
-                die "$DEST is checked out at '$CURRENT_BRANCH', not main; $PROG will not move a clone that is already somewhere else. Check it out at main yourself, or move it aside, then run again."
+        if [ "$KIND" = commit ]; then
+            CURRENT_COMMIT=$(git -C "$DEST" rev-parse HEAD 2>/dev/null || echo "")
+            if [ "$CURRENT_COMMIT" != "$REF" ]; then
+                die "$DEST is checked out at ${CURRENT_COMMIT:-a commit this cannot read}, not the commit release $TAG names for it ($REF); $PROG will not move a clone that is at another commit. Move it aside, or check out $REF there yourself with \`git -C $DEST checkout $REF\`, then run again."
             fi
-            echo "$PROG: reusing $DEST (write-better tracks main)"
+            echo "$PROG: reusing $DEST at $REF"
             return 0
         fi
         # A release tag is annotated (commit-export writes it with -a), so the tag
@@ -253,6 +959,16 @@ clone_or_verify() {
         return 0
     fi
 
+    if [ "$KIND" = commit ]; then
+        echo "$PROG: cloning $NAME at $REF into $DEST"
+        git clone --no-checkout "$URL" "$DEST"
+        if ! git -C "$DEST" checkout --quiet --detach "$REF"; then
+            echo "$PROG: could not check: $NAME has no commit $REF, which the $TAG release manifest names. Fetch it there with \`git -C $DEST fetch origin\`, or move the clone aside, then run again." >&2
+            exit 3
+        fi
+        return 0
+    fi
+
     echo "$PROG: cloning $NAME at $REF into $DEST"
     git clone --branch "$REF" "$URL" "$DEST"
 }
@@ -260,7 +976,94 @@ clone_or_verify() {
 for REPO_NAME in $TAGGED_REPOS; do
     clone_or_verify "$REPO_NAME" "$TAG"
 done
-clone_or_verify write-better main
+clone_or_verify write-better "$WRITE_BETTER_COMMIT" commit
+
+# ---------------------------------------------------------------------------
+# `--shape three` ONLY: the same clone, idempotent the same way, made again as
+# the `agents` account into its own source directory, so no agents or root
+# step ever reads the operator's own clone above. See the shape-three branch
+# below for why.
+# ---------------------------------------------------------------------------
+
+agents_clone_or_verify() {
+    # $1: a repository name. $2: the tag to clone at, or the exact commit when
+    # $3 is `commit`. $3: `tag` (default) or `commit`, as clone_or_verify's own.
+    #
+    # **EVERY CHECK RUNS AS `agents`, IN ONE `sudo -u agents -H sh -s`**, never
+    # as the operator: `agents`' home is not necessarily something the operator
+    # can even stat, once provision-accounts' isolation holds, so a bare shell
+    # test run here would read the wrong account's filesystem view or simply
+    # fail. This is clone_or_verify's own idempotence — reuse when already at
+    # the right ref and clean, refuse when dirty or at another ref, clone when
+    # absent — run under the account whose clone this is instead of embedded as
+    # a second copy of that logic run by the operator.
+    AC_NAME=$1
+    AC_REF=$2
+    AC_KIND=${3:-tag}
+    sudo -u "$AGENTS" -H sh -s -- "$AGENTS_SRC_DIR/$AC_NAME" "$REPOS_BASE/$AC_NAME" "$AC_REF" "$AC_KIND" <<'AGENTS_CLONE_SH' || die "could not clone or verify $AC_NAME as $AGENTS"
+set -eu
+DEST=$1
+URL=$2
+REF=$3
+KIND=$4
+
+if [ -e "$DEST" ] && [ ! -d "$DEST/.git" ]; then
+    echo "$DEST exists and is not a git checkout; move it aside and run again" >&2
+    exit 1
+fi
+
+if [ -d "$DEST/.git" ]; then
+    if [ -n "$(git -C "$DEST" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+        echo "$DEST has uncommitted changes to its files; refusing to touch a clone that is not clean" >&2
+        exit 1
+    fi
+    if [ "$KIND" = commit ]; then
+        CURRENT=$(git -C "$DEST" rev-parse HEAD 2>/dev/null || echo "")
+        if [ "$CURRENT" != "$REF" ]; then
+            echo "$DEST is checked out at ${CURRENT:-a commit this cannot read}, not $REF; refusing to move a clone that is at another commit" >&2
+            exit 1
+        fi
+        echo "reusing $DEST at $REF"
+        exit 0
+    fi
+    WANTED=$(git -C "$DEST" rev-parse "refs/tags/$REF^{commit}" 2>/dev/null || echo "")
+    if [ -z "$WANTED" ]; then
+        echo "$DEST has no tag $REF" >&2
+        exit 1
+    fi
+    CURRENT=$(git -C "$DEST" rev-parse HEAD)
+    if [ "$CURRENT" != "$WANTED" ]; then
+        echo "$DEST is checked out at $CURRENT, not $REF ($WANTED); refusing to move a clone that is at another release" >&2
+        exit 1
+    fi
+    echo "reusing $DEST at $REF"
+    exit 0
+fi
+
+mkdir -p "$(dirname "$DEST")"
+if [ "$KIND" = commit ]; then
+    echo "cloning $URL at $REF into $DEST"
+    git clone --no-checkout "$URL" "$DEST"
+    git -C "$DEST" checkout --quiet --detach "$REF"
+    exit 0
+fi
+echo "cloning $URL at $REF into $DEST"
+git clone --branch "$REF" "$URL" "$DEST"
+AGENTS_CLONE_SH
+}
+
+# ---------------------------------------------------------------------------
+# The release check, after every clone exists and before the first installer
+# runs. Same function --verify calls, in this same executing copy; a verifier
+# read from a clone would be vouching for itself. Every refusal from it has
+# already printed the line or lines that failed.
+# ---------------------------------------------------------------------------
+VERIFY_RC=0
+verify_release "$TAG" || VERIFY_RC=$?
+if [ "$VERIFY_RC" -ne 0 ]; then
+    echo "$PROG: refusing — $TAG did not verify (exit $VERIFY_RC), so no installer was run." >&2
+    exit "$VERIFY_RC"
+fi
 
 SHIPWRIGHT="$SRC_DIR/shipwright"
 
@@ -275,42 +1078,195 @@ run_step() {
     STATUS=0
     "$@" || STATUS=$?
     if [ "$STATUS" -ne 0 ]; then
-        die "$STEP_NAME refused (exit $STATUS). See https://convivybuilder.org/installing.html#when-something-goes-wrong, or installing.md in this checkout, for what to do next."
+        # install-deck's 3 means Deck is installed and something it printed
+        # still needs the operator, most often the crew ssh config on a first
+        # laptop install. That is not a refusal, so the done message below says
+        # what remains instead.
+        if [ "$STEP_NAME" = install-deck ] && [ "$STATUS" -eq 3 ]; then
+            DECK_NEEDS_ATTENTION=1
+            return 0
+        fi
+        if [ "$STEP_NAME" = create-github-app ]; then
+            die "the backend is installed; only the GitHub App remains. Finish it with: $PYTHON3 $SHIPWRIGHT/bin/create-github-app (over SSH, where the redirect cannot reach this machine, add --code <code> with the value from the browser's address bar)."
+        fi
+        die "$STEP_NAME refused (exit $STATUS). See $SITE_BASE/installing.html#when-something-goes-wrong, or installing.md in this checkout, for what to do next."
     fi
-}
-
-can_use_sudo() {
-    [ "$(id -u)" -eq 0 ] && return 0
-    command -v sudo >/dev/null 2>&1 || return 1
-    SUDO_PROBE=$(sudo -n true 2>&1) && return 0
-    case "$SUDO_PROBE" in
-        *password*) return 0 ;;
-        *) return 1 ;;
-    esac
 }
 
 if [ "$ROLE" = server ]; then
-    if [ "$(id -u)" -eq 0 ]; then
-        run_step provision-backend "$PYTHON3" "$SHIPWRIGHT/bin/provision-backend"
-    elif [ "$PLATFORM" = linux ] && can_use_sudo; then
-        echo "$PROG: provision-backend needs root once; this will ask for your account's password"
-        run_step provision-backend sudo "$PYTHON3" "$SHIPWRIGHT/bin/provision-backend"
+    if [ "$SHAPE" = three ]; then
+        # EVERYTHING ROOT OR `agents` RUNS FOR THIS SHAPE COMES FROM THE TREE
+        # PLACED BELOW, NEVER FROM $SHIPWRIGHT. $SHIPWRIGHT is the operator's
+        # own checkout, under the operator's account; provision-accounts'
+        # own isolation check requires that `agents` cannot read the
+        # operator's home, so a step run as `agents` or as root against
+        # $SHIPWRIGHT either cannot open the file it was told to run, or
+        # (on a machine where that check somehow does not hold) runs from a
+        # tree the operator can still edit. install-privileged already
+        # refuses to run from anywhere but its own extracted tree; this
+        # places shipwright there first, exactly as its usage comment shows,
+        # and every other root or agents step below is pointed at that same
+        # placed copy. Re-extracting the same commit's tree on a rerun
+        # changes nothing in it.
+        #
+        # THE COMMIT PLACED IS THE ONE verify_release ALREADY CHECKED, not a
+        # fresh `git rev-parse HEAD`: provision-accounts and install-
+        # privileged both run as root in between, and re-reading $SHIPWRIGHT
+        # after either of them had run would trust a read taken after an
+        # intervening root step rather than the signed manifest itself.
+        SW_SHA=$VERIFIED_SHIPWRIGHT_COMMIT
+        PRIVILEGED_TREE="/opt/builder/src/shipwright@$SW_SHA"
+        case "$PLATFORM" in
+            linux) ROOT_PYTHON3=/usr/bin/python3 ;;
+            macos) ROOT_PYTHON3=/opt/homebrew/bin/python3 ;;
+        esac
+
+        # REFUSED BEFORE IT IS EVER ARCHIVED FOR ROOT: the same check
+        # install-privileged's own extract() applies to every commit it
+        # extracts, so a tree with one is refused here too rather than
+        # placed as root first and only caught the next time install-
+        # privileged runs.
+        BAD_ENTRY=$(git -C "$SHIPWRIGHT" ls-tree -r "$SW_SHA" | first_link_or_gitlink)
+        if [ -n "$BAD_ENTRY" ]; then
+            die "shipwright@$SW_SHA holds a symbolic link or a submodule (gitlink), which is refused before it is ever placed for root: $BAD_ENTRY. Nothing was changed."
+        fi
+
+        echo "$PROG: placing shipwright@$SW_SHA at $PRIVILEGED_TREE for install-privileged"
+        sudo mkdir -p "$PRIVILEGED_TREE" || die "could not create $PRIVILEGED_TREE as root"
+        git -C "$SHIPWRIGHT" archive "$SW_SHA" | sudo tar -x -C "$PRIVILEGED_TREE" \
+            || die "could not extract shipwright@$SW_SHA into $PRIVILEGED_TREE"
+        run_step provision-accounts sudo "$ROOT_PYTHON3" -I \
+            "$PRIVILEGED_TREE/bin/provision-accounts" --shape three
+        run_step install-privileged sudo "$ROOT_PYTHON3" -I \
+            "$PRIVILEGED_TREE/bin/install-privileged" --shape three --org "$ORG" \
+            --release "$TAG" --commit "shipwright=$VERIFIED_SHIPWRIGHT_COMMIT" \
+            --commit "agent-platform=$VERIFIED_AGENT_PLATFORM_COMMIT" \
+            --commit "library=$VERIFIED_LIBRARY_COMMIT"
+
+        # EVERY AGENTS OR ROOT STEP FROM HERE ON READS ITS OWN CLONES OF THE
+        # RELEASE, MADE AS `agents`, NEVER THE OPERATOR'S ($SHIPWRIGHT) AND
+        # NEVER THE ROOT-OWNED EXTRACTED TREE ($PRIVILEGED_TREE), which carries
+        # no `.git` for a tool that reads one (install-payload's own --ref
+        # resolution, install-backend's default source lookup) to resolve
+        # from. `agents` now exists, provisioned above, so it can hold a clone
+        # of its own for the first time.
+        AGENTS_HOME=$(sudo -u "$AGENTS" -H sh -c 'printf %s "$HOME"') \
+            || die "could not resolve the $AGENTS account's home to clone the release into"
+        case "$AGENTS_HOME" in
+            /*) ;;
+            *) die "the $AGENTS account's home is not an absolute path: $AGENTS_HOME" ;;
+        esac
+        AGENTS_SRC_DIR="$AGENTS_HOME/src"
+        echo "$PROG: cloning $TAG into $AGENTS_SRC_DIR as $AGENTS"
+        sudo -u "$AGENTS" -H mkdir -p "$AGENTS_SRC_DIR" || die "could not create $AGENTS_SRC_DIR as $AGENTS"
+        for REPO_NAME in $TAGGED_REPOS; do
+            agents_clone_or_verify "$REPO_NAME" "$TAG"
+        done
+        agents_clone_or_verify write-better "$WRITE_BETTER_COMMIT" commit
+
+        # THE SAME CHECK, AGAINST THE CLONES JUST MADE, never trusted merely
+        # because the operator's own clones already passed it: the two are
+        # separate trees made by separate commands, and only this confirms
+        # what `agents` is about to run is what was signed.
+        AGENTS_VERIFY_RC=0
+        verify_release "$TAG" "$AGENTS_SRC_DIR" || AGENTS_VERIFY_RC=$?
+        if [ "$AGENTS_VERIFY_RC" -ne 0 ]; then
+            echo "$PROG: refusing — $AGENTS's own clones of $TAG did not verify (exit $AGENTS_VERIFY_RC), so no installer was run." >&2
+            exit "$AGENTS_VERIFY_RC"
+        fi
+
+        # stand-up-backend leaves `provision` out of this shape because it runs
+        # as `agents` and root's copy; this is the one place holding the
+        # operator's sudo, so the packages a dispatched run needs arrive here.
+        # Run from the root-placed tree, never the operator's clone. Linux only,
+        # as in the single-account branch: Homebrew refuses root, and macOS
+        # needs neither sandbox package.
+        if [ "$PLATFORM" = linux ]; then
+            run_step provision-backend sudo "$ROOT_PYTHON3" -I "$PRIVILEGED_TREE/bin/provision-backend"
+        fi
+        run_step install-payload sudo -u "$AGENTS" -H sh "$AGENTS_SRC_DIR/shipwright/bin/install-payload"
+        # write-better ships no release tag, so the backend installer would
+        # otherwise resolve it against its own origin/main, which can have
+        # moved past the release since the manifest was signed. Pin it to the
+        # commit verify_release checked, as builder-update does.
+        #
+        # RUN AS ROOT, FROM THE SAME PLACED COPY, under the fixed root
+        # interpreter: its own `root_copy_problem`/`root_invocation` refuse
+        # a root run from anywhere else, and its `agents` steps run
+        # `REPO/bin/<tool>` through `sudo -u agents -H`, so `REPO` has to be
+        # this root-owned tree for those steps to be able to read it at all.
+        # `--from` points its own `place` step at the agents clones above,
+        # since this tree carries no `.git` for install-backend's default
+        # source lookup to resolve from.
+        run_step stand-up-backend sudo "$ROOT_PYTHON3" -I \
+            "$PRIVILEGED_TREE/bin/stand-up-backend" \
+            --shape three --seed-registry --activate \
+            --commit "write-better=$VERIFIED_WRITE_BETTER_COMMIT" \
+            --from "$AGENTS_SRC_DIR"
     else
-        run_step provision-backend "$PYTHON3" "$SHIPWRIGHT/bin/provision-backend" --no-install
+        if [ "$(id -u)" -eq 0 ]; then
+            run_step provision-backend "$PYTHON3" "$SHIPWRIGHT/bin/provision-backend"
+        elif [ "$PLATFORM" = linux ] && can_use_sudo; then
+            echo "$PROG: provision-backend needs root once; this will ask for your account's password"
+            run_step provision-backend sudo "$PYTHON3" "$SHIPWRIGHT/bin/provision-backend"
+        else
+            run_step provision-backend "$PYTHON3" "$SHIPWRIGHT/bin/provision-backend" --no-install
+        fi
+        run_step install-payload sh "$SHIPWRIGHT/bin/install-payload"
+        # write-better ships no release tag, so the backend installer would
+        # otherwise resolve it against its own origin/main, which can have
+        # moved past the release since the manifest was signed. Pin it to the
+        # commit verify_release checked, as builder-update does.
+        run_step stand-up-backend "$PYTHON3" "$SHIPWRIGHT/bin/stand-up-backend" \
+            --shape single --seed-registry --activate \
+            --commit "write-better=$VERIFIED_WRITE_BETTER_COMMIT"
     fi
-    run_step install-payload sh "$SHIPWRIGHT/bin/install-payload"
-    run_step stand-up-backend "$PYTHON3" "$SHIPWRIGHT/bin/stand-up-backend" \
-        --shape single --seed-registry --activate
+    if [ "$NO_GITHUB_APP" != yes ]; then
+        # Checked before the step runs, since --if-missing's own exit tells
+        # us nothing: it exits 0 whether this run created the key or found
+        # one already there, and the done message below needs to say which.
+        GITHUB_APP_KEY="${BUILDER_CONFIG_DIR:-${HOME:-}/.config/convivy}/github-app/app.pem"
+        GITHUB_APP_EXISTED=no
+        [ -f "$GITHUB_APP_KEY" ] && GITHUB_APP_EXISTED=yes
+        run_step create-github-app "$PYTHON3" "$SHIPWRIGHT/bin/create-github-app" \
+            --if-missing --code-from-tty
+    fi
     echo
-    echo "$PROG: done. Open a new login shell (or log out and back in), then check:"
-    echo "    command -v co agentctl"
-    echo "Both should print a path under ~/.local/bin. On your Mac laptop, install Deck:"
-    echo "    curl -fsSL https://convivybuilder.org/install.sh | sh -s -- --role laptop"
+    if [ "${CLAUDE_INSTALLED_NOW:-no}" = yes ]; then
+        echo "Claude Code was installed just now; run \`claude\` once to sign in before it runs a crew."
+    fi
+    if [ "$SHAPE" = three ]; then
+        echo "$PROG: done. stand-up-backend printed above how to pair Deck with this machine."
+    else
+        echo "$PROG: done. Open a new login shell (or log out and back in), then check:"
+        echo "    command -v co agentctl"
+        echo "Both should print a path under ~/.local/bin."
+    fi
+    echo "On your Mac laptop, install Deck:"
+    echo "    curl -fsSL $SITE_BASE/install.sh | sh -s -- --role laptop"
     echo "Open Deck and add this server; Deck opens the steward."
+    if [ "$NO_GITHUB_APP" != yes ]; then
+        if [ "$GITHUB_APP_EXISTED" = yes ]; then
+            echo "The GitHub App was created on an earlier run; create-github-app printed above"
+            echo "where to manage its installations. Connect it with step 2 in connecting-github.md,"
+            echo "starting \`python3 $SHIPWRIGHT/bin/connect-github\`."
+        else
+            echo "One step remains on GitHub: install the App on the repositories Builder works in, at"
+            echo "the address create-github-app printed above, then connect it with step 2 in"
+            echo "connecting-github.md, starting \`python3 $SHIPWRIGHT/bin/connect-github\`."
+        fi
+    fi
+    echo "Check items off as you go: $SITE_BASE/install-checklist.html"
 else
+    DECK_NEEDS_ATTENTION=0
     run_step install-deck "$PYTHON3" "$SHIPWRIGHT/bin/install-deck" --ref "$TAG"
     echo
     echo "$PROG: done. Deck is in ~/Applications; open it and add this server. Deck opens the steward."
+    if [ "$DECK_NEEDS_ATTENTION" -eq 1 ]; then
+        echo "install-deck reported something above that still needs you, such as the ssh config"
+        echo "Deck's crew sidebar reads. Fix it and rerun \`python3 $SHIPWRIGHT/bin/install-deck\`; a rerun is safe."
+    fi
+    echo "Check items off as you go: $SITE_BASE/install-checklist.html"
 fi
 }
 

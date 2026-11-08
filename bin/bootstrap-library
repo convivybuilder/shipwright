@@ -73,7 +73,7 @@ there is nobody to ask.
 
 **`--print-operator-name` resolves the chain and exits, nothing else.** It
 runs before anything that needs `--root` or the jobs directory: no database,
-no `operator.json`. `bin/stand-up-backend`'s `--shape two` runs this mode as
+no `operator.json`. `bin/stand-up-backend`'s `--shape three` runs this mode as
 a subprocess, in the operator's own process, since this command is the one
 place the chain is defined and its `library-person` step otherwise runs as
 `agents`, which has no claim to the operator's name.

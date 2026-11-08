@@ -7,6 +7,11 @@ account that cannot, follow [Installing on Linux, without administrator access](
 
 It has been tested on Debian 12. On Ubuntu 22.04 it has been tested only as far as the package step.
 
+**The one-command install installs `git`, Python 3.11 and Claude Code itself**, asking for your
+`sudo` password once; [Installing Builder's one-command section](installing.md#the-one-command)
+says exactly what it installs. This page is the manual route, one command at a time, which still
+needs those in place first.
+
 Before you begin, do everything in [Before you start](installing.md#before-you-start): Claude Code
 signed in, and the six repositories cloned into `~/src`.
 
@@ -36,8 +41,9 @@ which prints two paths under `~/.local/bin`. Those two lines are how you know th
 **What each command does:**
 
 1. `provision-backend` installs the system packages Builder needs: `zsh`, `lsof`, `tmux`, `curl`,
-   Python 3.11, Python's venv support, and `getfacl` from the `acl` package. It checks each one by
-   running it, and changes nothing that is already present.
+   Python 3.11, Python's venv support, `getfacl` from the `acl` package, and `bubblewrap` and
+   `socat`, which a dispatched session's sandbox needs. It checks each one by running it, and
+   changes nothing that is already present.
 2. `install-payload` puts the steward, its skills and your knowledge repository in place. On a
    first install, it names the folder where you meet the steward as it places the steward there.
 3. `stand-up-backend --shape single --seed-registry --activate` installs Builder as your own account,

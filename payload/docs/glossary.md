@@ -27,12 +27,12 @@ merge check in the Library, and that check approves every merge it is asked abou
 [What works and what does not yet](install-status.md) says. [Customizing Builder](customizing.md#the-agent-policy)
 shows how to change it.
 
-**`agents`** — The account the two-account install runs Builder as. The steward, every crew's
+**`agents`** — The account the three-account install runs Builder as. The steward, every crew's
 session, the agents they put to work, the Library and Builder's background jobs all run there, and
 `~/builder` is in it. It holds none of your credentials and has no administrator rights. You reach
 it over SSH and read what it writes through its group.
 
-**approver** — The GitHub App that posts review checks on the two-account install. Its key is read
+**approver** — The GitHub App that posts review checks on the three-account install. Its key is read
 only by the machine's administrator account and the program that runs a review, so no agent can post
 a check itself.
 
@@ -185,16 +185,16 @@ change is kept as a diff, a line-by-line record of what changed.
 **repository** — A folder of files whose whole history git keeps. Builder's own code lives in
 repositories, and so do the Reference Room's documents and the projects your crews build.
 
-**review check** — On the two-account install, a reviewer's verdict on a pull request, posted to
+**review check** — On the three-account install, a reviewer's verdict on a pull request, posted to
 GitHub by the approver. The rule you add on `main` lets a pull request merge only when both review
 checks, the reviewer's and the security reviewer's, are green against `main` and were posted by the
 approver, so a check of the same name posted by anyone else does not count. An organisation
 administrator is exempt from the rule.
 
 **reviewer** — The agent that reads a pull request for mistakes and reaches a verdict. On the
-two-account install the approver posts that verdict to GitHub as a review check.
+three-account install the approver posts that verdict to GitHub as a review check.
 
-**`reviewers`** — The second account the two-account install creates, which runs the agents that
+**`reviewers`** — The second account the three-account install creates, which runs the agents that
 review a change. `agents` can start a review only through one program the administrator account
 owns, which fixes the pull request and commit and posts the verdict itself.
 
@@ -213,15 +213,15 @@ kind of signal is also found by search is decided for that kind.
 **single-account install** — The install shape that runs Builder on the server as one account,
 your own, for a server where you have no administrator password, or for starting without GitHub.
 The shape counts only the server's accounts; Deck runs on your laptop as your account there. It
-creates no account and has no approver. Its agents reach GitHub as an App you create, and in the merge mode called
-Enforced, GitHub refuses to merge a pull request an agent opened until you approve it; in
-Instruction only, the agents'
-instructions hold that rule. [Connecting GitHub](connecting-github.md) sets it up.
+creates no account and has no approver. Its agents reach GitHub as an App you create, and the
+agents' instructions hold that no agent merges. [Connecting GitHub](connecting-github.md) sets it up.
 
-**skill** — A set of instructions a session loads for a particular job. Builder installs four of
-its own: `new-crew` and `new-subcrew`, which create a crew and an extra session within one,
-`write-bead`, which writes a crew's bead, and `take-upstream`, which brings later changes to Builder
-into a fork. It also links two writing passes, `write-better` and `talk-better`.
+**skill** — A set of instructions a session loads for a particular job. Builder installs seven of
+its own: `new-crew`, which creates a crew, `new-subcrew`, which is retired and sends a request
+for a child session to `new-crew`, `write-bead`, which writes a crew's bead, `take-upstream`, which brings later changes to Builder
+into a fork, `handoff-leave` and `handoff-pickup`, which hand a session's state to the next session
+that resumes it, and `rollover`, which rotates a session to a fresh one over remote control via a
+handoff. It also links two writing passes, `write-better` and `talk-better`.
 
 **Slate** — A sheet in Deck for each crew, where the crew's session leaves the questions it needs
 you to answer and you keep notes to send it at a break point. [The Slate](the-slate.md) explains it.
@@ -246,13 +246,17 @@ address the others can reach, and nothing is published to anyone else.
 **terminal** — A window where you type commands and read what the computer answers. On a Mac the
 application is called Terminal. In a path typed there, `~` stands for your account's home folder.
 
+**three-account install** — The install shape that runs Builder as `agents` and its reviews as
+`reviewers`, with the administrator password, so a merge waits on review checks no agent can post.
+This release installs only the single-account shape; the three-account install comes in a later
+release.
+
 **tmux** — A background program that keeps terminal sessions running after you close the window, so
 you can leave a session working and come back to it.
 
-**two-account install** — The install shape that runs Builder as `agents` and its reviews as
-`reviewers`, with the administrator password, so a merge waits on review checks no agent can post.
-This release installs only the single-account shape; the two-account install comes in a later
-release.
+**two-account install** — The install shape that runs Builder as `agents`, with reviews also running
+as `agents` rather than a separate account, so the account that writes a change is the same one that
+reviews it. It is designed and not built.
 
 **vault** — One of the Library's three parts, which are the Reference Room, the Chart House and the
 Archives. Each holds a different kind of thing under its own rules.

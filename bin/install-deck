@@ -7,14 +7,28 @@
     bin/install-deck --check         report only; 1 if work is left, 2 if refused
 
 A real run exits 0 when Deck is installed, 2 when it refused, and 3 when Deck
-is installed but another installed copy remains for the operator to remove: a
-Deck in /Applications, or an old `Deck.app` this could not delete. A superseded
-bundle under a dotted name that could not be deleted is not counted; the next
-run sweeps it, as it does any leftover.
+is installed but something still needs the operator's attention: another
+installed copy to remove (a Deck in /Applications, or an old `Deck.app` this
+could not delete), or, on a laptop install, the ssh config step below
+failing. A superseded bundle under a dotted name that could not be deleted is
+not counted; the next run sweeps it, as it does any leftover.
 No outcome of a real run is reported as 1. When one exits 1, an uncaught error
 ended it, such as a failed `git clone` or a filesystem error during placement,
 and Python printed the traceback. `--check` keeps the convention its sibling
 installers share, where 1 means work is left.
+
+## THE SSH CONFIG DECK'S CREW SIDEBAR READS
+
+A laptop install also fetches a full `agent-platform` tree beside this
+checkout, the same way and at the same verified release as the server role's.
+Once Deck is placed, this calls agent-platform's own
+`tools/install-crew-ssh-config.sh`, which sets up the ssh config Deck's crew
+sidebar reads, and reimplements none of its logic. That tool needs three
+things, all set up on this laptop, that a laptop install cannot supply on its
+own: the `tailnet_host` key in this laptop's own operator config, an ssh host
+alias for the crew machine, and a mounted share of the crew account's home.
+When any is missing the tool refuses and this reports which, with Deck
+already in place; rerunning this installer once they are fixed is safe.
 
 **THIS CALLS DECK'S BUILD AND REIMPLEMENTS NONE OF IT.** The invocation is
 Deck's, specified in Deck's own build contract:
@@ -103,6 +117,13 @@ BUNDLE = "Convivy Builder.app"
 # real run removes it once the new one is in place, and only when it is Deck's.
 LEGACY_BUNDLE = "Deck.app"
 BUNDLE_ID = "com.convivy.deck"
+
+# Relative to a sibling `agent-platform` tree, cloned beside this checkout by
+# a laptop install the same way builder-install's server role clones one.
+# RUN WITH `bash`, NOT RE-IMPLEMENTED: the tool reads this laptop's own
+# operator config, an ssh host alias for the crew machine, and a mounted
+# share of its home, none of which this installer can stand in for.
+CREW_SSH_CONFIG_SCRIPT = "tools/install-crew-ssh-config.sh"
 
 # THE SHARED APPLICATIONS DIRECTORY, checked for a Deck someone copied there by
 # hand, as on one operator's laptop where /Applications/Deck.app was the only
@@ -199,6 +220,48 @@ def resolve_source(args) -> Path:
         ["git", "clone", args.clone_from, str(source)], check=True
     )
     return source.resolve()
+
+
+def resolve_agent_platform(args) -> Path | None:
+    """A sibling `agent-platform` tree carrying the crew ssh-config tool.
+
+    None when there is no such tree, which is the ordinary case for a bare
+    `install-deck` call never made through `builder-install` — the step
+    below is then simply skipped, since there is nothing here for it to run.
+    """
+    candidate = (args.agent_platform or REPO.parent / "agent-platform").expanduser()
+    if not (candidate / CREW_SSH_CONFIG_SCRIPT).is_file():
+        return None
+    return candidate.resolve()
+
+
+def run_crew_ssh_config(agent_platform: Path | None) -> bool:
+    """Run agent-platform's own ssh-config tool, once Deck is placed.
+
+    **CALLS THE TOOL AND REIMPLEMENTS NONE OF ITS LOGIC.** Its stdout and
+    stderr are inherited rather than captured, so its own output reaches the
+    operator exactly as it printed it.
+
+    Returns whether it failed. `agent_platform` being None is not a failure:
+    a laptop install always fetches the tree, so its absence means this was
+    not called through `builder-install`, and skipping it quietly is right.
+    """
+    if agent_platform is None:
+        return False
+    script = agent_platform / CREW_SSH_CONFIG_SCRIPT
+    result = subprocess.run(["bash", str(script)], check=False)
+    if result.returncode == 0:
+        return False
+    print(
+        f"{PROG}: setting up the ssh config Deck's crew sidebar reads failed "
+        f"(exit {result.returncode}). {BUNDLE} is installed; what this "
+        f"laptop still needs is one or more of: the tailnet_host key in this "
+        f"laptop's own operator config, an ssh host alias for the crew "
+        f"machine, and a mounted share of the crew account's home. Fix "
+        f"whichever is missing and rerun {PROG}; it is safe to rerun.",
+        file=sys.stderr,
+    )
+    return True
 
 
 def check_full_clone(source: Path) -> None:
@@ -656,7 +719,7 @@ def outstanding(applications: Path) -> list[str]:
             "install one and does not configure the connection; add the host in "
             "Deck's own settings once the backend is up:"
         ),
-        "    bin/stand-up-backend --shape single|two    # on the machine serving the backend",
+        "    bin/stand-up-backend --shape single|three  # on the machine serving the backend",
         "",
     ]
 
@@ -722,6 +785,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--clone-from", default=None,
                         help="clone the checkout from this URL if --source is "
                              "absent; never shallow")
+    parser.add_argument("--agent-platform", type=Path, default=None,
+                        help="an agent-platform tree carrying "
+                             f"{CREW_SSH_CONFIG_SCRIPT} (default: beside this "
+                             "repository); absent, the crew ssh-config step "
+                             "is skipped")
     parser.add_argument("--ref", default=None,
                         help="the commit or tag to build (default: the "
                              "checkout's HEAD). A tag is reported with the "
@@ -878,10 +946,14 @@ def main(argv: list[str]) -> int:
         print()
         for line in outstanding(applications):
             print(line)
-        # LAST, AND EXIT 3. Deck is installed, but two bundles now share its
-        # identifier until someone removes the shared copy, so the run is not
-        # finished and its exit status says so. Not 1, which is also what
-        # Python exits with on an uncaught error.
+        # AFTER THE OUTSTANDING BOILERPLATE, since this is specific to this
+        # run and a laptop install's sidebar depends on it, not general
+        # advice that applies every time.
+        ssh_config_failed = run_crew_ssh_config(resolve_agent_platform(args))
+        # LAST, AND EXIT 3. Deck is installed, but something still needs the
+        # operator's attention, so the run is not finished and its exit
+        # status says so. Not 1, which is also what Python exits with on an
+        # uncaught error.
         shared = shared_deck(applications)
         if shared is not None:
             for line in shared_deck_lines(shared):
@@ -890,6 +962,8 @@ def main(argv: list[str]) -> int:
         # THE OLD COPY COULD NOT BE DELETED, so two bundles share Deck's
         # identifier just as with a shared copy, and the status says so.
         if legacy_note and legacy_note.startswith("could NOT"):
+            return 3
+        if ssh_config_failed:
             return 3
         return 0
 

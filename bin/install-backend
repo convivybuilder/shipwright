@@ -63,8 +63,10 @@ which is each owning crew's work, and it does not install supervision, which
 - **Rule 4, the interpreter is pinned alongside the code.** Pinning code and
   leaving the venv in the tree pins half of it: a `pip install -e .` on a
   branch changes what the deployed process imports even when the deployed code
-  is fixed. So each area gets its own venv, built from that repository's
-  `requirements.txt` and never from `requirements-dev.txt`.
+  is fixed. So each area gets its own venv, built with `pip install
+  --require-hashes` from that repository's hash-locked lockfile (`lockfile_for`
+  says which file), never from `requirements.txt` or `requirements-dev.txt`
+  directly.
 - **Rule 6 and 7, the install is the only writer and it reads a git REF.**
   Never a live checkout directory: `cp -r` and `rsync` do not respect
   `.gitignore`, so they would sweep exactly the gitignored credential files
@@ -128,6 +130,11 @@ PROG = "install-backend"
 # The backend. Deck is a macOS application rather than a served component and
 # is not placed by this.
 REPOSITORIES = ("library", "agent-platform", "convivy-orient", "write-better")
+
+# **write-better SHIPS NO RELEASE AND TRACKS ITS OWN main**. --release resolves to a tag for every
+# other repository this places; write-better keeps its ordinary default
+# (`default_ref_for`, or an explicit --ref).
+TAGGED_REPOSITORIES = tuple(name for name in REPOSITORIES if name != "write-better")
 
 
 @dataclass(frozen=True)
@@ -240,6 +247,22 @@ MARKER = ".built-by-install-backend"
 # tooling, and a deploy area is not where anything is tested.
 REQUIREMENTS = "requirements.txt"
 
+# **THE LOCKFILE A REPOSITORY OR COMPONENT INSTALLS FROM, NAMED HERE ONCE.**
+# `build_venv` never runs `pip install -r requirements.txt`: it runs
+# `pip install --require-hashes -r <lockfile>`, and this is the one place that
+# says which file that is, so two call sites can never disagree. A name not
+# listed here still gets one, the default below, rather than falling back to
+# an unpinned install the moment somebody adds a repository or component and
+# forgets this dict.
+DEFAULT_LOCKFILE = "requirements.lock.txt"
+LOCKFILES = {
+    "library": "requirements.lock",
+}
+
+
+def lockfile_for(name: str) -> str:
+    return LOCKFILES.get(name, DEFAULT_LOCKFILE)
+
 
 class Refused(Exception):
     """Something a person has to decide about. Never a stack trace."""
@@ -279,6 +302,41 @@ def primary_worktree() -> Path:
     return (Path(common) if Path(common).is_absolute() else here / common).resolve().parent
 
 
+def _owned_by(path: Path, owner: int) -> str | None:
+    """Why `owner` may not trust `path` alone, or None when it may.
+
+    Not a symlink, owned by exactly `owner`, and no group or other write bit —
+    the same test `stand-up-backend`'s `tree_problem` applies to what root runs.
+    """
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        return f"{path} is missing"
+    if stat.S_ISLNK(st.st_mode) or st.st_uid != owner or st.st_mode & 0o022:
+        return f"{path} is not owned by this account alone, or another account can write it"
+    return None
+
+
+def source_problem(paths: list[Path], owner: int | None = None) -> str | None:
+    """Why this account may not trust the checkouts it is about to place, or None.
+
+    **THE THREE-ACCOUNT SHAPE RUNS THIS AS `agents`, FROM CLONES `agents` MADE
+    ITSELF.** `bin/builder-install` clones the release as `agents`, into its own
+    source directory, and passes it with `--from`. A directory owned by another
+    account, or one any other account can write, could substitute code this
+    never asked for into the deploy area it is about to serve. Checked for every
+    shape, not only the three-account one: the single-account shape reads its
+    own checkout, which already belongs to the account running it and passes
+    this without changing what that shape could already do.
+    """
+    owner = os.geteuid() if owner is None else owner
+    for path in paths:
+        problem = _owned_by(path, owner)
+        if problem:
+            return problem
+    return None
+
+
 def default_ref_for(repo: Path) -> str:
     """`origin/stable` when `repo` carries that branch, `origin/main` otherwise.
 
@@ -309,6 +367,42 @@ def default_ref_for(repo: Path) -> str:
     return "origin/main"
 
 
+# **ACCEPTS "0.6.1" OR "v0.6.1" ALIKE, AS builder-install DOES**; the tag is
+# always written with the v. The shape is the union of what commit-export
+# tags (`-rc1`) and what build-site accepts (`-rc.1`).
+RELEASE_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)(\.?[0-9]+)?)?$")
+
+
+def release_tag(value: str) -> str:
+    """The tag --release names, or a refusal when its shape is wrong."""
+    version = value[1:] if value.startswith("v") else value
+    if not RELEASE_VERSION.fullmatch(version):
+        raise Refused(
+            f"'{value}' is not a release version. Pass --release with a version "
+            f"such as 1.2.3 or v1.2.3-rc1."
+        )
+    return f"v{version}"
+
+
+def clean_clone_or_refuse(repo: Path, tag: str) -> None:
+    """Refuse, naming `repo`, when it has uncommitted changes to tracked files.
+
+    Only untracked files are ignored, the way `builder-install`'s own clone
+    check reads a clone's cleanliness: this installs from a published ref
+    through `git archive`, which an untracked file never reaches, but a
+    tracked one left modified is a clone that is not really at the release it
+    claims to be.
+    """
+    dirty = run("git", "-C", str(repo), "status", "--porcelain",
+                "--untracked-files=no").strip()
+    if dirty:
+        raise Refused(
+            f"{repo} has uncommitted changes to its tracked files; refusing to "
+            f"install release {tag} from a clone that is not clean. Commit, "
+            f"discard or move it aside, then run again."
+        )
+
+
 def commit_of(repo: Path, ref: str) -> str:
     """The commit `ref` names, or a refusal that says which repository failed."""
     if not (repo / ".git").exists():
@@ -324,6 +418,74 @@ def commit_of(repo: Path, ref: str) -> str:
             f"with --ref; this never falls back to the checkout's own HEAD, "
             f"because a local HEAD is not what a release serves."
         ) from exc
+
+
+def expected_commits(given: list[str] | None, flag: str = "--expect-commit") -> dict[str, str]:
+    """Each `flag REPO=SHA`, as {repository: commit}, or a refusal.
+
+    Shared by `--expect-commit`, which checks a resolved ref against a
+    commit, and `--commit`, which names the commit to resolve to directly;
+    `flag` is only for the refusal's own wording."""
+    found: dict[str, str] = {}
+    for item in given or ():
+        name, sep, commit = item.partition("=")
+        if not sep or name not in REPOSITORIES or not commit:
+            raise Refused(
+                f"{flag} takes REPO=SHA, REPO one of {', '.join(REPOSITORIES)}: "
+                f"{item!r}")
+        if found.get(name, commit) != commit:
+            raise Refused(f"{flag} names two commits for {name}")
+        found[name] = commit
+    return found
+
+
+def refuse_unexpected(repo: Path, ref: str, commit: str, expected: str | None) -> None:
+    """Refuse, naming `repo`, when `ref` resolved to `commit` and the caller expected another.
+
+    builder-update checks a release's commits against its signed manifest and
+    then calls this with the tag. A tag re-pointed in the clone between that
+    check and this resolution would otherwise be placed and then run.
+    """
+    if expected is not None and commit != expected:
+        raise Refused(
+            f"{repo.name}'s {ref} in {repo} names {commit}, not the expected commit "
+            f"{expected}; refusing to place it, and nothing has been changed.")
+
+
+def from_tree_paths(given: list[str] | None) -> dict[str, Path]:
+    """Each `--from-tree REPO=PATH`, as {repository: Path}, or a refusal."""
+    found: dict[str, Path] = {}
+    for item in given or ():
+        name, sep, path = item.partition("=")
+        if not sep or name not in REPOSITORIES or not path:
+            raise Refused(
+                f"--from-tree takes REPO=PATH, REPO one of {', '.join(REPOSITORIES)}: "
+                f"{item!r}")
+        if name in found:
+            raise Refused(f"--from-tree names two paths for {name}")
+        found[name] = Path(path)
+    return found
+
+
+# `install-privileged`'s `extract()` names a root-owned tree `<repo>@<sha>`,
+# lowercase hex, the same shape `RUNNING` there parses out of its own path.
+TREE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def commit_from_tree(path: Path) -> str:
+    """The commit `path`'s own directory name claims, after its last `@`, or
+    a refusal.
+
+    This stands in for `commit_of`'s `git rev-parse` when `path` is a
+    root-owned extracted tree with no `.git` to ask — the directory name is
+    the only thing that says which commit it is."""
+    _, sep, commit = path.name.rpartition("@")
+    if not sep or not TREE_COMMIT_RE.fullmatch(commit):
+        raise Refused(
+            f"{path} is not a root-owned extracted tree: its name must end "
+            f"`@<40-hex commit>`"
+        )
+    return commit
 
 
 def escapes(path: str) -> bool:
@@ -517,49 +679,85 @@ def export_tree(repo: Path, commit: str, into: Path,
                 f"could not archive {repo.name} at {said}: "
                 f"{result.stderr.decode(errors='replace').strip()}"
             )
-        root = os.path.realpath(into)
-        with tarfile.open(archive) as tar:
-            members = checked_members(tar.getmembers())
-            # `filter="data"` IS NOT AVAILABLE ON THE PLATFORM THIS TARGETS.
-            # Ubuntu 22.04's `python3.11` package is 3.11.0rc1 — measured in a
-            # container — and the filter was backported in 3.11.4, so passing
-            # it there raises `TypeError`. It is applied where it exists, as a
-            # bonus rather than as the control.
-            supports_filter = "filter" in inspect.signature(tarfile.TarFile.extract).parameters
-            for member in members:
-                # **BEFORE THE WRITE, NOT AFTER, AND THAT ORDER IS THE WHOLE OF
-                # IT.** `check_destination`'s docstring says what it is
-                # protecting against and how that was found; it is written once,
-                # there, rather than restated at this call site.
-                dest = check_destination(into, root, member)
-                try:
-                    if supports_filter:
-                        tar.extract(member, into, filter="data")
-                    else:
-                        tar.extract(member, into)
-                except tarfile.TarError as exc:
-                    # THE FILTER'S OWN REFUSAL IS A REFUSAL, NOT A STACK TRACE.
-                    # `data` raises `LinkOutsideDestinationError` on some
-                    # versions, and letting it propagate printed a traceback
-                    # straight past the "never a stack trace" this module's
-                    # exception exists for. Measured: 3.14 and 3.10.12 raise
-                    # here where 3.11.16 rewrites the link instead.
-                    raise Refused(
-                        f"the archive was refused while extracting "
-                        f"{member.name}: {exc}"
-                    ) from None
-                # And the same question of the member once written, which is
-                # what catches a LINK that points outside — the pre-write check
-                # asks about its directory, not about where it leads. A link
-                # that escapes is caught here, before any later member can be
-                # written through it, and the pre-write collision check is what
-                # makes "any later member" true rather than hopeful.
-                landed = os.path.realpath(dest)
-                if landed != root and not landed.startswith(root + os.sep):
-                    raise Refused(
-                        f"refusing {member.name}: it resolves to {landed}, "
-                        f"outside the tree being built at {root}"
-                    )
+        return extract_checked(archive, into)
+
+
+def export_from_tree(source: Path, into: Path) -> int:
+    """`source`, a root-owned extracted tree with no `.git`, tarred and
+    extracted into `into` through the same checks `export_tree` runs on a
+    `git archive`. Returns the file count.
+
+    **Written into a tar here, rather than copied, so there is one extraction
+    rather than two.** `checked_members` and `check_destination` read a
+    member's name, type and link target, and mask every mode to what
+    `filter="data"` would have — none of that depends on whether the tar came
+    from `git archive` or from `tarfile.add` against a plain directory, so the
+    same extraction loop below covers both without weakening either.
+
+    **ADDED FILE BY FILE AT THE TOP LEVEL, NOT AS `source` ITSELF WITH
+    `arcname="."`.** `git archive` never emits a root `.` entry, and a bare
+    `tar.add(source, arcname=".")` would, which is a shape `checked_members`
+    has never had to see.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = Path(tmp) / "tree.tar"
+        with tarfile.open(archive, "w") as tar:
+            for child in sorted(source.iterdir()):
+                tar.add(child, arcname=child.name)
+        return extract_checked(archive, into)
+
+
+def extract_checked(archive: Path, into: Path) -> int:
+    """`archive`, already built by `export_tree` or `export_from_tree`,
+    extracted into `into`. Returns the file count.
+
+    The one extraction loop both call, so `checked_members`, the pre-write
+    `check_destination` and the final realpath sweep run identically whether
+    the tar came from `git archive` or from a root-owned tree with no `.git`.
+    """
+    root = os.path.realpath(into)
+    with tarfile.open(archive) as tar:
+        members = checked_members(tar.getmembers())
+        # `filter="data"` IS NOT AVAILABLE ON THE PLATFORM THIS TARGETS.
+        # Ubuntu 22.04's `python3.11` package is 3.11.0rc1 — measured in a
+        # container — and the filter was backported in 3.11.4, so passing
+        # it there raises `TypeError`. It is applied where it exists, as a
+        # bonus rather than as the control.
+        supports_filter = "filter" in inspect.signature(tarfile.TarFile.extract).parameters
+        for member in members:
+            # **BEFORE THE WRITE, NOT AFTER, AND THAT ORDER IS THE WHOLE OF
+            # IT.** `check_destination`'s docstring says what it is
+            # protecting against and how that was found; it is written once,
+            # there, rather than restated at this call site.
+            dest = check_destination(into, root, member)
+            try:
+                if supports_filter:
+                    tar.extract(member, into, filter="data")
+                else:
+                    tar.extract(member, into)
+            except tarfile.TarError as exc:
+                # THE FILTER'S OWN REFUSAL IS A REFUSAL, NOT A STACK TRACE.
+                # `data` raises `LinkOutsideDestinationError` on some
+                # versions, and letting it propagate printed a traceback
+                # straight past the "never a stack trace" this module's
+                # exception exists for. Measured: 3.14 and 3.10.12 raise
+                # here where 3.11.16 rewrites the link instead.
+                raise Refused(
+                    f"the archive was refused while extracting "
+                    f"{member.name}: {exc}"
+                ) from None
+            # And the same question of the member once written, which is
+            # what catches a LINK that points outside — the pre-write check
+            # asks about its directory, not about where it leads. A link
+            # that escapes is caught here, before any later member can be
+            # written through it, and the pre-write collision check is what
+            # makes "any later member" true rather than hopeful.
+            landed = os.path.realpath(dest)
+            if landed != root and not landed.startswith(root + os.sep):
+                raise Refused(
+                    f"refusing {member.name}: it resolves to {landed}, "
+                    f"outside the tree being built at {root}"
+                )
     # A FINAL SWEEP OVER THE WHOLE TREE, because the per-member check can only
     # see chains whose links are already on disk, and because the three
     # interpreters measured here disagree about what they do with an escaping
@@ -664,21 +862,64 @@ def export_extra(repo: Path, commit: str, paths: tuple[str, ...],
     return written
 
 
-# **THE PROJECTS REGISTRY IS THE ADOPTER'S STATE, AND IT LIVES IN A DEPLOY AREA
-# EVERY INSTALL REPLACES.** agent-platform reads `config/projects.json` from its
-# own tree, `new-crew` registers each crew there, and the Library validates
-# products and review records against it (`AGENT_PLATFORM_PROJECTS` in
-# `jobs/library.toml`). The published export leaves the file out, because the
-# source repository's copy is Convivy's own registry, and ships
-# `config/projects.seed.json` instead. So a tree without a registry keeps the one
-# the replaced area held, which is what carries an adopter's registered crews
-# across an update, and a first install takes the seed.
+# **THE PROJECTS REGISTRY IS ONE TABLE, HELD BY THE LIBRARY IN ITS CHART
+# HOUSE, NEVER A FILE ON EVERY MACHINE.** Amendment to platform decision 0098,
+# 2026-10-25: a registry file on each machine a Builder install's crews run on
+# would diverge, since one install can run crews on several machines against
+# one Library (decision 0021). agent-platform reads the registry from
+# `PROJECTS_JSON` when that is set and otherwise from the Library over the
+# wire, and `crew_registration.register` registers a crew by sending it to the
+# Library — neither reads or writes a registry file on its own machine. This
+# file's only part in that is seeding the Library's table the first time it
+# starts: it works out the seed document and stages it where
+# `jobs/library.toml`'s own `prepare` command will find it, at
+# `{state}/library/projects-registry-seed.json`, written only when that path
+# is absent. `load_project_registry.py` — the Library's own CQ·241 — reads it
+# once, validates it and replaces the table's contents in one transaction.
+#
+# This file no longer writes any copy of the registry into agent-platform's
+# deploy area or into the install repository. `REGISTRY` and `INSTALL_REGISTRY`
+# below are read, never written: `REGISTRY` names the path an install running
+# before #234 wrote the registry to, in agent-platform's deploy area, and
+# `INSTALL_REGISTRY` names the path an install running under #234 (before this
+# change) wrote it to instead, in the install repository. Both are read once
+# more, so an adopter's registered crews recorded under either old behaviour
+# still reach the seed this stages, rather than being replaced by it. The
+# published export leaves `config/projects.json` out of the tree it ships,
+# because the source repository's own copy is Convivy's registry, and ships
+# `config/projects.seed.json` instead.
 #
 # A tree that carries its own registry is left alone: that is a source-controlled
 # registry, and the file in the tree is the one meant to serve.
 REGISTRY_REPOSITORY = "agent-platform"
 REGISTRY = Path("config", "projects.json")
 REGISTRY_SEED = Path("config", "projects.seed.json")
+
+# **THE INSTALL REPOSITORY, UNDER THE BUILDER ROOT RATHER THAN A DEPLOY AREA,
+# STILL EXISTS — points 1, 3 and 4 of decision 0098 stand — BUT NO LONGER
+# HOLDS THE REGISTRY.** `ensure_install_repo` below still creates it, since an
+# install's other non-secret configuration moves into it item by item. All
+# that is left of its part in the registry is `INSTALL_REGISTRY`, read above
+# as a legacy source and never written again.
+#
+# **OWNERSHIP NEEDS NOTHING EXTRA HERE.** On the two- and three-account
+# shapes `stand-up-backend` already runs this command's own "place" step as
+# the account whose root it is — `agents`, through `AS_AGENTS` — the same way
+# it runs every other write this file makes into that account's deploy areas.
+# A directory this process creates is owned by the account running it, so
+# `<root>/install` belongs to `agents` for exactly the reason its deploy
+# areas already do, with no `chown` to add.
+INSTALL_SUBDIR = Path("install")
+INSTALL_REGISTRY = Path("projects.json")
+
+# **WHERE THE SEED IS STAGED FOR THE LIBRARY, NEVER UNDER THE BUILDER ROOT.**
+# `{state}` is the account's own writable state and logs directory
+# (`tools/jobs/placeholders.py`'s `Machine`), the same one `jobs/library.toml`
+# names as `{state}/library` — this has to agree with that job declaration's
+# own path, because `load_project_registry.py` runs from there and is given no
+# other way to find what this file staged.
+LIBRARY_STATE_SUBDIR = Path("library")
+REGISTRY_STAGING = Path("projects-registry-seed.json")
 
 
 def _registry_text(top: Path, rel: Path) -> str | None:
@@ -859,11 +1100,12 @@ def builder_root(given: Path | None, home: Path,
     return None
 
 
-def place_registry(staging: Path, area: Path,
-                   knowledge: Callable[[Path], str] | None = None,
-                   seed_registry: bool = False) -> str:
-    """Give a staged agent-platform tree its projects registry. Returns a note
-    for the install's report line.
+def choose_registry(staging: Path, area: Path, install_repo: Path | None,
+                    knowledge: Callable[[Path], str] | None = None,
+                    seed_registry: bool = False) -> tuple[str, str | None]:
+    """The projects registry text to stage for the Library. Returns a note
+    for the install's report line, and the text chosen (None when there is
+    none to give).
 
     `knowledge` is asked only when the seed is used, so an update, or an
     install from a tree carrying its own registry, never reads the remote. It
@@ -871,10 +1113,19 @@ def place_registry(staging: Path, area: Path,
 
     **`seed_registry` IS FOR AN ADOPTER INSTALLING FROM SOURCE**, which until Builder is
     public is every adopter. The source repository tracks Convivy's own
-    registry, so without it an adopter's registry names Convivy's crews and
-    none of theirs. With it the tree's registry is dropped from staging, and the
-    area gets what the published export would give it: the registry the
-    replaced area held, or else the seed."""
+    registry, so without it an adopter's choice would be Convivy's crews and
+    none of theirs. With it the tree's own registry is dropped from staging
+    first, so it is never the answer.
+
+    **NOTHING IS WRITTEN HERE.** This only decides what text the Library's
+    seed should carry. `area`'s own `config/projects.json`, when it has one,
+    is what an install running before #234 left there; `install_repo`'s own
+    `projects.json`, when it has one and `area` does not, is what an install
+    running under #234 (before this change) left there instead. Reading
+    either is how an adopter's registered crews reach the seed this stages,
+    rather than being replaced by it. `install_repo` is None when the Builder
+    root could not be resolved, in which case only `area`'s copy, the tree's
+    own, or the release seed can answer."""
     target = staging / REGISTRY
     dropped = False
     if seed_registry and (target.exists() or target.is_symlink()):
@@ -883,8 +1134,12 @@ def place_registry(staging: Path, area: Path,
         target.unlink()
         dropped = True
     if target.exists() or target.is_symlink():
-        return "registry from the tree"
+        return "registry from the tree", target.read_text(encoding="utf-8")
     kept = _registry_text(area, REGISTRY)
+    source = "the replaced area"
+    if kept is None and install_repo is not None:
+        kept = _registry_text(install_repo, INSTALL_REGISTRY)
+        source = "the install repository"
     seed = None if kept is not None else _registry_text(staging, REGISTRY_SEED)
     if seed is not None:
         if knowledge is None:
@@ -893,41 +1148,116 @@ def place_registry(staging: Path, area: Path,
         seed = seeded_registry(seed, knowledge(staging))
     text = kept if kept is not None else seed
     if text is not None:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        # CREATED WITH ITS MODE, the way `export_extra` writes a file, rather
-        # than written and then `chmod`ed: under a loose umask the two-step
-        # version leaves the registry the Library authorizes against briefly
-        # group- or world-writable. The `chmod` after only widens a mode the
-        # umask narrowed, so the result is 0644 whatever the old area held.
-        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-        try:
-            os.write(fd, text.encode("utf-8"))
-        finally:
-            os.close(fd)
-        os.chmod(target, 0o644)
         if kept is not None:
-            return ("registry kept from the replaced area, not the tree's"
-                    if dropped else "registry kept from the replaced area")
-        unusable = (area / REGISTRY).exists() or (area / REGISTRY).is_symlink()
-        note = ("registry seeded; the replaced area's registry was not a regular "
-                "JSON file inside the area and was not kept" if unusable
-                else "registry seeded")
-        return f"{note}, not the tree's" if dropped else note
+            return (f"registry kept from {source}, not the tree's" if dropped
+                     else f"registry kept from {source}"), text
+        unusable = (
+            (area / REGISTRY).exists() or (area / REGISTRY).is_symlink()
+            or (install_repo is not None
+                and ((install_repo / INSTALL_REGISTRY).exists()
+                     or (install_repo / INSTALL_REGISTRY).is_symlink())))
+        note = ("registry seeded; neither the replaced area's nor the install "
+                "repository's registry was a regular JSON file and was not kept"
+                if unusable else "registry seeded")
+        return (f"{note}, not the tree's" if dropped else note), text
     # A release from before the seed existed. Nothing is invented here: with no
     # registry, agent-platform's own reads fail closed and the Library's
     # validation is off, and the line below says so.
     return (f"NO REGISTRY: neither {REGISTRY} nor {REGISTRY_SEED} is in this "
-            f"release and the replaced area held none")
+            f"release and the replaced area held none"), None
 
 
-def build_venv(tree: Path, python: str, venv: Path | None = None,
+def ensure_install_repo(root: Path) -> Path:
+    """`<root>/install` as a git repository with no remote, created when
+    absent. An existing one, whatever its history, is left exactly alone.
+
+    **CREATED WITH AN EMPTY TEMPLATE, AND HOOKS ARE PINNED OFF IN ITS OWN
+    CONFIG.** `git init` copies a hook from whatever directory `GIT_TEMPLATE_DIR`
+    or `init.templateDir` names, and an ambient `core.hooksPath` would fire on
+    any future commit this repository's other configuration items make into
+    it — the same two doors `bin/install-payload` closes on the knowledge
+    repository, for the commits it runs there. The first is closed by naming
+    an empty directory as the template; the second by writing the pin into
+    this repository's own config, which outranks an ambient one.
+    """
+    repo = root / INSTALL_SUBDIR
+    if os.path.islink(repo):
+        raise Refused(f"{repo} is a symlink; refusing to treat a link as the "
+                      f"install repository")
+    if (repo / ".git").exists():
+        return repo
+    repo.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as empty_template:
+        run("git", "init", "--quiet", f"--template={empty_template}", str(repo))
+    run("git", "-C", str(repo), "config", "core.hooksPath", os.devnull)
+    # `git init -b` needs git 2.28; `symbolic-ref` has always set the same thing.
+    run("git", "-C", str(repo), "symbolic-ref", "HEAD", "refs/heads/main")
+    return repo
+
+
+def stage_registry_for_library(target: Path, text: str) -> bool:
+    """Write the Library's registry seed to `target` when it is absent.
+    Returns whether it wrote one.
+
+    **NEVER OVERWRITES.** Once this file exists, `load_project_registry.py`
+    may already have loaded it into the Chart House's table, and this file
+    has no way to tell whether that has happened; overwriting it could hand
+    the loader a second, different document on a retry.
+
+    **MODE 0600, NOT THE 0644 A COMMITTED FILE GETS ELSEWHERE IN THIS
+    COMMAND.** This is not a release artifact sitting in a repository
+    anybody with access to the machine might read; it is a staging file for
+    the account's own Library to consume once, so it is private to the
+    account that wrote it from the moment it exists.
+    """
+    if target.exists() or target.is_symlink():
+        return False
+    if target.parent.is_symlink():
+        raise Refused(f"refusing to stage the registry: {target.parent} is a symlink")
+    # **A FAILURE HERE IS A REFUSAL, NOT A STACK TRACE**, the same promise
+    # every other write in this file makes. `{state}/library` may not exist
+    # yet — `install-jobs` creates it later, from this job's own
+    # `directories` list — and this account may lack permission on a
+    # directory it does not own, so this is the one write in this file that
+    # creates its own parent, and the one most likely to meet a filesystem it
+    # cannot write to.
+    #
+    # **AT 0700, BECAUSE THIS RUNS BEFORE `install-jobs`.** `install-jobs` would
+    # make this directory at 700 but finds it already here, and the Library's
+    # `serve.sh` refuses to start on a database directory other accounts can
+    # reach. At the default mode a fresh install left the Library down.
+    try:
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # CREATED WITH ITS MODE, as `export_extra` already does, for the same
+        # reason: a write followed by `chmod` is briefly more permissive under
+        # a loose umask.
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, text.encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.chmod(target, 0o600)
+    except OSError as exc:
+        raise Refused(f"could not stage the registry at {target}: "
+                      f"{exc.strerror or exc}") from None
+    return True
+
+
+def build_venv(tree: Path, python: str, name: str, venv: Path | None = None,
                program: Path | None = None) -> str | None:
-    """A venv from this tree's requirements, at `venv` or inside the tree.
+    """A venv from this tree's hash-locked lockfile, at `venv` or inside the tree.
 
     Returns a one-line description, or None when the repository declares no
     production requirements. **Rule 4 is why this is not optional**: a deploy
     that pins code and leaves the interpreter in a development checkout has
     pinned half of what decides which code runs.
+
+    **`name` SAYS WHICH LOCKFILE, THROUGH `lockfile_for`, AND NOTHING ELSE
+    DECIDES IT.** A tree that carries `requirements.txt` but not that lockfile
+    is refused rather than installed from `requirements.txt` directly — a pin
+    on the code with no pin on what `pip` resolves for it is the rule 4 gap
+    this change closes, and reopening it one call site at a time is how it
+    would come back.
 
     **`venv` MAY SIT OUTSIDE `tree`, AND THEN THE EXISTING ONE IS PARKED RATHER
     THAN DELETED.** A venv is not relocatable, so a component's venv has to be
@@ -979,6 +1309,15 @@ def build_venv(tree: Path, python: str, venv: Path | None = None,
     requirements = tree / REQUIREMENTS
     if not requirements.is_file():
         return None
+    lockfile_name = lockfile_for(name)
+    lockfile = tree / lockfile_name
+    if not lockfile.is_file():
+        raise Refused(
+            f"{name} has {REQUIREMENTS} but no {lockfile_name} at {tree}. "
+            f"This installs with `pip install --require-hashes`, never "
+            f"directly from {REQUIREMENTS}, so add the lockfile before this "
+            f"can build {name}'s venv."
+        )
     out_of_tree = venv is not None
     parked_venv: Path | None = None
     if venv is None:
@@ -1030,7 +1369,7 @@ def build_venv(tree: Path, python: str, venv: Path | None = None,
             os.rename(venv, parked)
             parked_venv = parked
     try:
-        _fill_venv(tree, venv, python, program, requirements, out_of_tree)
+        _fill_venv(tree, venv, python, program, lockfile, out_of_tree)
     except BaseException:
         # PUT BACK WHAT WAS WORKING. `install_one` rolls the LIB tree back on
         # the same exception; without this half the machine ends up with the
@@ -1046,12 +1385,12 @@ def build_venv(tree: Path, python: str, venv: Path | None = None,
         # must not turn that into a nonzero exit.
         remove_ours(parked_venv, ignore_errors=True)
     frozen = run(str(venv / "bin" / "pip"), "freeze")
-    return f"{len(frozen.splitlines())} package(s) from {REQUIREMENTS}"
+    return f"{len(frozen.splitlines())} package(s) from {lockfile_name}"
 
 
 def _fill_venv(tree: Path, venv: Path, python: str, program: Path | None,
-               requirements: Path, out_of_tree: bool) -> None:
-    """Create the venv at `venv` and install `requirements` into it.
+               lockfile: Path, out_of_tree: bool) -> None:
+    """Create the venv at `venv` and install `lockfile` into it, hash-checked.
 
     Split out so that everything between clearing the path and a working venv
     sits under one `try` in the caller, with nothing before it that a restore
@@ -1080,7 +1419,7 @@ def _fill_venv(tree: Path, venv: Path, python: str, program: Path | None,
             encoding="utf-8",
         )
     run(python, "-m", "venv", str(venv))
-    print(f"{PROG}:   building the venv, which installs {REQUIREMENTS} and can "
+    print(f"{PROG}:   building the venv, which installs {lockfile.name} and can "
           f"take a while — do not start a second run")
     pip = venv / "bin" / "pip"
     if not pip.is_file():
@@ -1090,19 +1429,47 @@ def _fill_venv(tree: Path, venv: Path, python: str, program: Path | None,
     # the operator happened to be in — putting an editable link to a
     # development checkout into the deploy venv, which is precisely the
     # rule 4 failure this whole file exists to prevent.
+    #
+    # **`--require-hashes`, AND NO OTHER `pip` CALL PRECEDES IT.** Every
+    # package this installs, `pip` included by `ensurepip` inside `python -m
+    # venv`, has to come from something this venv already trusted before the
+    # install ran — never a `pip install --upgrade pip` or a setuptools/wheel
+    # bootstrap run unpinned ahead of the lockfile, which would be exactly the
+    # unhashed install this whole change exists to remove, one step earlier.
+    #
+    # **`--only-binary :all:` AND `--no-build-isolation` BESIDE IT**, because
+    # `--require-hashes` checks only what the lockfile names. When a wheel's
+    # hash fails, pip falls back to a pinned sdist, and building that sdist in
+    # an isolated environment installs setuptools from the index unchecked; a
+    # run against the Library's lock did exactly that. `--only-binary` closes
+    # the fallback. A package that ships no wheel is exempted in its own
+    # lockfile with a `--no-binary <name>` line (convivy-orient's `http_ece`),
+    # and `--no-build-isolation` then builds it with the venv's own setuptools,
+    # which a Python 3.11 venv carries and a 3.12 one does not; on 3.12 that
+    # build fails here rather than reaching the index.
+    #
+    # **`--no-deps`, BECAUSE A LOCKFILE ALREADY NAMES EVERY PACKAGE AND THE
+    # RESOLVER CAN ONLY MISREAD IT.** The pip 23.0.1 that Debian 12's Python 3.11
+    # puts in a venv refused the gateway's lock outright: `fastapi-sso` asks for
+    # `pydantic[email]>=1.8.0`, the lock pins `pydantic` and `email-validator`
+    # separately, and that pip's hash mode treats the extra as an unpinned
+    # requirement. Skipping resolution also skips what caught a package missing
+    # from the lockfile, so `pip check` below takes that job.
     run(str(pip), "install", "--quiet", "--disable-pip-version-check",
-        "-r", str(requirements), cwd=tree)
+        "--require-hashes", "--no-deps", "--only-binary", ":all:",
+        "--no-build-isolation", "-r", str(lockfile), cwd=tree)
+    run(str(pip), "check")
     # **WHAT THE LAUNCHER EXECS, ASKED OF THE FILESYSTEM.** `pip install`
-    # exiting 0 says the requirements resolved, which is a different claim from
+    # exiting 0 says the lockfile resolved, which is a different claim from
     # "the program is there under the name that will be run for it". Without
     # this the install reports success and the daemon fails at exec, and launchd
     # reports that exactly the way it reports a job that ran and did nothing.
     if program is not None and not program.is_file():
         raise Refused(
-            f"{REQUIREMENTS} installed, but its launcher runs {program}, which "
-            f"is not there. The venv was built and the requirements resolved, "
-            f"so what is wrong is the name rather than the install: check the "
-            f"console script the requirements provide."
+            f"{lockfile.name} installed, but its launcher runs {program}, which "
+            f"is not there. The venv was built and the lockfile resolved, so "
+            f"what is wrong is the name rather than the install: check the "
+            f"console script the lockfile provides."
         )
 
 
@@ -1365,7 +1732,11 @@ def install_one(name: str, source: Path, area: Path, ref: str,
                 report_into: list[str] | None = None,
                 knowledge: Callable[[Path], str] | None = None,
                 seed_registry: bool = False,
-                python_named: bool = False) -> tuple[str, str]:
+                python_named: bool = False,
+                expect_commit: str | None = None,
+                root_for: Callable[[Path], Path | None] | None = None,
+                state_root: Path | None = None,
+                from_tree: bool = False) -> tuple[str, str]:
     """Place one repository, or one component. Returns (state, detail).
 
     `report_into`, when given, receives one line per process still running the
@@ -1376,8 +1747,33 @@ def install_one(name: str, source: Path, area: Path, ref: str,
     a repository, and `Component` says why each exists. Absent, this places a
     whole repository into `area` with its venv at `area/.venv`, which is what
     the three backend repositories get.
+
+    `expect_commit`, when given, is the commit `ref` must resolve to; any other
+    is refused here, before anything is touched. Everything below reads
+    `commit`, never `ref`, so this is the commit placed.
+
+    `root_for`, when given, is asked for the Builder root whenever this places
+    agent-platform's own repository rather than one of its components, since
+    that root is what resolves the install repository `ensure_install_repo`
+    still creates there, and the legacy copy of the registry it may hold —
+    the same `staging` argument `knowledge` is given, and for the same reason:
+    a first install has nothing linked yet, so the root has to come from the
+    staged tree's own `builder-root` rather than this account's.
+
+    `state_root`, when given, is where the Library's registry seed is staged,
+    at `state_root/library/projects-registry-seed.json`. `None` only when the
+    caller has no state directory to offer, in which case the registry is
+    never staged and the report says so.
+
+    `from_tree`, when true, means `source` is a root-owned extracted tree with
+    no `.git`: the commit comes from `commit_from_tree` instead of
+    `commit_of`, and `export_from_tree` tars `source` itself instead of
+    running `git archive` against it. `ref` is still read below — it is the
+    tree's own directory name here, so the stamp names it the same way an
+    ordinary placement's resolved ref is named.
     """
-    commit = commit_of(source, ref)
+    commit = commit_from_tree(source) if from_tree else commit_of(source, ref)
+    refuse_unexpected(source, ref, commit, expect_commit)
     stamp = read_stamp(area)
 
     # **WHAT "the venv is there" MEANS, ASKED ONCE.** For a component it is the
@@ -1539,17 +1935,63 @@ def install_one(name: str, source: Path, area: Path, ref: str,
     )
     try:
         # MINUS THE MARKER, which is this command's own file rather than
-        # deployed content. `export_tree` counts what it extracted, so the
-        # subtraction that used to be implicit in the ordering is now explicit;
-        # without it the stamp would report one file more than the ref carries.
-        files = export_tree(source, commit, staging, subtree)
+        # deployed content. `export_tree` and `export_from_tree` both count
+        # what they extracted, so the subtraction that used to be implicit in
+        # the ordering is now explicit; without it the stamp would report one
+        # file more than the ref carries.
+        files = (export_from_tree(source, staging) if from_tree
+                 else export_tree(source, commit, staging, subtree))
         # **INSIDE THE SAME `try`, SO A REFUSAL HERE CLEANS UP THE STAGING
         # DIRECTORY TOO.** Placed after it and the collision refusal would leave
         # a marked, half-built staging tree behind on every run.
         files += export_extra(source, commit, extra, staging)
-        registry = (place_registry(staging, area, knowledge,
-                                   seed_registry=seed_registry)
-                    if name == REGISTRY_REPOSITORY and subtree is None else None)
+        registry = None
+        if name == REGISTRY_REPOSITORY and subtree is None:
+            # **ALREADY STAGED IS CHECKED BEFORE ANYTHING ELSE, INCLUDING THE
+            # BUILDER ROOT.** Once the Library's seed is staged,
+            # `choose_registry` is never called again: `load_project_registry.py`
+            # may already have loaded the file into the Chart House, and
+            # choosing a fresh document would ask `knowledge` to resolve the
+            # knowledge checkout's remote, and `root_for` to resolve the
+            # install repository, on every ordinary update for a result
+            # nothing would then use.
+            staged = (state_root / LIBRARY_STATE_SUBDIR / REGISTRY_STAGING
+                     if state_root is not None else None)
+            if staged is not None and (staged.exists() or staged.is_symlink()):
+                registry = "registry already staged for the Library"
+            elif staged is None:
+                registry = "the registry was not staged: no state directory was given"
+            else:
+                # **AN UNKNOWN ROOT IS REPORTED, NOT REFUSED.** A fresh install
+                # often has nothing linked yet when this runs — `builder_root`'s
+                # docstring says why — and refusing here would stop an update
+                # that worked before, and every repository queued after this
+                # one, over a registry this run has nowhere to place. The next
+                # run with a root stages it.
+                install_root = root_for(staging) if root_for is not None else None
+                if install_root is None:
+                    registry = ("the registry was not staged for the Library: "
+                                "the Builder root is unknown (pass --root)")
+                else:
+                    note, text = choose_registry(
+                        staging, area, install_root / INSTALL_SUBDIR, knowledge,
+                        seed_registry=seed_registry)
+                    if text is None:
+                        registry = note
+                    else:
+                        # The symlink refusal stays a refusal: it is raised
+                        # by `ensure_install_repo`, outside the `try` below.
+                        # Only the staging write reports and goes on.
+                        # `ensure_install_repo` still runs here — decision
+                        # 0098's point 1 holds whether or not the registry has
+                        # anything left for the install repository.
+                        ensure_install_repo(install_root)
+                        try:
+                            stage_registry_for_library(staged, text)
+                        except Refused as exc:
+                            registry = f"{note}; the registry was not staged for the Library: {exc}"
+                        else:
+                            registry = f"{note}; staged the registry for the Library"
     except BaseException:
         # A partial tree that looks finished is what gets served by mistake, and
         # the deploy area already in place stays untouched and keeps working.
@@ -1569,7 +2011,7 @@ def install_one(name: str, source: Path, area: Path, ref: str,
     swapped_at = time.time()
     parked = swap(staging, area, previous, advice)
     try:
-        packages = build_venv(area, python, venv, program)
+        packages = build_venv(area, python, name, venv, program)
         # THE STAMP IS WRITTEN LAST. It is the answer to "what is this serving",
         # so it must not exist until the thing it describes is complete: a stamp
         # beside a half-built venv reports a working install.
@@ -1638,11 +2080,22 @@ class Placement:
     venv: Path | None = None
     program: Path | None = None
     extra: tuple[str, ...] = ()
+    # Whether `source` is a root-owned extracted tree named by `--from-tree`,
+    # rather than a git checkout. Only ever true for a bare repository: a
+    # component's source is always derived from its repository's checkout.
+    from_tree: bool = False
 
     def venv_present(self) -> bool:
         if self.program is not None:
             return self.program.is_file()
         return (self.venv or self.area / ".venv").is_dir()
+
+    def repo_name(self) -> str:
+        """The REPOSITORIES key this placement answers to, for `--commit`,
+        `--expect-commit` and `--release`: `source.name` ordinarily, since
+        that is the checkout's own directory name, but `--from-tree`'s source
+        is named `<repo>@<sha>` rather than the repository's own name."""
+        return self.name if self.from_tree else self.source.name
 
 
 def status(placements: tuple[Placement, ...]) -> int:
@@ -1742,11 +2195,36 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--deploy", type=Path, default=None,
                         help="deploy root (default: ~/.local/deploy, or "
                              "$BUILDER_DEPLOY_ROOT)")
-    parser.add_argument("--ref", default=None,
+    ref_group = parser.add_mutually_exclusive_group()
+    ref_group.add_argument("--ref", default=None,
                         help="ref to install from (default: origin/stable when "
                              "a repository's checkout carries that branch, "
                              "origin/main otherwise). Never the checkout's HEAD "
                              "unless you name it.")
+    ref_group.add_argument("--release", default=None, metavar="vX.Y.Z",
+                        help="the release tag to install library, agent-platform "
+                             "and convivy-orient at (write-better tracks its own "
+                             "main and is never moved by this). Refused, naming "
+                             "the repository, when a clone lacks the tag or has "
+                             "uncommitted changes to tracked files.")
+    ref_group.add_argument("--from-tree", action="append", default=None, metavar="REPO=PATH",
+                        help="place REPO from the root-owned extracted tree at PATH "
+                             "instead of a git checkout; repeatable. PATH's own "
+                             "directory name must end `@<40-hex commit>`, which is "
+                             "read as the commit placed — no `.git`, ref or clean "
+                             "tree is required or consulted. Refused combined with "
+                             "--from, --ref or --release.")
+    parser.add_argument("--expect-commit", action="append", default=None, metavar="REPO=SHA",
+                        help="the full commit REPO's ref must resolve to; repeatable. "
+                             "Refused, before any deploy area changes, when the ref "
+                             "names another commit")
+    parser.add_argument("--commit", action="append", default=None, metavar="REPO=SHA",
+                        help="place REPO at exactly this commit, instead of resolving "
+                             "--ref, --release or the default ref; repeatable. Refused, "
+                             "naming REPO, when the commit is absent from its clone. "
+                             "For a repository with no release tag to name, such as "
+                             "write-better's own main, when a caller needs to place a "
+                             "commit its ref no longer names.")
     parser.add_argument("--only", action="append", choices=PLACEABLE,
                         help="place only this repository or component; repeatable")
     parser.add_argument("--root", type=Path, default=None,
@@ -1771,6 +2249,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--home", type=Path, default=None,
                         help="home directory a component's fixed paths hang off "
                              "(default: this account's). For tests.")
+    parser.add_argument("--state", type=Path, default=None,
+                        help="writable state and logs, where the projects registry "
+                             "is staged for the Library to load (default: "
+                             "{home}/.local/state, the same default "
+                             "tools/jobs/placeholders.py's Machine gives {state})")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--status", action="store_true",
                       help="what each deploy area is serving")
@@ -1779,6 +2262,28 @@ def main(argv: list[str]) -> int:
     mode.add_argument("--check", action="store_true",
                       help="report only; exit 1 if anything is missing or stale, 2 if a deploy path is refused")
     args = parser.parse_args(argv)
+
+    release = release_tag(args.release) if args.release is not None else None
+    expected = expected_commits(args.expect_commit)
+    pinned = expected_commits(args.commit, flag="--commit")
+    trees = from_tree_paths(args.from_tree)
+    # `ref_group` already refuses --from-tree combined with --ref or
+    # --release. --from is not in that group — it combines with --ref, since
+    # --from names where a checkout is and --ref what to resolve in it — so
+    # this is the one conflict argparse cannot already catch.
+    if trees and args.source is not None:
+        raise Refused(
+            f"--from-tree names {', '.join(sorted(trees))}; refusing to "
+            f"combine it with --from, which already names where every "
+            f"checkout under this run is read from."
+        )
+    pinned_trees = sorted(set(trees) & set(pinned))
+    if pinned_trees:
+        raise Refused(
+            f"--from-tree names {', '.join(pinned_trees)}, and so does --commit; "
+            f"a tree's own directory name says which commit it is. Use "
+            f"--expect-commit to check it."
+        )
 
     # `Path("")` IS `PosixPath('.')`, WHICH IS TRUTHY. Writing this as
     # `Path(os.environ.get(NAME, "")) or default` silently deploys into the
@@ -1795,6 +2300,10 @@ def main(argv: list[str]) -> int:
     if not home.is_absolute():
         raise Refused(f"--home must be an absolute path: {home}")
 
+    state_root = (args.state or home / ".local" / "state").expanduser()
+    if not state_root.is_absolute():
+        raise Refused(f"--state must be an absolute path: {state_root}")
+
     names = tuple(args.only) if args.only else PLACEABLE
 
     # THE SIBLINGS LIVE BESIDE THE PRIMARY CHECKOUT, so this is its parent
@@ -1806,14 +2315,31 @@ def main(argv: list[str]) -> int:
     # **RESOLVED BEFORE `--status` RETURNS, BECAUSE A COMPONENT'S SOURCE IS
     # ANOTHER NAME ENTIRELY**: the gateway comes out of `agent-platform`, so a
     # placement cannot be built from its own name the way a repository's can.
-    source_root = (args.source or primary_worktree().parent).expanduser().resolve()
+    #
+    # **SKIPPED ENTIRELY WHEN EVERY NAME PLACED THIS RUN COMES FROM
+    # `--from-tree`.** `primary_worktree()` asks git for `--git-common-dir`,
+    # which a root-owned tree with no `.git` anywhere above it cannot answer —
+    # and a run with nothing left to resolve from a checkout has no reason to
+    # ask. A component always needs it, since `--from-tree` only ever names a
+    # bare repository.
+    needs_source_root = any(name not in trees for name in names)
+    source_root = ((args.source or primary_worktree().parent).expanduser().resolve()
+                   if needs_source_root else None)
 
     placements = []
     for name in names:
         component = COMPONENTS_BY_NAME.get(name)
         if component is None:
-            placements.append(Placement(name=name, source=source_root / name,
-                                        area=root / name))
+            tree = trees.get(name)
+            if tree is not None:
+                # `.expanduser()` ONLY, NOT `.resolve()`: resolving would
+                # follow a symlink at `tree` itself, and the ownership check
+                # below has to see the path AS GIVEN to refuse exactly that.
+                placements.append(Placement(name=name, source=tree.expanduser(),
+                                            area=root / name, from_tree=True))
+            else:
+                placements.append(Placement(name=name, source=source_root / name,
+                                            area=root / name))
         else:
             placements.append(Placement(
                 name=name,
@@ -1833,19 +2359,73 @@ def main(argv: list[str]) -> int:
     # **THE CHECKOUTS A COMPONENT NEEDS, NOT THE NAMES ASKED FOR.** Keyed on the
     # requested names, `--only llm-gateway` looked for a checkout called
     # `llm-gateway` and refused, naming a repository that has never existed.
+    #
+    # **A `--from-tree` SOURCE IS NEITHER A `.git` CHECKOUT NOR CHECKED AGAINST
+    # THIS ACCOUNT'S OWNERSHIP**: it has no `.git` by design, and it is
+    # trusted only when ROOT owns it, checked separately below with
+    # `owner=0` — this account running the install is never the owner a
+    # root-owned tree is trusted by.
     wanted = {placement.source for placement in placements}
-    missing = sorted(p.name for p in wanted if not (p / ".git").exists())
+    tree_wanted = {placement.source for placement in placements if placement.from_tree}
+    ordinary_wanted = wanted - tree_wanted
+
+    missing = sorted(p.name for p in ordinary_wanted if not (p / ".git").exists())
     if missing:
         raise Refused(
             f"no checkout for {', '.join(missing)} under {source_root}. "
             f"Name the directory holding them with --from."
         )
 
+    if ordinary_wanted:
+        problem = source_problem([source_root, *sorted(ordinary_wanted)])
+        if problem:
+            raise Refused(problem)
+
+    if tree_wanted:
+        problem = source_problem(sorted(tree_wanted), owner=0)
+        if problem:
+            raise Refused(problem)
+
+    def ref_for(placement: Placement) -> str:
+        # **A TREE NAMES ITS OWN COMMIT; THERE IS NO REF TO RESOLVE.** The
+        # directory name stands in for a ref everywhere below, including the
+        # stamp this eventually becomes `install_one`'s `ref` argument for.
+        if placement.from_tree:
+            return placement.source.name
+        # **CHECKED FIRST, AHEAD OF --release AND --ref.** `--commit` names the
+        # exact commit a caller wants placed, for a repository whose ref has
+        # moved past it since that commit was recorded — write-better's own
+        # main is the one case this exists for. `commit_of` resolves it the
+        # same way it resolves any other ref, and refuses, naming the
+        # repository, when the clone lacks it.
+        given = pinned.get(placement.source.name)
+        if given is not None:
+            return given
+        if release is not None and placement.source.name in TAGGED_REPOSITORIES:
+            return f"refs/tags/{release}"
+        return args.ref if args.ref is not None else default_ref_for(placement.source)
+
+    def commit_for(placement: Placement, ref: str) -> str:
+        return (commit_from_tree(placement.source) if placement.from_tree
+                else commit_of(placement.source, ref))
+
+    # **EVERY EXPECTED COMMIT IS CHECKED BEFORE THE FIRST AREA IS PLACED**, so a
+    # moved tag in convivy-orient refuses before library has been replaced.
+    # `install_one` checks its own resolution again, which closes the window
+    # between this pass and the placement.
+    for placement in placements:
+        want = expected.get(placement.repo_name())
+        if want is not None:
+            ref = ref_for(placement)
+            refuse_unexpected(placement.source, ref, commit_for(placement, ref), want)
+
     results = []
     still_running: list[str] = []
     for placement in placements:
         report: list[str] = []
-        ref = args.ref if args.ref is not None else default_ref_for(placement.source)
+        if release is not None and placement.source.name in TAGGED_REPOSITORIES:
+            clean_clone_or_refuse(placement.source, release)
+        ref = ref_for(placement)
         state, detail = install_one(
             placement.name, placement.source, placement.area, ref,
             args.python or sys.executable, args.dry_run or args.check,
@@ -1855,6 +2435,10 @@ def main(argv: list[str]) -> int:
             knowledge=lambda staged: knowledge_repo_name(builder_root(args.root, home, staged)),
             seed_registry=args.seed_registry,
             python_named=args.python is not None,
+            expect_commit=expected.get(placement.repo_name()),
+            root_for=lambda staged: builder_root(args.root, home, staged),
+            state_root=state_root,
+            from_tree=placement.from_tree,
         )
         results.append((placement.name, state, detail))
         print(f"{PROG}: {placement.name:<16} {state} — {detail}")

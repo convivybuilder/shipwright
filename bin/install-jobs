@@ -60,6 +60,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -256,7 +257,7 @@ def as_invoker(jobs: list[declaration.Job]) -> list[declaration.Job]:
     """Each system-scope job that names an account, as a user-scope job of the account running this.
 
     **THE SINGLE-ACCOUNT SHAPE HAS NO SECOND ACCOUNT, SO NOTHING RUNS AS `agents`.** The declarations name
-    `agents` at system scope for the two-account shape. Dropping the account and the scope gives the
+    `agents` at system scope for the three-account shape. Dropping the account and the scope gives the
     user-scope jobs `main` renders: `{home}`, `{state}` and the log paths resolve against the operator, and
     no log moves under `--log-dir`. A system-scope job that names no account keeps its scope, so a
     non-root run still refuses it.
@@ -271,7 +272,7 @@ def as_invoker(jobs: list[declaration.Job]) -> list[declaration.Job]:
 def leave_out_as_root(jobs: list[declaration.Job]) -> list[declaration.Job]:
     """The jobs a run as root installs, with each user-scope job that names no account left out and named.
 
-    **A USER-SCOPE JOB THAT NAMES NO ACCOUNT IS WRITTEN INTO WHICHEVER HOME THE RUN WAS GIVEN.** The two-account
+    **A USER-SCOPE JOB THAT NAMES NO ACCOUNT IS WRITTEN INTO WHICHEVER HOME THE RUN WAS GIVEN.** The three-account
     shape runs this with `--home` set to `agents`' home, so such a job would land in that home's LaunchAgents or
     systemd directory. The agents account has no desktop login, and its Claude login is a file, so the job has
     nothing to do there. It is left out and named, and nothing is written for it. `--single-account` keeps it,
@@ -383,7 +384,7 @@ def systemd_state(output: str) -> bool | None:
     return state == "active"
 
 
-def is_active(job: declaration.Job, platform: str) -> bool | None:
+def is_active(job: declaration.Job, platform: str, run=subprocess.run) -> bool | None:
     """Whether the supervisor is currently running this job.
 
     None means the question could not be asked — no supervisor command on this
@@ -412,7 +413,7 @@ def is_active(job: declaration.Job, platform: str) -> bool | None:
     if platform == "macos":
         if not shutil.which("launchctl"):
             return None
-        result = subprocess.run(
+        result = run(
             ["launchctl", "list"], capture_output=True, text=True, check=False
         )
         if result.returncode != 0:
@@ -421,13 +422,20 @@ def is_active(job: declaration.Job, platform: str) -> bool | None:
     if not shutil.which("systemctl"):
         return None
     scope = [] if job.scope == "system" else ["--user"]
-    result = subprocess.run(
+    result = run(
         ["systemctl", *scope, "is-active", systemd_unit(job)],
         capture_output=True,
         text=True,
         check=False,
     )
     return systemd_state(result.stdout)
+
+
+def launchd_domain(job: declaration.Job) -> str:
+    """The launchd domain this job's label lives in: this account's GUI
+    session for a user-scope job, or the system domain for one that is
+    system-scope."""
+    return f"gui/{os.getuid()}" if job.scope == "user" else "system"
 
 
 def activate(
@@ -442,7 +450,7 @@ def activate(
         # --system-dir from somewhere less trusted and feeding it into a
         # root-privileged shell. Quoting a value that never needed it renders
         # identically, so the printed text still equals the executed text.
-        domain = f"gui/{os.getuid()}" if job.scope == "user" else "system"
+        domain = launchd_domain(job)
         path = next(iter(destinations(job, platform, home, system_dir)))
         target = shlex.quote(f"{domain}/{job.label}")
         return [
@@ -481,6 +489,174 @@ def reload(
         f"systemctl {scope}daemon-reload",
         f"systemctl {scope}try-restart {unit}",
     ]
+
+
+def loaded_launchd_path(target: str, run=subprocess.run) -> str | None:
+    """The plist path launchd currently has loaded for `target`
+    (`<domain>/<label>`), or None when nothing is loaded for it.
+
+    `launchctl print <target>` exits non-zero, or answers with no `path =`
+    line, when the domain has nothing loaded for the label: both mean there
+    is nothing loaded to compare the file this would stop against, so the
+    caller leaves the job alone rather than guessing.
+    """
+    result = run(["launchctl", "print", target], capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        return None
+    for line in (result.stdout or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("path = "):
+            return stripped[len("path = "):].strip()
+    return None
+
+
+def loaded_systemd_fragment(unit: str, scope: list[str], run=subprocess.run) -> str | None:
+    """The unit file path systemd currently has loaded for `unit`, in `scope`
+    (`["--user"]` or `[]`), or None when nothing is loaded for it.
+
+    `systemctl show -p FragmentPath` answers a unit systemd has never heard
+    of with exit 0 and an empty `FragmentPath=`, read here the same as a
+    non-zero exit: both mean nothing is loaded to compare against.
+    """
+    result = run(["systemctl", *scope, "show", "-p", "FragmentPath", unit],
+                 capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        return None
+    for line in (result.stdout or "").splitlines():
+        if line.startswith("FragmentPath="):
+            value = line[len("FragmentPath="):].strip()
+            return value or None
+    return None
+
+
+def stop_plan(
+    job: declaration.Job, platform: str, home: str, system_dir: str | None,
+    run=subprocess.run,
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """What a stop of this job would act on right now, found with `launchctl
+    print` or `systemctl show -p FragmentPath` alone — both read-only, never
+    `bootout` or `disable`, so this is safe to run for a preview as well as
+    for the real stop.
+
+    **THE SUPERVISOR IS A MACHINE-WIDE SINGLETON; NEITHER `--home` NOR
+    `--system-dir` SCOPES IT.** `launchctl bootout` and `systemctl disable
+    --now` both act against the real, running account's service manager, by
+    label or unit name alone, whatever those options say — a review run of
+    `bin/uninstall-builder` against a throwaway `--home` had it boot out a
+    dozen of the operator's own real launchd jobs, because every job here
+    shares its label with whatever real job happens to be running under that
+    name. So before touching anything, this reads what the supervisor
+    currently has loaded for the label (macOS) or each unit (Linux) and
+    compares it, resolved with symlinks followed, against the file this
+    install renders for the same job.
+
+    Returns `(targets, left)`. `targets` names what IS loaded from the file
+    this install renders — the one launchd target on macOS, or each matching
+    systemd unit on Linux — empty when nothing loaded matches. `left` carries
+    a `(name, reason)` pair, naming the path that IS loaded, for each label
+    or unit loaded from a different file. A label or unit nothing is loaded
+    for appears in neither list, the same as a supervisor that is not
+    running at all.
+    """
+    unit_paths = sorted(destinations(job, platform, home, system_dir).keys())
+    targets: list[str] = []
+    left: list[tuple[str, str]] = []
+    if platform == "macos":
+        if not shutil.which("launchctl"):
+            return targets, left
+        target = f"{launchd_domain(job)}/{job.label}"
+        loaded = loaded_launchd_path(target, run)
+        if loaded is None:
+            return targets, left
+        expected = unit_paths[0] if unit_paths else None
+        if expected is None or os.path.realpath(loaded) != os.path.realpath(expected):
+            left.append((job.label, f"launchd has {loaded} loaded for this label, not "
+                                    f"the file this install renders; left running"))
+            return targets, left
+        targets.append(target)
+        return targets, left
+    if not shutil.which("systemctl"):
+        return targets, left
+    scope = [] if job.scope == "system" else ["--user"]
+    for path in unit_paths:
+        unit = Path(path).name
+        fragment = loaded_systemd_fragment(unit, scope, run)
+        if fragment is None:
+            continue
+        if os.path.realpath(fragment) != os.path.realpath(path):
+            left.append((path, f"systemd has {fragment} loaded for {unit}, not the "
+                                f"file this install renders; left running"))
+            continue
+        targets.append(unit)
+    return targets, left
+
+
+def stop_job(
+    job: declaration.Job, platform: str, home: str, system_dir: str | None,
+    left: list[tuple[str, str]], run=subprocess.run,
+) -> bool:
+    """Ask the supervisor to stop this job, but only once `stop_plan` has
+    confirmed that what the supervisor has loaded for it IS the file this
+    install renders for it. A mismatch `stop_plan` finds is added to `left`
+    and left alone, with the path that IS loaded; a label or unit nothing is
+    loaded for is left alone without comment, the same as a supervisor that
+    is not running at all.
+
+    Returns whether a stop was actually issued.
+    """
+    targets, mismatches = stop_plan(job, platform, home, system_dir, run)
+    left.extend(mismatches)
+    if not targets:
+        return False
+    if platform == "macos":
+        run(["launchctl", "bootout", targets[0]], capture_output=True, check=False)
+        return True
+    scope = [] if job.scope == "system" else ["--user"]
+    for unit in targets:
+        run(["systemctl", *scope, "disable", "--now", unit], capture_output=True, check=False)
+    return True
+
+
+# launchd's and systemd's own defaults when a declaration sets no
+# stop-timeout-seconds, named here because a wait has to know what it is
+# waiting up to. jobs/library.toml's own comment states both, measured on a
+# current Mac and read from systemd's manual: ExitTimeOut defaults to 5
+# seconds, TimeoutStopSec to 90.
+DEFAULT_STOP_TIMEOUT_SECONDS = {"macos": 5, "linux": 90}
+
+
+def effective_stop_timeout(job: declaration.Job, platform: str) -> int:
+    """How long to wait for this job to exit after asking it to stop: the
+    declaration's own `stop-timeout-seconds`, or the supervisor's default
+    when it sets none."""
+    return (
+        job.stop_timeout_seconds
+        if job.stop_timeout_seconds is not None
+        else DEFAULT_STOP_TIMEOUT_SECONDS[platform]
+    )
+
+
+def wait_for_stop(
+    job: declaration.Job, platform: str, timeout_seconds: int, run=subprocess.run,
+    sleep=time.sleep, clock=time.monotonic,
+) -> bool:
+    """Poll until the supervisor reports this job not running, or
+    `timeout_seconds` elapses. Returns whether it stopped in time.
+
+    **POLLED, NEVER TRUSTED FROM THE STOP COMMAND'S OWN EXIT STATUS.** A
+    caller that moved on as soon as `launchctl bootout` or `systemctl
+    disable --now` returned would have no way to tell "gone" from "still
+    draining", and the Library's own prepare steps run against a database it
+    expects to be quiet.
+    """
+    deadline = clock() + timeout_seconds
+    while True:
+        if is_active(job, platform, run=run) is not True:
+            return True
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return False
+        sleep(min(1, remaining))
 
 
 def digest(data: bytes) -> str:
@@ -944,7 +1120,9 @@ def prepare_jobs(jobs, dry_run: bool, runner=subprocess.run, drop=drop_to_accoun
         except KeyError:
             raise Refused(
                 f"preparing {job.label} needs the account {account}, which this "
-                f"machine does not have. Run provision-accounts. Nothing was installed."
+                f"machine does not have. Run provision-accounts with the shape this "
+                f"install uses (--shape two or --shape three). "
+                f"Nothing was installed."
             ) from None
         who = f" as {account}" if account is not None else ""
         if job.directories and dry_run:
@@ -1003,12 +1181,21 @@ def prepare_jobs(jobs, dry_run: bool, runner=subprocess.run, drop=drop_to_accoun
                     f"Nothing was installed."
                 ) from exc
             if done.returncode != 0:
-                tail = (done.stderr or done.stdout).strip()[-600:]
+                # A step's refusal can be the operator's only instructions. Deck's
+                # mint prints its own line and then a replace command with three
+                # full paths, about 750 characters, and a 600-character tail cut
+                # away the line the command's explanation points at.
+                tail = (done.stderr or done.stdout).strip()[-4000:]
                 raise Refused(
                     f"preparing {job.label} failed at `{shown}`, exit "
                     f"{done.returncode}:\n{tail}\nNothing was installed."
                 )
             print(f"  prepared {job.label}{who}: {shown}")
+            # A STEP THAT EXITS 0 CAN STILL HAVE SOMETHING TO SAY. Only lines it
+            # marks, because alembic logs every migration to stderr.
+            for line in (done.stderr or "").splitlines():
+                if line.startswith("warning: "):
+                    print(f"  {line}")
 
 
 def make_private_directory(directory: Path, mode: int = 0o700, owner: int | None = None) -> list[Path]:
@@ -1132,6 +1319,27 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="also start the jobs marked enabled-by-default",
     )
+    parser.add_argument(
+        "--running",
+        action="store_true",
+        help="print the label of every job currently running, one per line, "
+        "and change nothing",
+    )
+    parser.add_argument(
+        "--stop",
+        nargs="*",
+        metavar="LABEL",
+        help="stop every job that is running or whose state is unknown (tmux-keeper "
+        "excluded), or exactly these jobs by label, waiting for each to exit up to "
+        "its declared stop timeout",
+    )
+    parser.add_argument(
+        "--start",
+        nargs="+",
+        metavar="LABEL",
+        help="start exactly these jobs by label, the same commands --activate would "
+        "run for them, and confirm each is running",
+    )
     args = parser.parse_args(argv)
     if args.check:
         # A CHECK CHANGES NOTHING, so it takes the dry-run path exactly. Only
@@ -1176,6 +1384,9 @@ def main(argv: list[str]) -> int:
         print(f"{PROG}: no declarations list {platform}; nothing to install")
         return 0
 
+    if args.running:
+        return report_running(jobs, platform)
+
     system_scope = [job for job in jobs if job.scope == "system"]
     if system_scope and os.geteuid() != 0 and not args.dry_run and not args.status:
         raise Refused(
@@ -1184,6 +1395,12 @@ def main(argv: list[str]) -> int:
             f"{', '.join(job.label for job in system_scope)}. Re-run as root, or "
             f"pass --dry-run to see what they would write."
         )
+
+    if args.stop is not None:
+        return stop_command(jobs, platform, machine.home, args)
+
+    if args.start is not None:
+        return start_command(jobs, platform, machine.home, args)
 
     record_file = record_path(machine)
     record = load_record(record_file)
@@ -1483,6 +1700,117 @@ def logs_of(jobs) -> list[str]:
             if log and log not in seen:
                 seen.append(log)
     return seen
+
+
+def report_running(jobs: list[declaration.Job], platform: str) -> int:
+    """Print the label of every job currently running, one per line, and
+    change nothing. This is what an updater's own record step reads to say
+    which jobs to start again once it has moved the install."""
+    for job in jobs:
+        if is_active(job, platform) is True:
+            print(job.label)
+    return 0
+
+
+def resolve_requested(
+    jobs: list[declaration.Job], labels: list[str], flag: str, past: str
+) -> list[declaration.Job]:
+    """`jobs` filtered to `labels`, in the order given.
+
+    Refuses naming a label this platform has no declaration for, rather than
+    silently skipping it.
+    """
+    by_label = {job.label: job for job in jobs}
+    unknown = [label for label in labels if label not in by_label]
+    if unknown:
+        raise Refused(
+            f"{flag} named {', '.join(unknown)}, which this platform has no "
+            f"declaration for. Known: {', '.join(sorted(by_label)) or '(none)'}. "
+            f"Nothing was {past}."
+        )
+    return [by_label[label] for label in labels]
+
+
+def stop_command(
+    jobs: list[declaration.Job], platform: str, home: str, args: argparse.Namespace
+) -> int:
+    """Stop exactly the named jobs, or (with no names) every job that is
+    running or whose state is unknown, tmux-keeper excluded either way: its
+    abandoned process group holds every crew session's tmux server, and
+    `install-jobs` only ever replaces its unit when its own declaration
+    changes, never as part of stopping everything else."""
+    if args.stop:
+        targets = resolve_requested(jobs, args.stop, "--stop", "stopped")
+    else:
+        targets = [
+            job for job in jobs
+            if job.name != "tmux-keeper" and is_active(job, platform) is not False
+        ]
+    if not targets:
+        print(f"{PROG}: nothing to stop")
+        return 0
+    left: list[tuple[str, str]] = []
+    failed: list[str] = []
+    for job in targets:
+        if args.dry_run:
+            stoppable, mismatches = stop_plan(job, platform, home, args.system_dir)
+            left.extend(mismatches)
+            if stoppable:
+                print(f"  would stop {job.label}")
+            elif not mismatches:
+                print(f"  {job.label}: not running")
+            continue
+        before = len(left)
+        stopped = stop_job(job, platform, home, args.system_dir, left)
+        if not stopped:
+            if len(left) == before:
+                print(f"  {job.label}: not running")
+            continue
+        timeout = effective_stop_timeout(job, platform)
+        if wait_for_stop(job, platform, timeout):
+            print(f"  stopped {job.label}")
+        else:
+            failed.append(job.label)
+            print(f"  {job.label} did not exit within its {timeout}-second stop timeout")
+    for label, reason in left:
+        print(f"  {label}: {reason}")
+    if args.dry_run:
+        return 0
+    return 1 if (failed or left) else 0
+
+
+def start_command(
+    jobs: list[declaration.Job], platform: str, home: str, args: argparse.Namespace
+) -> int:
+    """Start exactly the named jobs: the same commands `--activate` would
+    run for them, then confirm each is running."""
+    targets = resolve_requested(jobs, args.start, "--start", "started")
+    failed: list[str] = []
+    for job in targets:
+        commands = activate(job, platform, home, args.system_dir)
+        if args.dry_run:
+            print(f"  would start {job.label}:")
+            for line in commands:
+                print(f"    {line}")
+            continue
+        print(f"  starting {job.label}:")
+        ok = True
+        for line in commands:
+            print(f"    {line}")
+            result = subprocess.run(line, shell=True, check=False)
+            if result.returncode != 0:
+                ok = False
+                print(f"      FAILED with status {result.returncode}")
+        if not ok:
+            failed.append(job.label)
+            continue
+        if is_active(job, platform) is False:
+            failed.append(job.label)
+            print(f"  {job.label} was started and is not running")
+    if failed:
+        print(f"  {len(failed)} job(s) failed to start: {', '.join(failed)}")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

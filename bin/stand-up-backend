@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Stand Builder's backend up with one command, by calling the four that do it.
 
-    bin/stand-up-backend --shape single|two              provision, place, register, supervise
-    bin/stand-up-backend --shape single|two --activate   ...and start the jobs marked default-on
-    bin/stand-up-backend --shape single|two --status     what each step reports, changing nothing
-    bin/stand-up-backend --shape single|two --dry-run    say what would happen, change nothing
-    bin/stand-up-backend --shape single|two --check      report only; 1 work left, 2 something refused
+    bin/stand-up-backend --shape single|three              provision, place, register, supervise
+    bin/stand-up-backend --shape single|three --activate   ...and start the jobs marked default-on
+    bin/stand-up-backend --shape single|three --status     what each step reports, changing nothing
+    bin/stand-up-backend --shape single|three --dry-run    say what would happen, change nothing
+    bin/stand-up-backend --shape single|three --check      report only; 1 work left, 2 something refused
 
 ## THE OPERATOR NAMES THE SHAPE, AND THIS NEVER FALLS BACK FROM ONE TO THE OTHER
 
@@ -15,12 +15,16 @@ program stops the run with the command that installs it, and nothing reaches
 for sudo. On Linux it enables lingering for the operator, so the jobs keep
 running after logout; where the machine refuses, it says so and carries on.
 
-`--shape two` installs the two-account shape, which needs the `agents` and
+`--shape three` installs the three-account shape, which needs the `agents` and
 `reviewers` accounts and the privileged half. **It checks for them before any
 step runs**, and where one is missing it stops, names what it lacked, and
 leaves the machine as it found it. Quietly installing the single-account
 pieces instead would hand the operator the shape they did not choose, and the
 one that gives up the boundary they chose the other for.
+
+`--shape two` is not built yet in this release: it refuses before changing
+anything, naming `--shape three` as the install that builds the `reviewers`
+account alongside `agents`.
 
 **THIS EXISTS BECAUSE FIVE STEPS IN AN UNENFORCED ORDER IS NOT AN INSTALL.**
 Each of the four commands below is complete, refuses rather than half-doing its
@@ -35,7 +39,7 @@ has to run in the right order, holding two facts nobody wrote down:
   a job pointed at a missing area undoes the rule that a service serves only from
   its deploy area.
 
-**THE TWO-ACCOUNT SHAPE RUNS THREE STEPS AS `agents` AND SUPERVISION AS ROOT.**
+**THE THREE-ACCOUNT SHAPE RUNS THREE STEPS AS `agents` AND SUPERVISION AS ROOT.**
 `place`, `link` and `register` run through `sudo -u agents -H`, so the deploy areas,
 the linked commands and the MCP registration are the backend account's. `supervise`
 runs root's own copy of `install-jobs`, from the commit `install-privileged` recorded,
@@ -43,13 +47,21 @@ under the cleared environment `update-privileged` uses, and renders the declarat
 for `agents`. `provision` is left out: it installs packages, which needs an administrator
 this shape does not run as.
 
+**`place` RUNS FROM A TREE WITH NO `.git`, SO ITS SOURCE CHECKOUTS HAVE TO BE
+NAMED.** This runs from the root-owned tree `install-privileged` extracted, which
+carries no `.git` for `install-backend`'s own default source lookup
+(`primary_worktree().parent`) to resolve from. `--from`, passed through to `place`
+as install-backend's own `--from`, names where `agents` holds its own clones of
+the release instead — made as `agents`, by `bin/builder-install`, never the
+operator's own checkout.
+
 `--migrate-from <operator home>` moves an existing single-account install into the
 `agents` account, and `--rollback-to <operator home>` reverses that from the record the
 migration wrote under the root-owned prefix. A real run is root's, and root runs only the
 copy `install-privileged` extracted and recorded, invoked by its absolute path:
 
     sudo /opt/homebrew/bin/python3 -I /opt/builder/src/shipwright@<sha>/bin/stand-up-backend \
-        --shape two --migrate-from <operator home>
+        --shape three --migrate-from <operator home>
 
 Root refuses to start from any other copy, before it reads anything, unless that file, every
 directory above it and the `bin`, `tools` and `jobs` trees beside it belong to root with no
@@ -119,7 +131,13 @@ operator named and got wrong is exactly the thing they should be told about.
 
 **Installed is not started.** `install-jobs` writes the units; it starts only
 the default-on ones, and only with `--activate`, which this passes through.
-Without it the jobs are on the machine and not running.
+Without it the jobs are on the machine and not running, and the final
+`knowledge-index` step is skipped: there is no Library to ask.
+
+**A green `knowledge-index` step means the Library answered and `agentctl
+kb sync` ran**, not that every document was admitted. A document a project
+has not registered is reported by that command itself, on stderr, the same
+way a manual `agentctl kb sync` would.
 
 ## What it never does
 
@@ -178,6 +196,9 @@ REPO = Path(__file__).resolve().parent.parent
 #   bootstrap-library  `--check` and `--status` both `1 if` person_id is
 #                      absent (main); a real run has no non-crash `1` at
 #                      all — it either writes person_id or refuses
+#   sync-knowledge-index `--check` and `--status` both `1 if` the Library is
+#                      not answering right now (main); a real run has no
+#                      non-crash `1` either — it refuses (2) or runs
 #
 # Under `--dry-run` no tool reports pending work through its code at all, so a
 # `1` there is an uncaught exception in every case and the mode appears nowhere
@@ -261,6 +282,20 @@ STEPS = (
         "work_left_modes": ("check", "status"),
         "needs_311": True,
     },
+    {
+        "name": "knowledge-index",
+        "tool": "sync-knowledge-index",
+        "why": "build the index the Library serves agents from, now it is answering",
+        # **AFTER `supervise` HAS STARTED THE LIBRARY, AND ONLY THEN.**
+        # `agentctl kb sync` asks the Library for the project registry over
+        # the Library's own HTTP API; run any earlier, it refuses every
+        # document and leaves the index at 0 docs. `supervision_skipped`
+        # below additionally skips this whenever `--activate` is absent, since
+        # there is then no running Library to ask.
+        "modes": {"dry-run": "--dry-run", "check": "--check", "status": "--status"},
+        "work_left_modes": ("check", "status"),
+        "needs_311": False,
+    },
 )
 
 
@@ -270,11 +305,31 @@ class Refused(Exception):
 
 SHAPES = {
     "single": "one account, the operator's own, with no administrator",
-    "two": "the agents and reviewers accounts and a root-owned privileged half",
+    "two": "the operator and an `agents` account, reviews run as `agents` — not built yet in this release",
+    "three": "the agents and reviewers accounts and a root-owned privileged half",
 }
 
-# What the two-account shape needs before anything is installed for it.
-TWO_ACCOUNT_USERS = ("agents", "reviewers")
+# **ACCEPTS "0.6.1" OR "v0.6.1" ALIKE, AS install-backend AND builder-install
+# DO**; checked here too so a bad --release is refused before any step runs,
+# rather than after `provision` has already changed the machine.
+RELEASE_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)(\.?[0-9]+)?)?$")
+
+
+def checked_release(value: str | None) -> str | None:
+    """`value`, normalised to "vX.Y.Z", or a refusal when its shape is wrong."""
+    if value is None:
+        return None
+    version = value[1:] if value.startswith("v") else value
+    if not RELEASE_VERSION.fullmatch(version):
+        raise Refused(
+            f"'{value}' is not a release version. Pass --release with a version "
+            f"such as 1.2.3 or v1.2.3-rc1."
+        )
+    return f"v{version}"
+
+
+# What the three-account shape needs before anything is installed for it.
+THREE_ACCOUNT_USERS = ("agents", "reviewers")
 PRIVILEGED_INSTALLER = Path("bin", "install-privileged")
 
 # THE BACKEND'S ACCOUNT, AND THE ROOT-OWNED TREE THE PRIVILEGED HALF INSTALLS.
@@ -395,9 +450,9 @@ def root_copy_problem(script: str, owner: int = 0, *, prefix: Path = PRIVILEGED_
     return tree_problem(Path(script), owner, top)
 
 
-def two_shape_lacks(repo: Path = REPO, exists=_account_exists,
+def three_shape_lacks(repo: Path = REPO, exists=_account_exists,
                     record: Path = INSTALLED_RECORD) -> list[str]:
-    """What the two-account shape needs and this machine lacks, one line each.
+    """What the three-account shape needs and this machine lacks, one line each.
 
     **THE ACCOUNTS ARE ASKED OF THE DIRECTORY, NOT OF `provision-accounts
     --check`**, because that command needs root for every mode and this runs
@@ -409,8 +464,8 @@ def two_shape_lacks(repo: Path = REPO, exists=_account_exists,
     steps this runs cannot work without the launcher it installs.
     """
     lacks = [
-        f"the `{name}` account, which `sudo bin/provision-accounts` creates"
-        for name in TWO_ACCOUNT_USERS if not exists(name)
+        f"the `{name}` account, which `sudo bin/provision-accounts --shape three` creates"
+        for name in THREE_ACCOUNT_USERS if not exists(name)
     ]
     if not (repo / PRIVILEGED_INSTALLER).is_file():
         lacks.append(
@@ -424,10 +479,10 @@ def two_shape_lacks(repo: Path = REPO, exists=_account_exists,
     return lacks
 
 
-def refuse_two_shape(lacks: list[str]) -> Refused:
+def refuse_three_shape(lacks: list[str]) -> Refused:
     listed = "\n".join(f"  - {line}" for line in lacks)
     return Refused(
-        f"the two-account shape cannot be installed on this machine. It lacks:\n"
+        f"the three-account shape cannot be installed on this machine. It lacks:\n"
         f"{listed}\n"
         f"Nothing was installed or changed, and the single-account shape was not "
         f"installed in its place. To install as one account instead, run with "
@@ -444,7 +499,7 @@ def lingers_before(step: dict, mode: str | None, shape: str,
                    platform: str = sys.platform) -> bool:
     """Whether to enable lingering before running `step`: just before the jobs
     are installed, in a real single-account run, on Linux. Every reporting mode
-    changes nothing, and the two-account shape's jobs run as `agents`."""
+    changes nothing, and the three-account shape's jobs run as `agents`."""
     return (step["name"] == "supervise" and mode is None and shape == "single"
             and platform.startswith("linux"))
 
@@ -547,7 +602,7 @@ def resolve_operator_name(explicit: str | None, best: str | None) -> tuple[str, 
     --print-operator-name` as a subprocess, in THIS process's own context —
     the operator's, never through `AS_AGENTS`.
 
-    **ONLY FOR `--shape two`.** Its `library-person` step runs as `agents`
+    **ONLY FOR `--shape three`.** Its `library-person` step runs as `agents`
     (`runs_as`), and `bootstrap-library`'s own fallback chain, run from
     there, would read `agents`' git config and account name rather than the
     operator's. Resolving it here, before the step drops to `agents`, and
@@ -600,8 +655,16 @@ def argv_for(step: dict, args, mode: str | None, best: str | None) -> list[str]:
         # The single-account shape has no administrator: name what is missing
         # and how to install it, never sudo.
         argv.append("--no-install")
-    if step["name"] in ("place", "register", "library-person") and args.deploy is not None:
+    if step["name"] in ("place", "register", "library-person", "knowledge-index") and args.deploy is not None:
         argv += ["--deploy", str(args.deploy)]
+    if step["name"] == "place" and args.source is not None:
+        # **--shape three ONLY.** `place` runs as `agents`, from the root-owned
+        # tree install-privileged extracted, which carries no `.git` for
+        # install-backend's own default (`primary_worktree().parent`) to resolve
+        # from. The caller — `bin/builder-install` — names where `agents` holds
+        # its own clones of the release instead, made as `agents` and never the
+        # operator's own checkout (step 1's rule).
+        argv += ["--from", str(args.source)]
     if step["name"] == "place" and best is not None:
         # `--python` defaults to whatever invoked the tool. On 22.04 that is
         # the stock 3.10, and a deploy venv built with it is a worse floor than
@@ -609,10 +672,18 @@ def argv_for(step: dict, args, mode: str | None, best: str | None) -> list[str]:
         argv += ["--python", best]
     if step["name"] == "place" and args.seed_registry:
         argv += ["--seed-registry"]
+    if step["name"] == "place" and args.release is not None:
+        argv += ["--release", args.release]
+    if step["name"] == "place" and args.commit:
+        # A repository with no release tag to resolve, such as write-better,
+        # whose ref is its own main. The caller names the exact commit it
+        # verified; install-backend refuses one its clone does not hold.
+        for value in args.commit:
+            argv += ["--commit", value]
     if step["name"] == "supervise":
         argv += ["--jobs", str(declarations_dir(args))]
         if args.shape == "single":
-            # The declarations name `agents` for the two-account shape; the operator runs them here.
+            # The declarations name `agents` for the three-account shape; the operator runs them here.
             argv += ["--single-account"]
         if args.deploy is not None:
             argv += ["--deploy", str(args.deploy)]
@@ -620,10 +691,10 @@ def argv_for(step: dict, args, mode: str | None, best: str | None) -> list[str]:
             argv += ["--activate"]
     if step["name"] == "library-person":
         argv += ["--jobs", str(declarations_dir(args))]
-        if args.shape == "two":
+        if args.shape == "three":
             # `--shape single` runs this step as the operator, and
             # `bootstrap-library` resolves the name for itself there,
-            # exactly as on main. `--shape two` runs it as `agents`, so the
+            # exactly as on main. `--shape three` runs it as `agents`, so the
             # name is resolved here instead, as a subprocess in this
             # process's own context, and always passed through.
             name, source = resolve_operator_name(args.operator_name, best)
@@ -637,12 +708,12 @@ def argv_for(step: dict, args, mode: str | None, best: str | None) -> list[str]:
 def steps_for(shape: str) -> tuple:
     """The steps this shape runs, in order.
 
-    **THE TWO-ACCOUNT SHAPE LEAVES OUT `provision`.** That step installs
+    **THE THREE-ACCOUNT SHAPE LEAVES OUT `provision`.** That step installs
     packages, which needs an administrator, and this shape runs as `agents`
     and as root, never as the operator. Whether the interpreter exists is what
     `place` refuses on, and `place` says which command installs it.
     """
-    if shape == "two":
+    if shape == "three":
         return tuple(step for step in STEPS if step["name"] != "provision")
     return STEPS
 
@@ -650,7 +721,7 @@ def steps_for(shape: str) -> tuple:
 def runs_as(step: dict, shape: str) -> str:
     """Who runs one step: the operator, `agents`, or root's own copy.
 
-    In the single-account shape everything is the operator's. In the two-account
+    In the single-account shape everything is the operator's. In the three-account
     shape the backend's steps are `agents`', and supervision is root's, because a
     system-scope job is installed by root whatever account it runs as.
     """
@@ -665,7 +736,7 @@ def agents_home() -> str:
         return pwd.getpwnam(AGENTS).pw_dir
     except KeyError:
         raise Refused(f"the `{AGENTS}` account does not exist. Run "
-                      f"`sudo bin/provision-accounts`. Nothing was installed.")
+                      f"`sudo bin/provision-accounts --shape three`. Nothing was installed.")
 
 
 def agents_builder_root(home: str, run=None) -> str:
@@ -736,7 +807,7 @@ def launch(step: dict, args, mode: str | None, best: str | None, run=None) -> tu
 
     **THE PREFIX IS THE ONLY DIFFERENCE BETWEEN THE SHAPES' STEPS.** `argv_for`
     builds the tool's own command line, which tests read, and this adds the
-    account it runs as in front of it. Supervision in the two-account shape is
+    account it runs as in front of it. Supervision in the three-account shape is
     not a prefix on the agents' command, since it runs root's copy instead.
     """
     who = runs_as(step, args.shape)
@@ -930,9 +1001,16 @@ def outstanding(args, blocks, mode: str | None, supervise_ok: bool) -> list[str]
         lines += [
             (
                 "The jobs are INSTALLED AND NOT STARTED. `install-jobs` starts the "
-                "default-on ones only with `--activate`, which this did not pass:"
+                "default-on ones only with `--activate`, which this did not pass, "
+                "so the Library is not running and its knowledge index was not "
+                "built either:"
             ),
             f"    {PROG} --activate",
+            (
+                "which starts the jobs and builds the index in one run. Or start "
+                "the jobs some other way and build the index yourself:"
+            ),
+            "    agentctl kb sync",
             "",
         ]
     if mode == "dry-run":
@@ -1299,7 +1377,7 @@ def agents_ids() -> tuple[int, int]:
         entry = pwd.getpwnam(AGENTS)
     except KeyError:
         raise Refused(f"the `{AGENTS}` account does not exist. Run "
-                      f"`sudo bin/provision-accounts`. Nothing was changed.")
+                      f"`sudo bin/provision-accounts --shape three`. Nothing was changed.")
     return entry.pw_uid, entry.pw_gid
 
 
@@ -2783,7 +2861,7 @@ def run_migration_mode(args, chosen: str | None) -> int:
     try:
         if chosen is None and os.geteuid() != 0:
             raise Refused(f"the migration changes files that only root can change. Run it as root from "
-                          f"the installed copy, `{root_invocation()} --shape two --migrate-from …`, or "
+                          f"the installed copy, `{root_invocation()} --shape three --migrate-from …`, or "
                           f"`--dry-run` first. Nothing was changed.")
         if args.rollback_to is not None:
             if chosen is not None:
@@ -2832,21 +2910,38 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--deploy", type=Path, default=None,
                         help="deploy root, passed to the steps that place and "
                              "read it (default: each tool's own)")
+    parser.add_argument("--from", dest="source", type=Path, default=None,
+                        help="directory holding the repository checkouts, passed "
+                             "to the place step as install-backend's own --from "
+                             "(default: install-backend's own default, the "
+                             "primary checkout's sibling directory — wrong under "
+                             "--shape three, where place runs from a tree "
+                             "install-privileged extracted and carries no .git)")
     parser.add_argument("--jobs", type=Path, default=None,
                         help="directory of job declarations (default: <repo>/jobs)")
     parser.add_argument("--seed-registry", action="store_true",
                         help="give the backend the projects registry the published "
                              "release would, not the one a source checkout carries; "
                              "for anyone installing from source but Convivy itself")
+    parser.add_argument("--release", default=None, metavar="vX.Y.Z",
+                        help="the release tag to place library, agent-platform "
+                             "and convivy-orient at, passed to install-backend "
+                             "(write-better tracks its own main and is never "
+                             "moved by this)")
+    parser.add_argument("--commit", action="append", default=None, metavar="REPO=SHA",
+                        help="place REPO at exactly this commit, passed to "
+                             "install-backend; repeatable. write-better's ref is "
+                             "its own main rather than a release tag, so a caller "
+                             "that verified a commit pins it here")
     parser.add_argument("--activate", action="store_true",
                         help="also start the jobs marked enabled-by-default")
     parser.add_argument("--migrate-from", type=Path, default=None, metavar="OPERATOR_HOME",
-                        help="move the operator's Builder tree into the agents account (--shape two "
+                        help="move the operator's Builder tree into the agents account (--shape three "
                              "only). A real run is root's: run it from the installed copy, by absolute "
                              "path, as the module usage shows; --dry-run plans it as the operator")
     parser.add_argument("--rollback-to", type=Path, default=None, metavar="OPERATOR_HOME",
                         help="reverse the migration recorded under the root-owned prefix, as root from "
-                             "the installed copy (--shape two only)")
+                             "the installed copy (--shape three only)")
     parser.add_argument("--operator-name", default=None,
                         help="the operator's display name, for making them the "
                              "Library's first person (default: git config "
@@ -2860,10 +2955,16 @@ def main(argv: list[str]) -> int:
     mode.add_argument("--check", action="store_true",
                       help="report only; 1 if work is left, 2 if a step refused")
     args = parser.parse_args(argv)
+    try:
+        args.release = checked_release(args.release)
+    except Refused as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 2
     if os.geteuid() == 0:
         # A PATH ARGUMENT UNDER ROOT NAMES WHAT THE OPERATOR TYPED, NOT `/`.
         args.deploy = invoked_path(args.deploy, start)
         args.jobs = invoked_path(args.jobs, start)
+        args.source = invoked_path(args.source, start)
         args.migrate_from = invoked_path(args.migrate_from, start)
         args.rollback_to = invoked_path(args.rollback_to, start)
 
@@ -2893,11 +2994,19 @@ def main(argv: list[str]) -> int:
               f"Run it without sudo. Nothing was changed.", file=sys.stderr)
         return 2
     if args.shape == "two":
+        # BEFORE ANY STEP, IN EVERY MODE. The two-account shape is not built
+        # yet in this release; the install with a reviewers account is
+        # --shape three, and this never silently substitutes it.
+        print(f"{PROG}: the two-account install is not built yet in this release. "
+              f"The install with a reviewers account is `--shape three`. Nothing "
+              f"was installed or changed.", file=sys.stderr)
+        return 2
+    if args.shape == "three":
         # BEFORE ANY STEP, IN EVERY MODE. A reporting mode would otherwise
-        # describe installing pieces the two-account shape cannot use.
-        lacks = two_shape_lacks()
+        # describe installing pieces the three-account shape cannot use.
+        lacks = three_shape_lacks()
         if lacks:
-            print(f"{PROG}: {refuse_two_shape(lacks)}", file=sys.stderr)
+            print(f"{PROG}: {refuse_three_shape(lacks)}", file=sys.stderr)
             return 2
 
     if args.migrate_from is not None or args.rollback_to is not None:
@@ -2908,9 +3017,9 @@ def main(argv: list[str]) -> int:
             print(f"{PROG}: name one of --migrate-from and --rollback-to, not both",
                   file=sys.stderr)
             return 2
-        if args.shape != "two":
+        if args.shape != "three":
             print(f"{PROG}: the migration moves the backend into the `{AGENTS}` account, "
-                  f"which only --shape two has. Nothing was changed.", file=sys.stderr)
+                  f"which only --shape three has. Nothing was changed.", file=sys.stderr)
             return 2
         return run_migration_mode(args, chosen)
 
@@ -2931,7 +3040,13 @@ def main(argv: list[str]) -> int:
                 # ONLY ROOT RAISES FROM HERE: it names the interpreter it needed, and runs nothing.
                 print(f"{PROG}: {exc}", file=sys.stderr)
                 return 2
-        if step["name"] in ("supervise", "library-person") and supervision_skipped(args):
+        if step["name"] in ("supervise", "library-person", "knowledge-index") and supervision_skipped(args):
+            continue
+        # A REAL RUN WITH NO `--activate` STARTED NOTHING, SO THERE IS NO
+        # LIBRARY TO ASK. A reporting mode still runs this step: it answers
+        # "is the Library answering right now", which `--activate` on THIS
+        # invocation has no bearing on.
+        if step["name"] == "knowledge-index" and not args.activate and chosen is None:
             continue
         if lingers_before(step, chosen, args.shape):
             # The name the process runs as, from its UID. `getpass.getuser()`

@@ -10,6 +10,12 @@ These steps were run on Debian 12, in a container, by an account that could not 
 not run. A container is an isolated Linux system running inside another machine. Ubuntu has not
 been tested on this path.
 
+**The one-command install still names `git` and Python 3.11 as missing here**, since its own
+`apt-get install` step needs `sudo`, which this account does not have; [Installing Builder's
+one-command section](installing.md#the-one-command) says what it installs on an account that can
+use `sudo`. It does install Claude Code itself even on this account, since that step never needs
+`sudo` either way.
+
 Two people take part, the machine's administrator and the owner of the account Builder will run in.
 If you are both, do both parts.
 
@@ -20,13 +26,15 @@ first:
 
 ```
 apt-get update
-apt-get install git zsh lsof tmux curl python3-venv acl
+apt-get install git zsh lsof tmux curl python3-venv acl bubblewrap socat
 ```
 
 Run both as root. The Debian test machine had `git` already and installed the rest with that
 `apt-get install` command. `provision-backend`, which the account runs later, names the venv package
 as `python3.11-venv`; Debian 12's `python3-venv` depends on it and installs it, and on the test
-machine `apt-cache depends python3-venv` listed it.
+machine `apt-cache depends python3-venv` listed it. `bubblewrap` and `socat` are what a dispatched
+session's sandbox needs; without them a session refuses to start with `sandbox required but
+unavailable`, naming whichever of the two is still missing.
 
 So that the account's services keep running after it logs out, the administrator also runs this as
 root, with the account name checked first:

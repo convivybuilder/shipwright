@@ -21,23 +21,27 @@ point where your needs stop.
 - **An account of your own on each machine.** Builder installs on the server in one of two shapes,
   and the shape counts only the server's accounts. This release installs only the single-account
   shape, which runs Builder on the server as one account, yours. Deck runs on the laptop as your
-  account there, whichever shape the server has. The two-account install comes in a later release.
+  account there, whichever shape the server has. The three-account install comes in a later release.
   It runs Builder on the server under two accounts of its own, separate from yours, and it needs
   the server's administrator password to create them, and again whenever Builder's privileged half
   is installed or updated. [One account vs. multiple accounts on the
   server](accounts-on-the-server.md)
-  explains both shapes and what the single-account one gives up.
+  explains the shapes and what the single-account one gives up.
 - **Claude Code, signed in to your Claude account.** Claude Code is the program that lets you talk
   with Claude, an AI model, in a terminal. Every Builder session is a conversation with Claude in a
-  terminal. On the two-account install, Builder's two accounts sign in to Claude as well as your
+  terminal. On the three-account install, Builder's two accounts sign in to Claude as well as your
   own, so check that your plan allows three sign-ins, or have a seat for each.
-- **A GitHub account, for the two-account install** and for any project you want reviewed. GitHub
+- **A GitHub account, for the three-account install** and for any project you want reviewed. GitHub
   is a website that stores a project's files and their history. The GitHub section below says why
   Builder uses it, and when the single-account install can start without one.
 
-On the two-account install, Homebrew installs anything else Builder needs, and that list is the
+On the three-account install, Homebrew installs anything else Builder needs, and that list is the
 whole of it. Homebrew is a free program for the Mac that installs other programs. The single-account
-install installs no program itself: it checks each one and names any you need to install.
+install's one-command route installs most of the rest itself — `git`, Python 3.11, Claude Code and,
+on a Mac, `tmux`, using `apt-get` on Linux and Homebrew on a Mac, bootstrapping Homebrew itself when
+an administrator is at the keyboard — and checks and names whatever it has no route to install: an
+account with no administrator rights and no Homebrew already there, and signing in to Claude Code,
+which stays something only you can do.
 
 The next two sections describe the machines as Builder is designed to use them, starting from one.
 This release needs both from the start, as listed above. The sections after them cover what you add
@@ -95,14 +99,16 @@ identities Builder acts under. This section takes them in turn. Two words come u
 pull request is a proposed change, packaged so it can be read and checked before it is accepted,
 and to merge it is to accept it.
 
-**The two-account install needs a GitHub account, whatever you are building.** The gate that
+**The three-account install needs a GitHub account, whatever you are building.** The gate that
 decides whether a change merges is GitHub's, and the part of Builder that runs reviews installs only
 from GitHub.
 
 **The single-account install can start without one**, for work that is not software. You get a
 Reference Room, Builder's store of what a project holds to be true, which many systems call a
-knowledge base. You also get projects, and you meet no pull request. Adding a GitHub account
-later turns on reviews without a reinstall.
+knowledge base. You also get projects, and you meet no pull request. The one-command server
+install pauses near the end to create the App that [Connecting GitHub](connecting-github.md) sets
+up; without a GitHub account ready, run it with `--no-github-app` and add one later without a
+reinstall.
 
 **What GitHub holds is review.** A change that someone should look at before it counts becomes a
 pull request. Two agents review it, a reviewer and a security reviewer, and checks run against it to
@@ -113,8 +119,7 @@ works](how-builder-works.md#review-what-decides-a-merge) says why no agent can p
 itself. On the single-account install the reviewers post their findings on the pull request instead,
 and the rule on `main` that you set in the repository's settings on GitHub can require a pull
 request and the repository's own automated checks, such as the one that catches a malformed
-document. In the merge mode called Enforced it also requires your own approval, which [Connecting
-GitHub](connecting-github.md) explains.
+document, which [Connecting GitHub](connecting-github.md) sets up.
 
 **It is also your copy.** GitHub keeps your work off your own disk at no cost, so a failed disk or a
 lost laptop takes nothing you cannot restore, and handing someone a link is the same act as keeping
@@ -133,7 +138,7 @@ install step creates it yet.
 A separate identity buys two things.
 
 - **Work is attributed to whoever did it.** A pull request the Library merged says the Library
-  merged it, and on the two-account install, work an agent pushed is attributable to the agent and
+  merged it, and on the three-account install, work an agent pushed is attributable to the agent and
   not to you. On the single-account install, sessions push as the agents' App once GitHub is
   connected, so their pushes carry the App's name rather than yours.
 - **Each App holds its own narrow permissions.** That is what lets the Library merge into the

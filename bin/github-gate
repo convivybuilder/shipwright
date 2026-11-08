@@ -7,9 +7,7 @@
     sudo bin/github-gate --check --org <name> [--exclude <repo>]...
 
     bin/github-gate --ruleset --shape single [--mode instruction] --require-check <check>... [--org <name>]
-    bin/github-gate --ruleset --shape single --mode enforced --operator <login> --require-check <check>... [--org <name>]
     GH_TOKEN=... bin/github-gate --check --shape single --mode instruction --repo <owner/name>... --require-check <check>...
-    GH_TOKEN=... bin/github-gate --check --shape single --mode enforced --operator <login> --repo <owner/name>... --require-check <check>...
 
 **A pull request merges to `main` only when the approver App has posted both
 review checks on its head.** The App's key is readable by root alone, so an
@@ -39,24 +37,21 @@ never reads as a gate that holds.
 
 **`--shape single` is the single-account install's**, which has no approver
 App, no key and no root. Its agents reach GitHub as an App the operator
-creates, so the operator is not the author of their pull requests, and the
-operator chooses one of two merge modes:
+creates, so the operator is not the author of their pull requests.
 
-- **`--mode instruction`** (the default): the ruleset requires a pull request
-  and the passing checks the operator names, with no approving review. No
-  agent merging is held by the agents' instructions.
-- **`--mode enforced`**: the same, plus one approving review of the latest
-  push from a code owner, with stale approvals dismissed, and a `CODEOWNERS`
-  file on `main` naming the operator alone as owner of every path. The App
-  can approve any pull request it did not author, so a plain approving review
-  would admit the App's own; an App cannot be a code owner, so a code-owner
-  review is the operator's.
+**`--mode instruction`** is the only mode this builds: the ruleset requires a
+pull request and the passing checks the operator names, with no approving
+review. No agent merging is held by the agents' instructions, like any
+instruction fence.
 
-Neither ruleset has a bypass actor. Its `--check` reads with the token in
+**`--mode enforced` was withdrawn** and is refused. Deterministic, the mode
+in which GitHub itself holds that only the operator merges, is designed and
+ships once it has been rehearsed; it is not available yet.
+
+The ruleset has no bypass actor. `--check` reads with the token in
 `GH_TOKEN`, which on such an install comes from `github-app-token`, and
-confirms each repository's ruleset matches the mode named with `--mode`,
-which `--check` requires rather than defaulting. In enforced mode it also
-reads `CODEOWNERS` on `main` and the errors GitHub found in it.
+confirms the repository's ruleset matches instruction mode, which `--check`
+requires naming with `--mode` rather than defaulting.
 """
 
 from __future__ import annotations
@@ -459,39 +454,27 @@ def ruleset(app_id: int, excludes: list[str]) -> dict:
 
 SINGLE_NAME = "builder single-account gate"
 MODES = ("instruction", "enforced")
+# `enforced` is refused before this is read; `single_ruleset` and
+# `single_problem` build and check against instruction mode alone.
 SINGLE_PULL_REQUEST = {
-    "instruction": {
-        "required_approving_review_count": 0,
-        "dismiss_stale_reviews_on_push": False,
-        "require_code_owner_review": False,
-        "require_last_push_approval": False,
-        "required_review_thread_resolution": False,
-    },
-    "enforced": {
-        "required_approving_review_count": 1,
-        "dismiss_stale_reviews_on_push": True,
-        "require_code_owner_review": True,
-        "require_last_push_approval": True,
-        "required_review_thread_resolution": False,
-    },
+    "required_approving_review_count": 0,
+    "dismiss_stale_reviews_on_push": False,
+    "require_code_owner_review": False,
+    "require_last_push_approval": False,
+    "required_review_thread_resolution": False,
 }
-# The pull_request fields each mode's check compares, against the value above.
-SINGLE_REVIEW_FIELDS = ("required_approving_review_count", "dismiss_stale_reviews_on_push",
-                        "require_code_owner_review", "require_last_push_approval")
-# Where GitHub looks for CODEOWNERS, in its order; the first one found is used.
-CODEOWNERS_PATHS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
-LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
+# The pull_request field the check compares against the value above. The
+# other fields only mean something once an approval is required, which
+# instruction mode never does.
+SINGLE_REVIEW_FIELDS = ("required_approving_review_count",)
 
 
-def single_ruleset(checks: list[str], org: str | None, mode: str = "instruction") -> dict:
+def single_ruleset(checks: list[str], org: str | None) -> dict:
     """The ruleset for a single-account install, where no approver App exists.
 
-    **A PULL REQUEST AND PASSING CHECKS**, and in `enforced` mode one
-    code-owner approval of the latest push. **NO BYPASS ACTOR**, so a direct push
-    to `main` is refused for everyone, an administrator included. The App the
-    agents use holds no `administration` permission, so it cannot change the
-    ruleset; an operator credential left on the machine could, so `enforced`
-    holds only while no such credential is on the machine.
+    **A PULL REQUEST AND PASSING CHECKS**, with no approving review.
+    **NO BYPASS ACTOR**, so a direct push to `main` is refused for everyone,
+    an administrator included.
 
     With `org`, an organisation ruleset over every repository; without, a
     repository ruleset, for an operator whose projects live under their own
@@ -508,7 +491,7 @@ def single_ruleset(checks: list[str], org: str | None, mode: str = "instruction"
         "rules": [
             {"type": "deletion"},
             {"type": "non_fast_forward"},
-            {"type": "pull_request", "parameters": dict(SINGLE_PULL_REQUEST[mode])},
+            {"type": "pull_request", "parameters": dict(SINGLE_PULL_REQUEST)},
             {"type": "required_status_checks", "parameters": {
                 "required_status_checks": [{"context": c} for c in checks],
                 "strict_required_status_checks_policy": False,
@@ -525,9 +508,9 @@ def pull_request_parameters(rs: dict) -> dict:
     return {}
 
 
-def single_problem(rs: dict, checks: list[str], mode: str = "instruction") -> str | None:
-    """Why this ruleset is not the single-account gate in `mode`, naming the
-    field, or None."""
+def single_problem(rs: dict, checks: list[str]) -> str | None:
+    """Why this ruleset is not the single-account gate, naming the field, or
+    None."""
     if rs.get("enforcement") != "active":
         return f"enforcement is {rs.get('enforcement')!r}, not 'active'"
     # The literal ref, as `gate_problem` requires. `~DEFAULT_BRANCH` means main
@@ -547,9 +530,9 @@ def single_problem(rs: dict, checks: list[str], mode: str = "instruction") -> st
         return f"the required checks do not include {', '.join(absent)}"
     params = pull_request_parameters(rs)
     for name in SINGLE_REVIEW_FIELDS:
-        want = SINGLE_PULL_REQUEST[mode][name]
+        want = SINGLE_PULL_REQUEST[name]
         if params.get(name) != want:
-            return (f"pull_request.{name} is {params.get(name)!r}, and {mode} mode "
+            return (f"pull_request.{name} is {params.get(name)!r}, and instruction mode "
                     f"needs {want!r}")
     # GitHub returns bypass_actors only to a token that can administer the
     # repository, and the agents' App deliberately cannot, so read with the
@@ -575,85 +558,11 @@ def bypass_said(rs: dict) -> str:
     return "and the token reading it cannot bypass it (GitHub shows the full list only to an administrator)"
 
 
-def codeowners_line(operator: str) -> str:
-    return f"* @{operator}"
-
-
-def codeowners_problem(text: str, operator: str) -> str | None:
-    """Why this CODEOWNERS does not name `operator` alone as owner of every
-    path, or None.
-
-    The last line matching a path decides its owners, so the `*` line names
-    every path only until a later line names a narrower pattern; from the last
-    `*` line on, every line must name the operator alone."""
-    rules = []
-    for raw in text.splitlines():
-        words = raw.split()
-        cut = next((i for i, w in enumerate(words) if w.startswith("#")), len(words))
-        if cut:
-            rules.append(words[:cut])
-    stars = [i for i, words in enumerate(rules) if words[0] == "*"]
-    if not stars:
-        return (f"no `*` line names @{operator}, so a path no other line names has no code "
-                f"owner and any approval counts")
-    for words in rules[stars[-1]:]:
-        if [w.lower() for w in words[1:]] != [f"@{operator}".lower()]:
-            return (f"`{' '.join(words)}` comes after the last `*` line and does not name "
-                    f"@{operator} alone, so another approver counts for the paths it matches")
-    return None
-
-
-def codeowners_rows(gh: GitHub, token: str, full: str, operator: str) -> Report:
-    """Whether CODEOWNERS on main names `operator` alone for every path, and
-    GitHub found no error in it."""
-    report = Report()
-    what = f"{full}: CODEOWNERS on main names @{operator} alone as owner of every path"
-    fix = (f"commit the line `{codeowners_line(operator)}` as the whole of "
-           f".github/CODEOWNERS on main")
-    for path in CODEOWNERS_PATHS:
-        code, payload = gh.get(f"/repos/{full}/contents/{path}?ref=main", token)
-        if code == 404:
-            continue
-        if code != 200 or not isinstance(payload, dict) or payload.get("encoding") != "base64":
-            report.add(f"{full}: {path} on main can be read", False,
-                       f"GitHub answered {code}: {message(payload)}")
-            return report
-        try:
-            text = base64.b64decode(payload.get("content") or "").decode()
-        except (ValueError, UnicodeDecodeError):
-            report.add(f"{full}: {path} on main can be read", False,
-                       "GitHub returned content that is not base64 UTF-8 text")
-            return report
-        problem = codeowners_problem(text, operator)
-        report.add(what, problem is None, f"{path}: {problem}. Instead, {fix}")
-        if problem is None:
-            # GitHub skips a line it cannot use, such as one naming a login
-            # that does not exist. `--ruleset` prints the line from `--operator`,
-            # so a mistyped login reads correctly here while GitHub ignores the
-            # line, the paths have no code owner, and the App's approval counts.
-            code, payload = gh.get(f"/repos/{full}/codeowners/errors?ref=main", token)
-            errors = payload.get("errors") if isinstance(payload, dict) else None
-            if code != 200 or not isinstance(errors, list):
-                report.add(f"{full}: GitHub's errors for {path} can be read", False,
-                           f"GitHub answered {code}: {message(payload)}")
-            elif errors:
-                first = errors[0] if isinstance(errors[0], dict) else {}
-                report.add(f"{full}: GitHub found no error in {path}", False,
-                           f"line {first.get('line', '?')}: {first.get('message', first)}. "
-                           f"GitHub ignores that line; check the login is yours")
-            else:
-                report.add(f"{full}: GitHub found no error in {path}", True)
-        return report
-    report.add(what, False, f"no CODEOWNERS on main. {fix[0].upper()}{fix[1:]}")
-    return report
-
-
-def check_single(gh: GitHub, token: str, repos: list[str], checks: list[str],
-                 mode: str = "instruction", operator: str | None = None) -> Report:
+def check_single(gh: GitHub, token: str, repos: list[str], checks: list[str]) -> Report:
     """Read each repository's rulesets with the token given, and find one that
-    is the single-account gate in `mode`. In enforced mode, read CODEOWNERS
-    too, which must name `operator`."""
+    is the single-account gate."""
     report = Report()
+    what = "a pull request and passing checks, with no approval"
     for full in repos:
         rulesets = []
         for summary in gh.pages(f"/repos/{full}/rulesets?includes_parents=true", token):
@@ -663,10 +572,8 @@ def check_single(gh: GitHub, token: str, repos: list[str], checks: list[str],
                            f"GitHub answered {code}: {message(detail)}")
                 continue
             rulesets.append(detail)
-        problems = [(rs, single_problem(rs, checks, mode)) for rs in rulesets]
+        problems = [(rs, single_problem(rs, checks)) for rs in rulesets]
         good = [rs for rs, p in problems if p is None]
-        what = ("a pull request, passing checks and a code owner's approval of the latest push"
-                if mode == "enforced" else "a pull request and passing checks, with no approval")
         if good:
             report.add(f"{full}: ruleset {good[0].get('id')} on {MAIN} requires {what}, "
                        f"{bypass_said(good[0])}", True)
@@ -677,9 +584,7 @@ def check_single(gh: GitHub, token: str, repos: list[str], checks: list[str],
                 False,
                 f"ruleset {named[0][0].get('id')} ({SINGLE_NAME}): {named[0][1]}" if named else
                 f"no ruleset does. Import the one `{PROG} --ruleset --shape single "
-                f"--mode {mode}` prints.")
-        if mode == "enforced":
-            report.rows.extend(codeowners_rows(gh, token, full, operator).rows)
+                f"--mode instruction` prints.")
     return report
 
 
@@ -865,77 +770,51 @@ def print_table(title: str, report: Report) -> None:
             print(f"         fix: {row.fix}")
 
 
-def single_instructions(org: str | None, mode: str = "instruction",
-                        operator: str | None = None) -> str:
+def single_instructions(org: str | None) -> str:
     where = (f"https://github.com/organizations/{org}/settings/rules, New ruleset, "
              f"Import a ruleset" if org else
              "each project repository's Settings, Rules, Rulesets, New ruleset, "
              "Import a ruleset")
-    owners = operator_flag = ""
-    if mode == "enforced":
-        owners = f"""
-First, in each repository, push a .github/CODEOWNERS to main that holds
-exactly this line. Do it before you import the ruleset, which refuses a
-direct push to main:
-
-  {codeowners_line(operator)}
-"""
-        operator_flag = f" --operator {operator}"
     return f"""\
 Import the JSON above (save it to a file first): {where}.
-{owners}
-{SINGLE_MODE_NOTE[mode]}
+
+{SINGLE_INSTRUCTION_NOTE}
 
 Then confirm it by reading:
-  GH_TOKEN=$(github-app-token) {PROG} --check --shape single --mode {mode}{operator_flag} --repo <owner/name> --require-check <check>
+  GH_TOKEN=$(github-app-token) {PROG} --check --shape single --mode instruction --repo <owner/name> --require-check <check>
 """
 
 
-SINGLE_MODE_NOTE = {
-    "instruction": """It refuses a direct push to main, for everyone, and requires the checks named
+SINGLE_INSTRUCTION_NOTE = """It refuses a direct push to main, for everyone, and requires the checks named
 above. Nothing on GitHub requires your approval: that no agent merges is held
-by the agents' instructions.""",
-    "enforced": """It refuses a direct push to main, for everyone, and requires the checks named
-above and your approval of the latest push, as the code owner CODEOWNERS
-names. On a pull request an agent opened, approval from anyone else, the
-agents' App included, does not count. On one you opened and only you pushed
-to, GitHub asks for no code owner, so any approval counts, the App's included;
-the agents' instructions forbid them to approve. Once an agent pushes to a pull
-request you opened, the latest push needs approving by someone other than that
-agent, and you cannot approve your own pull request, so it cannot merge.
-It holds only while no GitHub
-credential of yours (a gh login, or an SSH key that can push) is on this
-machine. An agent can still press merge once you have approved; its
-instructions forbid that.""",
-}
+by the agents' instructions."""
+
+ENFORCED_WITHDRAWN = (
+    "Enforced was withdrawn. Deterministic, the mode in which GitHub itself "
+    "holds that only the operator merges, is not available yet: it waits on "
+    "a rehearsal. Run with --mode instruction."
+)
 
 
 def main_single(args: argparse.Namespace, gh: GitHub) -> int:
     """`--shape single`: no approver App, no key, no root."""
     checked_mode = args.mode
-    args.mode = args.mode or "instruction"
     if args.mode == "enforced":
-        if not args.operator:
-            raise Refused("--mode enforced needs --operator, your GitHub login, which "
-                          "CODEOWNERS names as the one approver who counts.")
-        args.operator = args.operator.removeprefix("@")
-        if not LOGIN.fullmatch(args.operator):
-            raise Refused(f"--operator takes a GitHub login, and {args.operator!r} is not one.")
-    elif args.operator:
-        raise Refused("--operator belongs to --mode enforced.")
+        raise Refused(ENFORCED_WITHDRAWN)
+    args.mode = args.mode or "instruction"
     if args.print_app or args.place_key is not None or args.app_id:
         raise Refused("the single-account shape has no approver App, so there is no "
                       "App to print and no key to place.")
     if args.exclude:
-        raise Refused("--exclude belongs to the two-account organisation ruleset.")
+        raise Refused("--exclude belongs to the three-account organisation ruleset.")
     if not args.require_check:
         raise Refused("name the status checks main requires with --require-check, once "
                       "for each: the names of your project's CI jobs as GitHub shows them.")
     if args.ruleset:
         if args.repo:
             raise Refused("--repo belongs to --check.")
-        print(json.dumps(single_ruleset(args.require_check, args.org, args.mode), indent=2))
-        print(single_instructions(args.org, args.mode, args.operator), end="", file=sys.stderr)
+        print(json.dumps(single_ruleset(args.require_check, args.org), indent=2))
+        print(single_instructions(args.org), end="", file=sys.stderr)
         return 0
     if args.org:
         raise Refused("--org belongs to --ruleset; --check reads the repositories named "
@@ -946,12 +825,11 @@ def main_single(args: argparse.Namespace, gh: GitHub) -> int:
         if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", full):
             raise Refused(f"--repo takes owner/name, and {full!r} is not that.")
     # --check compares against the mode the install recorded, so it never
-    # assumes one: a default would pass a ruleset downgraded from enforced.
+    # assumes one: a default would pass a ruleset this install never set up.
     if not checked_mode:
-        raise Refused("name the merge mode to check against with --mode enforced or "
-                      "--mode instruction, the one this install recorded.")
-    report = check_single(gh, single_token(), args.repo, args.require_check, args.mode,
-                          args.operator)
+        raise Refused("name the merge mode to check against with --mode instruction, "
+                      "the one this install recorded.")
+    report = check_single(gh, single_token(), args.repo, args.require_check)
     print_table(f"{PROG}: single-account gate", report)
     return 1 if report.failing else 0
 
@@ -967,8 +845,8 @@ def main(argv: list[str], gh: GitHub | None = None, prefix: str = PREFIX) -> int
     parser.add_argument("--exclude", action="append", default=[], metavar="REPO",
                         help="a repository the gate leaves out (repeatable)")
     parser.add_argument("--app-id", help="with --place-key, the App's numeric id")
-    parser.add_argument("--shape", choices=("two", "single"), default="two",
-                        help="the install shape: two accounts and the approver App "
+    parser.add_argument("--shape", choices=("three", "single"), default="three",
+                        help="the install shape: three accounts and the approver App "
                              "(the default), or a single account with no App")
     parser.add_argument("--require-check", action="append", default=[], metavar="CONTEXT",
                         help="with --shape single, a status check main requires (repeatable)")
@@ -976,11 +854,8 @@ def main(argv: list[str], gh: GitHub | None = None, prefix: str = PREFIX) -> int
                         help="with --shape single --check, a repository to read (repeatable)")
     parser.add_argument("--mode", choices=MODES,
                         help="with --shape single, the merge mode: instruction (the default "
-                             "for --ruleset) or enforced, which requires your approval; "
-                             "--check needs it named")
-    parser.add_argument("--operator", metavar="LOGIN",
-                        help="with --mode enforced, your GitHub login, which CODEOWNERS "
-                             "names as owner of every path")
+                             "for --ruleset, and the only one built); enforced was "
+                             "withdrawn and is refused; --check needs it named")
     args = parser.parse_args(argv)
     gh = gh or GitHub()
 
@@ -992,9 +867,8 @@ def main(argv: list[str], gh: GitHub | None = None, prefix: str = PREFIX) -> int
             return 2
 
     try:
-        if args.require_check or args.repo or args.mode or args.operator:
-            raise Refused("--require-check, --repo, --mode and --operator belong to "
-                          "--shape single.")
+        if args.require_check or args.repo or args.mode:
+            raise Refused("--require-check, --repo and --mode belong to --shape single.")
         if args.place_key is None and args.app_id:
             raise Refused("--app-id only means something with --place-key.")
         if args.place_key is not None and not args.app_id:

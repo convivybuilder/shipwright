@@ -132,10 +132,10 @@ EXCLUDE["convivy-deck"] = ("inbox", ".github/workflows/ci.yml")
 # way an ALLOW entry pins a value. Each entry is one file, never a directory,
 # and is matched against the paths tracked at the exported commit.
 EXCLUDE_HASHED: dict[str, tuple[tuple[str, str], ...]] = {name: () for name in SCANNED}
-# Four tools set up one operator's own pair of Macs (volume mounts, and an ssh
-# config naming that operator's tailnet hosts and user), and the fifth is a
-# bash test that pins the ssh tool's hostnames and cannot run without it. An
-# adopter has none of those machines. agent-platform's owner ruled all five out.
+# Three tools set up one operator's own pair of Macs' volume mounts: one
+# mounts them, one remounts them, and the third is the remount tool's retired
+# predecessor. An adopter has none of those machines. agent-platform's owner
+# ruled all three out.
 EXCLUDE_HASHED["agent-platform"] = (
     ("7843404144ed9d99e0a507fcbb1d76512d6b94ab1b3776cd704b75036a404f87",
      "a tool that mounts one operator's volumes"),
@@ -143,10 +143,6 @@ EXCLUDE_HASHED["agent-platform"] = (
      "a tool that remounts one operator's volumes"),
     ("5e063469c7155bd88bc01091cf84eab846405592a7e6023d3431b11e48524f46",
      "the retired predecessor of the remount tool"),
-    ("a842d2243efd2f981444844e7682e0235a007f89541009ee23e30da37ae82128",
-     "a tool that writes an ssh config naming one operator's hosts and user"),
-    ("515ca98957dcb7a346961974afb88c1dc77d6bbb836ed5509e55fef56b0930bb",
-     "the bash test of that ssh config tool, which pins its hostnames"),
 )
 
 
@@ -337,6 +333,9 @@ ALLOW["agent-platform"] = (
     ("tests/test_deck_config.py", "an install prefix specific to this machine",
      "b4648fe484eaf1ac6b3ac459d9755e36b414e68182811e990f7a3f1e66dc15c7",
      "the invented install root two config-test fixtures build under"),
+    ("tests/test_worktrees.py", EMAIL, "8e7a2b05a09a07931d721896a66b6648bf9cc39fa80e2b4f65f3cdd6c8e553ab",
+     "the filename SwiftPM gives a manifest specific to Swift 6.0, which a test plants to prove "
+     "the Swift resolve gate refuses it; not an address"),
 )
 
 # What the classifier reads, and which keys it treats as secret-shaped.

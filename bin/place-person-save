@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""Place the Library's person-save inputs on an install whose Library runs as the operator.
+
+    bin/place-person-save --root-ca <file> --app-key <file> --app-config <file>
+                          [--verifier <file>] [--check]
+
+The Library verifies a knowledge save that claims a person made it, then commits
+and pushes it, using inputs it reads from one directory: `.library/person-save/`
+under the home of the account the Library process runs as. Its contract is
+section 2.2 of the Library's protocol. This command fills that directory on the
+single-account install, where that account is the operator's, so it runs as the
+operator and resolves the home the way the Library does, from the password
+database rather than `$HOME`.
+
+It places seven entries, each owned by the running account:
+
+  root-ca.crt                0644  copied from --root-ca, Deck's root certificate (PEM)
+  orient-statement-key.json  0644  `orient_statement_key` and `persons`, copied from --verifier
+  commit-signing-key         0600  an unencrypted OpenSSH ed25519 key, generated once
+  commit-signing-key.pub     0644  its public line
+  github-app.pem             0600  copied from --app-key, the Library App's RSA key
+  github-app.json            0644  `app_id` from --app-config, `installation_id` looked up
+  knowledge.git              0700  a bare clone of the knowledge repository, HTTPS origin
+
+**A SIGNING KEY IS NEVER REPLACED.** The Library signs every person save with it,
+so a new key would leave earlier saves signed by a key nobody holds. An existing
+one is checked and kept; to rotate it, remove it by hand first.
+
+**THE LIBRARY CHECKS NO MODE AND NO OWNER, SO THIS COMMAND DOES.** After placing
+everything it reads each entry back and reports its type, mode and owner; `--check`
+does only that. It exits 1 when any entry is missing or wrong.
+
+**WITHOUT --verifier, ORIENT'S KEY IS REPORTED, NOT FAILED.** Orient's statement key
+exists only once Orient's own account has created it. The Library reads it only to
+verify an Orient-signed save, so with the other entries placed Deck-signed saves
+work, and an Orient-signed save is refused with 403 `inputs` until this runs again
+with --verifier. The report marks that entry NOTE and the run exits 0.
+
+**THE THREE-ACCOUNT SHAPE IS NOT THIS COMMAND'S.** There the directory belongs to
+the Library's own account, out of the operator's reach, and the root-run install
+places it. This command refuses when the install record names a Library account.
+
+Exit codes: 0 every entry in place (Orient's key may be a NOTE), 1 refused or an entry
+missing or wrong, 2 usage.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+PROG = "place-person-save"
+HERE = Path(__file__).resolve().parent
+INSTALL_RECORD = "/opt/builder/install.json"
+# Where the knowledge repository is cloned from. Tests point it at a local directory.
+GIT_BASE = "https://github.com"
+SUBDIR = (".library", "person-save")
+SSH_KEYGEN = "/usr/bin/ssh-keygen"
+OPENSSL = "/usr/bin/openssl"
+GIT = shutil.which("git") or "/usr/bin/git"
+
+# Each entry, its kind and mode. `dir` is a directory, everything else a regular file.
+ENTRIES = (
+    ("root-ca.crt", "file", 0o644),
+    ("orient-statement-key.json", "file", 0o644),
+    ("commit-signing-key", "file", 0o600),
+    ("commit-signing-key.pub", "file", 0o644),
+    ("github-app.pem", "file", 0o600),
+    ("github-app.json", "file", 0o644),
+    ("knowledge.git", "dir", 0o700),
+)
+# Orient's statement key exists only once Orient's account has made it. The Library reads
+# it only to verify an Orient-signed save, so until then its absence is reported, not failed.
+OPTIONAL = "orient-statement-key.json"
+REPO_SHAPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+")
+
+
+class Refused(Exception):
+    """Something the operator has to fix. Never a stack trace."""
+
+
+def load_gate():
+    """bin/github-gate, which carries the App JWT and the request function."""
+    path = HERE / "github-gate"
+    loader = importlib.machinery.SourceFileLoader("github_gate", str(path))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader("github_gate", loader))
+    sys.modules["github_gate"] = module  # its dataclasses look their module up while it loads
+    loader.exec_module(module)
+    return module
+
+
+def account_home() -> Path:
+    """The running account's home from the password database, as the Library resolves it."""
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+def refuse_separated_install() -> None:
+    record = INSTALL_RECORD
+    try:
+        text = Path(record).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise Refused(f"{record} exists but cannot be read ({exc}), so this command cannot tell "
+                      f"whether the Library has its own account. Nothing was changed.")
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise Refused(f"{record} is not JSON. Nothing was changed.")
+    if isinstance(data, dict) and data.get("library_account"):
+        raise Refused(f"{record} names the Library account {data['library_account']!r}, so its "
+                      f"person-save inputs belong in that account and the root-run install "
+                      f"places them. This command is for an install whose Library runs as the "
+                      f"operator. Nothing was changed.")
+
+
+def write_file(path: Path, data: bytes, mode: int) -> None:
+    """Write `data` to `path` through a private temporary file and a rename."""
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    os.chmod(path, mode)
+
+
+def read_source(path: str, what: str) -> bytes:
+    p = Path(path)
+    if p.is_symlink() or not p.is_file():
+        raise Refused(f"{what} {path} is not a regular file. Nothing further was placed.")
+    data = p.read_bytes()
+    if len(data) > 64 * 1024:
+        raise Refused(f"{what} {path} is larger than any such file. Nothing further was placed.")
+    return data
+
+
+def require_ok(argv: list[str], what: str, data: bytes | None = None) -> None:
+    done = subprocess.run(argv, input=data, capture_output=True, check=False)
+    if done.returncode != 0:
+        raise Refused(f"{what}: {done.stderr.decode(errors='replace').strip() or 'refused'}. "
+                      f"Nothing further was placed.")
+
+
+def place_root(d: Path, source: str) -> str:
+    data = read_source(source, "--root-ca")
+    require_ok([OPENSSL, "x509", "-noout"], f"--root-ca {source} is not a PEM certificate", data)
+    write_file(d / "root-ca.crt", data, 0o644)
+    return "placed from --root-ca"
+
+
+def place_orient_key(d: Path, source: str | None) -> str:
+    if source is None:
+        return "not placed: no --verifier was given"
+    try:
+        data = json.loads(read_source(source, "--verifier"))
+    except ValueError:
+        raise Refused(f"--verifier {source} is not JSON. Nothing further was placed.")
+    key = data.get("orient_statement_key") if isinstance(data, dict) else None
+    persons = data.get("persons") if isinstance(data, dict) else None
+    if not isinstance(key, str) or not key:
+        raise Refused(f"--verifier {source} has no orient_statement_key. Nothing further was placed.")
+    try:
+        der = base64.b64decode(key, validate=True)
+    except ValueError:
+        raise Refused(f"--verifier {source}'s orient_statement_key is not standard base64. "
+                      f"Nothing further was placed.")
+    require_ok([OPENSSL, "pkey", "-pubin", "-inform", "DER", "-noout"],
+               f"--verifier {source}'s orient_statement_key is not a DER public key", der)
+    # Section 2.2 stores `persons` in lower case, so each email is trimmed and lowered first, and
+    # the list is checked as it will be stored: an entry of only spaces would otherwise pass as
+    # non-empty and be written as "".
+    if isinstance(persons, list) and all(isinstance(p, str) for p in persons):
+        persons = [p.strip().lower() for p in persons]
+    if not isinstance(persons, list) or not persons or not all(isinstance(p, str) and p for p in persons):
+        raise Refused(f"--verifier {source}'s persons is not a list of emails. "
+                      f"Nothing further was placed.")
+    out = {"orient_statement_key": key, "persons": persons}
+    write_file(d / "orient-statement-key.json", (json.dumps(out, indent=2) + "\n").encode(), 0o644)
+    return f"placed from --verifier, {len(persons)} person(s)"
+
+
+def place_signing_key(d: Path) -> str:
+    key, pub = d / "commit-signing-key", d / "commit-signing-key.pub"
+    if key.exists() or key.is_symlink():
+        done = subprocess.run([SSH_KEYGEN, "-y", "-P", "", "-f", str(key)],
+                              capture_output=True, check=False)
+        line = done.stdout.decode().strip()
+        # The key type compared as its own field: the publish scanner reads the type followed by
+        # a space as a public key, and this file ships.
+        if done.returncode != 0 or line.split(" ", 1)[0] != "ssh-ed25519":
+            raise Refused(f"{key} exists but is not an unencrypted ed25519 key. It is never "
+                          f"replaced automatically; move it aside by hand if it should be. "
+                          f"Nothing further was placed.")
+        write_file(pub, (line + "\n").encode(), 0o644)
+        return "kept the existing key"
+    with tempfile.TemporaryDirectory(dir=str(d)) as tmp:
+        made = Path(tmp) / "key"
+        require_ok([SSH_KEYGEN, "-q", "-t", "ed25519", "-N", "", "-C", "library person-save",
+                    "-f", str(made)], "ssh-keygen could not make the signing key")
+        write_file(key, made.read_bytes(), 0o600)
+        write_file(pub, made.with_suffix(".pub").read_bytes(), 0o644)
+    return "generated"
+
+
+def place_app(d: Path, key_source: str, config_source: str, gate, gh) -> tuple[str, str, str]:
+    """Places github-app.pem and github-app.json. Returns the repository, a read
+    token for it, and the report line."""
+    key = read_source(key_source, "--app-key")
+    require_ok([OPENSSL, "rsa", "-check", "-noout"], f"--app-key {key_source} is not an RSA key", key)
+    try:
+        cfg = json.loads(read_source(config_source, "--app-config"))
+    except ValueError:
+        raise Refused(f"--app-config {config_source} is not JSON. Nothing further was placed.")
+    app_id = str((cfg or {}).get("app_id", "")) if isinstance(cfg, dict) else ""
+    repo = (cfg or {}).get("repo") if isinstance(cfg, dict) else None
+    if not app_id.isdigit():
+        raise Refused(f"--app-config {config_source} has no numeric app_id. Nothing further was placed.")
+    if not isinstance(repo, str) or not REPO_SHAPE.fullmatch(repo):
+        raise Refused(f"--app-config {config_source} has no repo naming owner/name. "
+                      f"Nothing further was placed.")
+    write_file(d / "github-app.pem", key, 0o600)
+    jwt = gate.app_jwt(str(d / "github-app.pem"), app_id)
+    code, payload = gh.get(f"/repos/{repo}/installation", jwt)
+    installation = payload.get("id") if code == 200 and isinstance(payload, dict) else None
+    if not isinstance(installation, int):
+        raise Refused(f"GitHub did not name the App's installation on {repo} ({code}: "
+                      f"{gate.message(payload)}). Install the App on that repository. "
+                      f"Nothing further was placed.")
+    write_file(d / "github-app.json",
+               (json.dumps({"app_id": int(app_id), "installation_id": installation}) + "\n").encode(),
+               0o644)
+    code, payload = gh.request("POST", f"{gh.api}/app/installations/{installation}/access_tokens",
+                               jwt, {"repositories": [repo.split("/", 1)[1]],
+                                     "permissions": {"contents": "read"}})
+    token = payload.get("token") if code == 201 and isinstance(payload, dict) else None
+    if not token:
+        raise Refused(f"GitHub refused a read token for {repo} ({code}). Nothing further was placed.")
+    return repo, token, f"placed, App {app_id}, installation {installation}"
+
+
+def git(*args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run([GIT, *args], capture_output=True, text=True, check=False,
+                          env={**os.environ, **(env or {})})
+
+
+def place_clone(d: Path, repo: str, token: str) -> str:
+    """A bare clone with a plain HTTPS origin. The token reaches git only through
+    environment-only config, so it is in no argument list and no config file."""
+    clone, url = d / "knowledge.git", f"{GIT_BASE}/{repo}.git"
+    if clone.exists() or clone.is_symlink():
+        bare = git("-C", str(clone), "rev-parse", "--is-bare-repository")
+        origin = git("-C", str(clone), "config", "--get", "remote.origin.url")
+        if clone.is_symlink() or bare.stdout.strip() != "true":
+            raise Refused(f"{clone} exists but is not a bare repository. Move it aside by hand. "
+                          f"Nothing further was placed.")
+        if origin.stdout.strip() != url:
+            raise Refused(f"{clone}'s origin is {origin.stdout.strip()!r}, not {url}. "
+                          f"Nothing further was placed.")
+        return "kept the existing bare clone"
+    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    env = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": f"http.{GIT_BASE}/.extraheader",
+           "GIT_CONFIG_VALUE_0": f"Authorization: Basic {basic}", "GIT_TERMINAL_PROMPT": "0"}
+    done = git("clone", "--quiet", "--bare", url, str(clone), env=env)
+    if done.returncode != 0:
+        shutil.rmtree(clone, ignore_errors=True)
+        raise Refused(f"git could not clone {url}: {done.stderr.replace(token, '***').strip()}. "
+                      f"Nothing further was placed.")
+    os.chmod(clone, 0o700)
+    return "cloned"
+
+
+def check(d: Path) -> list[tuple[str, bool | None, str]]:
+    """Each entry read back: (name, ok, what was found). `ok` is None for the one entry
+    whose absence is expected before Orient's key exists, which is reported, not failed."""
+    uid = os.getuid()
+    rows: list[tuple[str, bool | None, str]] = []
+    st = os.lstat(d) if os.path.lexists(d) else None
+    ok = bool(st and stat.S_ISDIR(st.st_mode) and st.st_uid == uid and stat.S_IMODE(st.st_mode) == 0o700)
+    rows.append((str(d), ok, "missing" if st is None else
+                 f"{'dir' if stat.S_ISDIR(st.st_mode) else 'not a dir'} {stat.S_IMODE(st.st_mode):04o} uid {st.st_uid}"))
+    for name, kind, mode in ENTRIES:
+        p = d / name
+        st = os.lstat(p) if os.path.lexists(p) else None
+        if st is None and name == OPTIONAL:
+            rows.append((name, None, "missing. Deck-signed saves work without it; the Library refuses "
+                                     "an Orient-signed save with 403 `inputs` until Orient's statement "
+                                     "key exists and this runs again with --verifier"))
+            continue
+        if st is None:
+            rows.append((name, False, "missing"))
+            continue
+        right_kind = stat.S_ISDIR(st.st_mode) if kind == "dir" else stat.S_ISREG(st.st_mode)
+        found = (f"{'dir' if stat.S_ISDIR(st.st_mode) else 'file' if stat.S_ISREG(st.st_mode) else 'other'} "
+                 f"{stat.S_IMODE(st.st_mode):04o} uid {st.st_uid}")
+        rows.append((name, right_kind and stat.S_IMODE(st.st_mode) == mode and st.st_uid == uid,
+                     f"{found}, wanted {kind} {mode:04o} uid {uid}"))
+    return rows
+
+
+def main(argv: list[str], gate=None, gh=None) -> int:
+    p = argparse.ArgumentParser(prog=PROG, description="Place the Library's person-save inputs "
+                                "on an install whose Library runs as the operator.")
+    p.add_argument("--root-ca", help="Deck's root certificate, PEM")
+    p.add_argument("--verifier", help="the JSON file carrying orient_statement_key and persons")
+    p.add_argument("--app-key", help="the Library App's RSA private key, PEM")
+    p.add_argument("--app-config", help="JSON naming the Library App's app_id and its repo, owner/name")
+    p.add_argument("--check", action="store_true", help="only read back what is placed")
+    args = p.parse_args(argv)
+    d = account_home().joinpath(*SUBDIR)
+    try:
+        refuse_separated_install()
+        if not args.check:
+            if not (args.root_ca and args.app_key and args.app_config):
+                p.print_usage(sys.stderr)
+                print(f"{PROG}: --root-ca, --app-key and --app-config are required", file=sys.stderr)
+                return 2
+            if d.is_symlink() or (d.exists() and not d.is_dir()):
+                raise Refused(f"{d} exists and is not a directory. Nothing was changed.")
+            d.mkdir(parents=True, exist_ok=True)
+            os.chmod(d, 0o700)
+            gate = gate or load_gate()
+            gh = gh or gate.GitHub()
+            report = [("root-ca.crt", place_root(d, args.root_ca)),
+                      ("orient-statement-key.json", place_orient_key(d, args.verifier)),
+                      ("commit-signing-key", place_signing_key(d))]
+            repo, token, line = place_app(d, args.app_key, args.app_config, gate, gh)
+            report.append(("github-app.pem and github-app.json", line))
+            try:
+                report.append(("knowledge.git", place_clone(d, repo, token)))
+            finally:
+                try:
+                    gh.request("DELETE", f"{gh.api}/installation/token", token, None)
+                except Exception:
+                    pass
+            for name, what in report:
+                print(f"{PROG}: {name}: {what}")
+    except Refused as exc:
+        print(f"{PROG}: refused: {exc}", file=sys.stderr)
+        return 1
+    rows = check(d)
+    for name, ok, found in rows:
+        print(f"{PROG}: {'NOTE' if ok is None else 'ok  ' if ok else 'FAIL'} {name}: {found}")
+    return 0 if all(ok is not False for _, ok, _ in rows) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

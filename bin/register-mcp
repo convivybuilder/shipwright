@@ -88,9 +88,12 @@ only place the difference appears, and an unrecognised status is reported as
 
 ## It writes no credentials
 
-The `ops` server needs an agent-class token at `~/.orient-control/ops-mcp-token`.
-The Library's job declaration mints it, once, the first time the install prepares
-the Library, and never replaces it. This command only registers servers.
+This user-scope `ops` entry carries no credential of its own. `bin/co` and
+`bin/agentctl` each pass the crew's own file inline, as `--mcp-config`, at
+launch — `ops-co-<crew>-token` for a crew's session, `ops-<crew>-token` for a
+run dispatched into it — so the entry this command registers works for every
+crew once `mint-crew-ops-credentials` has minted that crew's pair. This
+command only registers servers.
 """
 
 from __future__ import annotations
@@ -519,8 +522,9 @@ def outstanding() -> list[str]:
     """
     return [
         (
-            "The ops server's token is ~/.orient-control/ops-mcp-token, which "
-            "the Library's install step mints once and never replaces."
+            "This user-scope ops entry carries no credential. co and agentctl "
+            "pass a crew's own file by --mcp-config, so a crew's ops tools work "
+            "once mint-crew-ops-credentials has minted its pair."
         ),
         "",
         (

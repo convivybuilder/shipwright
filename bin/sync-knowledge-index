@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""sync-knowledge-index — wait for the Library to answer, then build its knowledge index.
+
+    bin/sync-knowledge-index                wait for the Library, then run `agentctl kb sync`
+    bin/sync-knowledge-index --soft         a sync refusal warns on stderr and exits 0
+    bin/sync-knowledge-index --dry-run      say what would happen, change nothing
+    bin/sync-knowledge-index --check        report only; 1 if the Library is not answering now
+    bin/sync-knowledge-index --status       the same report, changing nothing
+
+**WHY THIS IS ITS OWN STEP.** `agentctl kb sync` asks the Library for the
+project registry over the Library's own HTTP API, so it cannot run from a
+job's `prepare` step: `prepare` runs before the job's service starts, and the
+Library is not yet serving anything. Run there, every document was refused
+with "the project registry could not be read", the index stayed at 0 docs,
+and prepare's own marker stopped it from ever being retried — a rehearsal on
+a fresh, clean machine hit exactly that. `bin/stand-up-backend` now runs this
+after `supervise` has started the Library (with `--activate`), and
+`payload/bin/builder-update` runs it after its own restart step, passing
+`--soft`: an update's index is usually already built, and a sync that
+refuses a diverged local checkout is not a reason to fail the whole update.
+
+The wait and the Library's address are duplicated from
+`payload/bin/builder-update`'s own `library_answers`, on purpose rather than
+imported — that command's own module docstring gives the reason for its
+deploy-stamp reader, and the same reason applies here: a small, stable
+contract is cheaper to repeat than a shared module.
+
+Exit codes: 0 synced (or warned, under --soft), 1 under --check or --status
+when the Library is not answering now, 2 the Library never answered within
+--timeout, or `agentctl kb sync` itself refused and --soft was not given.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+PROG = "sync-knowledge-index"
+
+# The Library's own fixed address, as `payload/docs/after-installing.md` and
+# `payload/bin/builder-update`'s own LIBRARY_URL name it.
+LIBRARY_URL = "http://127.0.0.1:8100"
+WAIT_SECONDS = 30.0
+
+
+def default_deploy_root() -> Path:
+    """The same default `bin/install-backend`, `bin/link-commands` and
+    `payload/bin/builder-update` use."""
+    from_env = os.environ.get("BUILDER_DEPLOY_ROOT")
+    root = Path(from_env) if from_env else (Path.home() / ".local" / "deploy")
+    return root.expanduser()
+
+
+def orient_token_path() -> Path:
+    """Orient's own Library credential, minted by `jobs/library.toml`'s prepare steps."""
+    return Path.home() / ".orient-control" / "library-token"
+
+
+def library_answers(timeout: float, url: str = LIBRARY_URL, token_path: Path | None = None) -> str | None:
+    """None once the Library answers `/whoami` for Orient's credential, else why not.
+
+    `timeout` of 0 makes this a single probe, with no wait — what --check and
+    --status run. The credential reaches `curl` on its standard input, never
+    on its command line, the way `payload/docs/after-installing.md` passes it.
+    """
+    token_path = token_path or orient_token_path()
+    try:
+        token = token_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        return f"cannot read Orient's Library credential at {token_path}: {exc}"
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            result = subprocess.run(
+                ["curl", "-fsS", "--max-time", "5", "-H", "Library-Protocol: 1", "-H", "@-",
+                 f"{url}/whoami"],
+                input=f"Authorization: Bearer {token}\n", capture_output=True, text=True, check=False,
+            )
+            why = None if result.returncode == 0 else (result.stderr.strip() or f"curl exited {result.returncode}")
+        except OSError as exc:
+            why = f"curl could not run: {exc}"
+        if why is None or time.monotonic() >= deadline:
+            return None if why is None else f"the Library did not answer /whoami for Orient's credential: {why}"
+        time.sleep(2)
+
+
+def run_sync(agentctl: Path) -> tuple[int, str]:
+    """`agentctl kb sync`'s exit code and its combined, stripped output."""
+    try:
+        done = subprocess.run([str(agentctl), "kb", "sync"], capture_output=True, text=True,
+                              timeout=300, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 1, str(exc)
+    output = (done.stdout + done.stderr).strip()
+    return done.returncode, output
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG, description="Wait for the Library, then build its knowledge index.",
+    )
+    parser.add_argument("--deploy", type=Path, default=None,
+                        help="deploy root, where agent-platform's agentctl is found "
+                             "(default: $BUILDER_DEPLOY_ROOT or ~/.local/deploy)")
+    parser.add_argument("--timeout", type=float, default=WAIT_SECONDS,
+                        help=f"seconds to wait for the Library to answer (default {WAIT_SECONDS:.0f})")
+    parser.add_argument("--soft", action="store_true",
+                        help="a sync refusal warns on stderr and exits 0, rather than refusing")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--status", action="store_true",
+                      help="whether the Library is answering now; changes nothing")
+    mode.add_argument("--dry-run", action="store_true",
+                      help="say what would happen, change nothing")
+    mode.add_argument("--check", action="store_true",
+                      help="report only; 1 if the Library is not answering now")
+    args = parser.parse_args(argv)
+
+    deploy = args.deploy or default_deploy_root()
+    agentctl = deploy / "agent-platform" / "bin" / "agentctl"
+
+    if args.status or args.check:
+        why = library_answers(0.0)
+        if why is None:
+            print(f"{PROG}: answering: {LIBRARY_URL}/whoami")
+            return 0
+        print(f"{PROG}: not answering: {why}")
+        return 1
+
+    if args.dry_run:
+        print(f"{PROG}: would wait up to {args.timeout:.0f}s for {LIBRARY_URL}/whoami, "
+              f"then run {agentctl} kb sync")
+        return 0
+
+    if not agentctl.is_file():
+        print(f"{PROG}: refusing — no agentctl at {agentctl}; place agent-platform first "
+              f"with bin/install-backend. Nothing was changed.", file=sys.stderr)
+        return 2
+
+    why = library_answers(args.timeout)
+    if why is not None:
+        print(f"{PROG}: refusing — {why}. Nothing was changed.", file=sys.stderr)
+        return 2
+
+    code, output = run_sync(agentctl)
+    if output:
+        print(output)
+    if code == 0:
+        return 0
+    if args.soft:
+        print(f"{PROG}: warning: the knowledge index was not rebuilt, so a dispatch may not "
+              f"find its agent; run `agentctl kb sync` by hand", file=sys.stderr)
+        return 0
+    print(f"{PROG}: refusing — agentctl kb sync exited {code}. Nothing further was changed.",
+          file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

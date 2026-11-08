@@ -106,6 +106,7 @@ SHIPPING = (
     "payload",
     "bin",
     "jobs",
+    "release-signers",
     "tools/check-shipping-licences.py",
     "tools/stale_holders.py",
     "tools/jobs",
@@ -151,6 +152,15 @@ PERSONAL_EXEMPT = (
     ("an IP address", "127.0.0.1", "the loopback address, which names no machine"),
     ("an IP address", "0.0.0.0", "the unspecified address, which names no machine"),
 )
+
+# THE TRUST LIST'S OWN KEYS ARE THE ONE SSH PUBLIC KEY THAT SHIPS ON PURPOSE.
+# `release-signers` is public by design: an adopter's `--verify` needs it. A key
+# is exempt only at the root `release-signers`, and only where it follows this
+# exact principal and namespace at the start of its line, so a key in a comment
+# there, or anywhere else in the tree, is still refused. The recovery key is
+# ED25519, which the SSH-key pattern matches; the ECDSA release key never did.
+TRUST_LIST = Path("release-signers")
+TRUST_LIST_ENTRY = 'release@convivy namespaces="builder-release" '
 
 # THE EXACT FIRST LINE THAT MARKS A PAGE AS HAND-WRITTEN FOR PUBLICATION. An
 # operator who writes a page themselves and signs it is making their own
@@ -618,6 +628,11 @@ def personal_information(tree: Path) -> tuple[list[str], list[str]]:
                 # forge's name or a `git` mailbox on a personal domain.
                 if (what == "an email address"
                         and found + text[match.end():match.end() + 1] == GIT_REMOTE):
+                    continue
+                line_start = text.rfind("\n", 0, match.start()) + 1
+                if (what == "an SSH public key"
+                        and path.relative_to(tree) == TRUST_LIST
+                        and text[line_start:match.start()] == TRUST_LIST_ENTRY):
                     continue
                 # The category and place, never the match: a refusal's text
                 # gets passed along, and quoting a token or an address there

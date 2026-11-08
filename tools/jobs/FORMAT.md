@@ -61,7 +61,7 @@ delay-seconds = 10
 | `scope` | `user` or `system`; decides LaunchAgents against LaunchDaemons, and a user unit against a system one |
 | `enabled-by-default` | whether a fresh install starts this job |
 | `working-directory` | optional |
-| `[log]` | `stdout` and `stderr` paths; both optional. On a two-account install a system-scope job that runs as an account ignores them and logs to `/opt/builder/var/log/<label>.out` and `<label>.err` |
+| `[log]` | `stdout` and `stderr` paths; both optional. On a three-account install a system-scope job that runs as an account ignores them and logs to `/opt/builder/var/log/<label>.out` and `<label>.err` |
 | `[environment]` | string to string |
 | `[schedule]` | `at-load`, `every-seconds`, and `[[schedule.calendar]]` entries |
 | `[restart]` | `policy` of `always`, `on-failure` or `never`, and `delay-seconds` |
@@ -155,7 +155,7 @@ A system-scope job without one renders as before and runs as root. A system-scop
 `directories` and `prepare` steps as that account, under root's install. `jobs-lint import` reads `UserName`
 from a property list as `account` on a system-scope job.
 
-A run as root leaves out a user-scope job that names no account. The two-account shape runs `install-jobs`
+A run as root leaves out a user-scope job that names no account. The three-account shape runs `install-jobs`
 as root with `--home` set to the agents account's home, so such a job would be written there. `install-jobs`
 names each job it leaves out and installs nothing for it. `--single-account` installs it for the operator.
 

@@ -11,8 +11,9 @@
 **This is the provisioning half of standing the backend up**, and it is
 deliberately only that half. A clean Ubuntu 22.04 machine is missing `zsh`,
 `lsof`, `tmux`, `git`, `curl`, a Python new enough to read a job
-declaration, that Python's venv support, and the `getfacl` the Library's
-start-up guard reads ACLs with — measured by running Builder's backend
+declaration, that Python's venv support, the `getfacl` the Library's
+start-up guard reads ACLs with, and `bubblewrap` and `socat`, which a
+dispatched run's sandbox needs on Linux — measured by running Builder's backend
 repositories in a container, not by reading them. Those are one installer's work and they are
 this crew's to do. What it does NOT do is fix code that names one machine, or
 make the Library's ownership guard portable: those belong to the crews that
@@ -184,6 +185,27 @@ NEEDS = (
         "proof": ["getfacl", "--absolute-names", "--omit-header", "/"],
         "expects": "other::",
         "shows": "getfacl --absolute-names --omit-header / (listing other::)",
+    },
+    {
+        # A dispatched run's sandbox refuses to start without these two,
+        # named in its own words: "sandbox required but unavailable: bubblewrap
+        # (bwrap) not installed, socat not installed". A clean Debian 12
+        # container had neither — measured the same way as the rest of this
+        # table, by running the dispatch and reading what it refused on.
+        #
+        # LINUX ONLY, WHICH IS WHY THERE IS NO `brew` KEY. macOS sandboxes a
+        # run with Seatbelt, which the system carries; `plan()` leaves out any
+        # requirement with no package for the platform.
+        "program": "bwrap",
+        "why": "a dispatched run's sandbox is bubblewrap on Linux",
+        "apt": "bubblewrap",
+        "proof": ["bwrap", "--version"],
+    },
+    {
+        "program": "socat",
+        "why": "a dispatched run's sandbox uses socat on Linux",
+        "apt": "socat",
+        "proof": ["socat", "-V"],
     },
 )
 
@@ -467,8 +489,9 @@ def operator_key_step(args, parser) -> int:
     try:
         pwd.getpwnam(AGENTS)
     except KeyError:
-        raise Refused(f"the `{AGENTS}` account does not exist. Run `sudo bin/provision-accounts` "
-                      f"first. Nothing was changed.")
+        raise Refused(f"the `{AGENTS}` account does not exist. Run "
+                      f"`sudo bin/provision-accounts` with the shape this install uses "
+                      f"(`--shape two` or `--shape three`) first. Nothing was changed.")
     key = read_operator_key(args.operator_key)
     if args.dry_run or args.check:
         print(f"would add the key in {args.operator_key} to the `{AGENTS}` account's "

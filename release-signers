@@ -1,0 +1,19 @@
+# The trust list `bin/builder-install --verify` reads to check a release
+# manifest's signature, in OpenSSH's allowed-signers format (see
+# ssh-keygen(1), "ALLOWED SIGNERS").
+#
+# It lists the release key, which signs every release and lives in a Secure
+# Enclave, where it cannot be copied out, and the recovery key, kept offline
+# and used only to replace or revoke the release key.
+#
+# Each line reads:
+#
+#   release@convivy namespaces="builder-release" <key-type> <base64-key> [comment]
+#
+# one line for the release key, one for the recovery key. Both carry the
+# single principal `release@convivy` and the `builder-release` namespace;
+# `--verify` always passes `-I release@convivy -n builder-release` itself
+# and never reads a principal or namespace from anywhere else, so an option
+# here can only narrow which signature is accepted, never widen it.
+release@convivy namespaces="builder-release" ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBPXJRkgcZoBQvN+PnSaodswY81L73wv/38bo5W7HOxAZc3l2Bf62iDeN3fmdurp1s80IqttbMWia3HDLp8ELAXk= builder-release
+release@convivy namespaces="builder-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFXToK2msiz9YEUK+Q9lR/S0o5lHBBPiJKrcOOXiIhIq builder-recovery

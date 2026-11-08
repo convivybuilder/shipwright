@@ -5,6 +5,13 @@ Everything runs as that account. These steps were run on macOS 26.4 by a standar
 whose administrator is someone else, except where a step says it was not run. The install has not
 been run on a clean Mac.
 
+**The one-command install does the next two sections' program installs itself, where it can.** If an
+administrator is at the keyboard (or Homebrew is already there) when you run it, skip ahead to [Run
+the install](#run-the-install); [Installing Builder's one-command section](installing.md#the-one-command)
+says exactly what it installs and how. This page's own steps remain the route for an account with no
+administrator rights and no Homebrew already there, which has no install route at all, and signing
+in to Claude Code by running `claude` once is always a person's own act, on every route.
+
 Two people take part, the Mac's administrator and the owner of the account Builder will run in. If
 you are both, do both parts. The page has five parts, in this order:
 

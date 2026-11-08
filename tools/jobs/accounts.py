@@ -70,7 +70,8 @@ def require(name: str, source: str, directory: Directory = lookup) -> Account:
     if account is None:
         raise AccountMissing(
             f"{source}: the job runs as account {name!r}, which this machine's "
-            f"directory service does not have. Run provision-accounts to create "
+            f"directory service does not have. Run provision-accounts with the "
+            f"shape this install uses (--shape two or --shape three) to create "
             f"it, then install again."
         )
     for field_name, value in (("group", account.group), ("home", account.home)):

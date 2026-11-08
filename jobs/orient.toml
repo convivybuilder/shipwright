@@ -25,10 +25,6 @@ stderr = "{state}/orient.log"
 HOME = "{home}"
 ORIENT_CONFIG_ROOT = "{state}/orient"
 ORIENT_STATE_ROOT = "{state}/orient"
-# The projects registry the policy page and its write route list crews from.
-# Without it Orient falls back to a path under the home directory that an
-# install from Builder's repositories never creates.
-PROJECTS_JSON = "{deploy}/agent-platform/config/projects.json"
 PATH = "{bin}:/usr/bin:/bin"
 
 [schedule]

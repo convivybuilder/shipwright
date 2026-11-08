@@ -19,18 +19,18 @@ not need to have written a program before.
   commands, and on a Mac the application is called Terminal.
 - **An account of your own on each machine.** This release installs only the single-account shape,
   which runs Builder on the server as one account, yours; Deck runs on the laptop as your account
-  there. The two-account install, which comes in a later release, runs Builder on the server under
+  there. The three-account install, which comes in a later release, runs Builder on the server under
   two accounts of its own and needs the server's administrator password to create them. Both are
   explained under Install, below.
 - **Claude Code, signed in to your Claude account.** Claude Code is the program that lets you talk
   with Claude, an AI model, in a terminal. Every Builder session is a conversation with Claude in a
   terminal.
-- **A GitHub account, for the two-account install**, which keeps its merge gate on GitHub. GitHub
+- **A GitHub account, for the three-account install**, which keeps its merge gate on GitHub. GitHub
   is a website that stores a project's files and history, and the merge gate is the rule that a
   change must pass review before it is accepted. The single-account install can start without a
   GitHub account.
 
-On the two-account install, Homebrew installs anything else Builder needs; Homebrew is a free
+On the three-account install, Homebrew installs anything else Builder needs; Homebrew is a free
 program for the Mac that installs other programs. The single-account install names anything missing
 for you to install. [What you need](what-you-need.md) covers the rest: the machine that keeps
 working while your laptop is shut, the accounts Builder acts through, and where the apps you build
@@ -38,11 +38,11 @@ can live.
 
 ## Install
 
-Builder installs from a terminal with a single Homebrew command, which this page will give once
-Builder is public, and you name the install's shape as you run it. The shape decides which user
+Builder installs from a terminal with one command, which [Installing Builder](installing.md#the-one-command)
+gives along with a Homebrew route for a Mac, and you name the install's shape as you run it. The shape decides which user
 account on the server Builder runs as, and there are two.
 
-- **The two-account install** creates two accounts, `agents`, which runs Builder, and `reviewers`,
+- **The three-account install** creates two accounts, `agents`, which runs Builder, and `reviewers`,
   which runs the agents that review a change, and asks you to turn on Remote Login for `agents` if
   it is off. Remote Login is the Mac setting that allows a login over SSH, which the next section
   uses. The install puts everything Builder owns under one folder in the `agents` account,
@@ -50,11 +50,11 @@ account on the server Builder runs as, and there are two.
 - **The single-account install** creates no account and puts `~/builder` in your own account.
 
 Today the single-account install is the only shape built, and [Installing Builder](installing.md)
-gives its steps. Once the two-account install is built, choose it when you have the administrator
+gives its steps. Once the three-account install is built, choose it when you have the administrator
 password, because it keeps the agents away from your own files and credentials. The first install
 names the folder where you meet the steward. [One account vs. multiple
-accounts on the server](accounts-on-the-server.md) says how the two shapes differ, and why the
-two-account install does not run Builder as you.
+accounts on the server](accounts-on-the-server.md) says how the shapes differ, and why the
+three-account install does not run Builder as you.
 
 ## Meet the steward
 

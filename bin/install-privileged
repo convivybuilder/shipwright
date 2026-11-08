@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
-"""The root-owned half of Builder's install: the review launcher, the reviewers'
-tools and the one sudo rule that reaches the launcher.
+"""The root-owned half of Builder's install.
 
-    sudo <absolute python3> -I /opt/builder/src/shipwright@<sha>/bin/install-privileged --org <name>
-        [--agent-platform-repo <name>] [--shipwright-repo <name>]
-        [--commit <repo>=<sha>]... [--consent ask|yes|no]
+    sudo <absolute python3> -I /opt/builder/src/shipwright@<sha>/bin/install-privileged \
+        --shape two --org <name> --release <tag> [--shipwright-repo <name>]
+    sudo <absolute python3> -I /opt/builder/src/shipwright@<sha>/bin/install-privileged \
+        --shape three --org <name> [--release <tag>] [--agent-platform-repo <name>] \
+        [--shipwright-repo <name>] [--library-repo <name>] [--commit <repo>=<sha>]... \
+        [--consent ask|yes|no]
     sudo /opt/builder/libexec/update-privileged
+
+`--shape two` installs the shipwright-only root half: the bare copy, the extracted
+tree, the install record, the settings and the entry point. It fetches shipwright
+anonymously over HTTPS from the organisation `install.json` records, takes the
+release by tag, and never fetches agent-platform or library. It places no review
+launcher, no sudo rule, no approver key and no reviewers' tools.
+
+`--shape three` installs the three-account root half: the review launcher, the
+reviewers' tools, the one sudo rule that reaches the launcher, and a root-owned
+tree and record line for library. Nothing yet reads that tree.
 
 **This runs only from its own extracted tree.** It refuses unless its file sits at
 `<prefix>/src/shipwright@<sha>/bin/install-privileged` and every directory from the
@@ -15,21 +27,31 @@ does the extraction, so the tree belongs to root:
 
     sudo mkdir -p /opt/builder/src/shipwright@<sha>
     git -C <checkout> archive <sha> | sudo tar -x -C /opt/builder/src/shipwright@<sha>
-    sudo <absolute python3> -I /opt/builder/src/shipwright@<sha>/bin/install-privileged --org <name>
+    sudo <absolute python3> -I /opt/builder/src/shipwright@<sha>/bin/install-privileged --shape two ...
 
 A tree the operator's own account extracted is refused, because its files belong to that
 account. The check runs before `github-gate` is loaded, because `github-gate` sits beside
 this file.
 
-**Root installs only what GitHub confirms is on `main`.** For each repository it
-mints a read token from the approver key, fetches `refs/heads/main` alone into a
-bare copy under `<prefix>/src`, and revokes the token. The commit it installs is the
-fetched head, or the one named with `--commit <repo>=<sha>`, which is refused unless
-it is an ancestor of that fetched `main`. Each commit is extracted with `git archive`
-into its own root-owned tree, refused if it holds a symbolic link, a submodule or any
-other special entry. Everything placed comes from those trees alone, read without
-following a link. Nothing under the `agents` home or a deploy area is read, except
-the instruction-file diff that the operator is shown and may consent to.
+**Root installs only a commit confirmed by a signed release, or by GitHub's own `main`.**
+With a release tag — named by `--release`, or the tag a prior anonymous install of this
+shape recorded, read when `--release` is not given — root fetches shipwright,
+agent-platform and (on the three-account shape) library anonymously over HTTPS, each by
+that tag, following a four-step order (ls-remote, recorded-tag check, fetch without
+force, peel and ancestry) so a tag moved backward, or a recorded tag moved forward, is
+refused. On the three-account shape, naming a tag with `--release` also requires
+`--commit <repo>=<sha>` for every one of the three repositories, each checked against
+the tag's own commit before anything is fetched from that repository; a mismatch is
+refused and chooses nothing. The two-account shape always takes this path. With no tag
+at all — the three-account shape's only other case — root instead mints a read token
+from the approver key for each repository, fetches `refs/heads/main` alone into a bare
+copy under `<prefix>/src`, and revokes the token; the commit it installs is the fetched
+head, or the one named with `--commit <repo>=<sha>`, refused unless it is an ancestor of
+that fetched `main`. Each commit is extracted with `git archive` into its own root-owned
+tree, refused if it holds a symbolic link, a submodule or any other special entry.
+Everything placed comes from those trees alone, read without following a link. Nothing
+under the `agents` home or a deploy area is read, except the instruction-file diff that
+the operator is shown and may consent to on the three-account shape.
 
 **Nothing live changes until everything is built.** The launcher, library, sudo
 rule, reviewers' tools and venv are staged beside their live paths and checked. Only
@@ -41,9 +63,10 @@ newer shipwright commit is installed by running that commit's copy, and the entr
 point moves only when that copy succeeds.
 
 **Settings persist, and only the settings that name this install do.** The first
-run writes `install.json` beside the slots: the organisation and the repository
-names. Test settings never persist. They come from `fixtures.json` under the prefix,
-and only where the prefix is not the real install root.
+run writes `install.json` beside the slots: the organisation, the repository names
+(shipwright, agent-platform and, on the three-account shape, library) and the shape.
+Test settings never persist. They come from `fixtures.json` under the prefix, and only
+where the prefix is not the real install root.
 """
 
 from __future__ import annotations
@@ -65,6 +88,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import urllib.request
 
 HERE_FILE = pathlib.Path(__file__).resolve()
@@ -123,7 +147,7 @@ gg = _load_sibling("github_gate", "github-gate")
 Refused = gg.Refused
 
 ACCOUNT = "agents"
-ROLES = ("agent-platform", "shipwright")
+ROLES = ("agent-platform", "library", "shipwright")
 MAIN = "refs/heads/main"
 CONFIG = "install.json"
 FIXTURES = "fixtures.json"
@@ -163,6 +187,15 @@ CLAUDE_PLATFORMS = {
 # How long the pinned binary gets to answer --version before it is refused.
 CLAUDE_VERSION_TIMEOUT = 120
 
+# The pinned standalone CPython for the Mac's three-account install:
+# python-build-standalone release 20261026, checked against that release's own
+# SHA256SUMS file.
+PYTHON_VERSION = "3.11.18"
+PYTHON_URL = ("https://github.com/astral-sh/python-build-standalone/releases/download/"
+              "20261026/cpython-3.11.18%2B20261026-aarch64-apple-darwin-"
+              "install_only_stripped.tar.gz")
+PYTHON_SHA256 = "f3e1cd83a7f1d70e58b0d69102c18bd6867d2f973068dc5cbfd5822e445c66df"
+
 SHA = re.compile(r"[0-9a-f]{40}")
 COMMIT_ARG = re.compile(r"([A-Za-z0-9._-]+)=([0-9a-f]{40})")
 ORG = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?")
@@ -174,6 +207,7 @@ DEFAULTS = {
     "github_base": "https://github.com",
     "agent_platform_repo": "agent-platform",
     "shipwright_repo": "shipwright",
+    "library_repo": "library",
     "download_base": DEFAULT_DOWNLOAD_BASE,
     "api_base": gg.API,
     "sudoers_dir": DEFAULT_SUDOERS_DIR,
@@ -183,8 +217,14 @@ DEFAULTS = {
     "homes": {},
     "require_root": True,
 }
-# What install.json keeps. Every other setting is a test setting.
-PERSISTED = ("org", "agent_platform_repo", "shipwright_repo")
+# What install.json keeps. Every other setting is a test setting. An install.json
+# written before library_repo existed has none, and still loads: merged_config
+# fills it from DEFAULTS.
+PERSISTED = ("org", "agent_platform_repo", "shipwright_repo", "library_repo", "shape")
+# Shape two fetches only shipwright and never agent-platform, so its record
+# names neither. The three keys are the organisation, the repository name and
+# the shape, as the plan's Handoff sets out.
+PERSISTED_TWO = ("org", "shipwright_repo", "shape")
 # What fixtures.json may name. Honoured only where the prefix is not the real root.
 FIXTURE_KEYS = ("github_base", "download_base", "api_base", "interpreter", "sudoers_dir",
                 "visudo", "pip_args", "homes", "require_root")
@@ -196,12 +236,19 @@ def token() -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog=PROG, description="The root-owned half of Builder's install.")
+    p.add_argument("--shape", choices=("two", "three"), default=None,
+                   help="the install shape: two (shipwright-only root half) or three "
+                        "(the review launcher, reviewers' tools and sudo rule)")
+    p.add_argument("--release", default=None, metavar="TAG",
+                   help="the release tag to install (shape two, or shape three fetched "
+                        "anonymously)")
     p.add_argument("--org", help="the GitHub organisation that holds the repositories")
     p.add_argument("--agent-platform-repo", help="the agent-platform repository's name")
     p.add_argument("--shipwright-repo", help="the shipwright repository's name")
+    p.add_argument("--library-repo", help="the library repository's name (shape three)")
     p.add_argument("--commit", action="append", default=[], metavar="REPO=SHA",
                    help="install this commit of REPO instead of its main (repeatable)")
-    p.add_argument("--consent", choices=("ask", "yes", "no"), default="ask",
+    p.add_argument("--consent", choices=("ask", "yes", "no"), default=None,
                    help="answer the instruction-file question without asking")
     return p
 
@@ -367,11 +414,14 @@ def merged_config(stored: dict, fixtures: dict, args: argparse.Namespace) -> dic
                       f"Nothing was changed.")
     cfg = {**DEFAULTS, **{k: stored[k] for k in PERSISTED if k in stored}, **fixtures}
     for key, value in (("org", args.org), ("agent_platform_repo", args.agent_platform_repo),
-                       ("shipwright_repo", args.shipwright_repo)):
+                       ("shipwright_repo", args.shipwright_repo), ("library_repo", args.library_repo),
+                       ("shape", args.shape)):
         if value is not None:
             cfg[key] = value
     if not cfg.get("org") or not ORG.fullmatch(cfg["org"]):
         raise Refused("name the GitHub organisation with --org (a single name, no slash).")
+    if cfg.get("shape") not in ("two", "three"):
+        raise Refused("name the install shape with --shape two or --shape three.")
     if not str(cfg["download_base"]).startswith(("https://", "http://")):
         raise Refused("the Claude download base must be an http or https URL.")
     if not cfg.get("interpreter"):
@@ -494,6 +544,134 @@ def is_on_main(bare: str, sha: str) -> bool:
     return git_in(bare, "merge-base", "--is-ancestor", sha, MAIN).returncode == 0
 
 
+# The shape-two fetch: anonymous HTTPS, release by tag, four-step order.
+
+TAG = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)(\.?[0-9]+)?)?$")
+
+
+def remote_tag_commit(url: str, tag: str) -> str:
+    """The commit the remote's tag resolves to, read with `git ls-remote` under the
+    cleared environment. Takes the peeled line (`refs/tags/<tag>^{}`) for an
+    annotated tag; the unpeeled line names the tag object. Changes no local ref."""
+    done = git_in("", "ls-remote", "--quiet", url,
+                  f"refs/tags/{tag}", f"refs/tags/{tag}^{{}}")
+    if done.returncode:
+        raise Refused(f"git could not read tag {tag} from {url}: {tail(done.stderr)}. "
+                      f"Nothing was fetched.")
+    peeled = None
+    for line in done.stdout.decode().splitlines():
+        fields = line.split(None, 1)
+        if len(fields) == 2 and fields[1] == f"refs/tags/{tag}^{{}}":
+            peeled = fields[0]
+            break
+    if peeled is None:
+        for line in done.stdout.decode().splitlines():
+            fields = line.split(None, 1)
+            if len(fields) == 2 and fields[1] == f"refs/tags/{tag}":
+                peeled = fields[0]
+                break
+    if not peeled or not SHA.fullmatch(peeled):
+        raise Refused(f"tag {tag} is not on {url}, or does not resolve to a commit. "
+                      f"Nothing was fetched.")
+    return peeled
+
+
+def recorded_tag(records: str, name: str, tag: str) -> str | None:
+    """The commit `src/installed` records for `name`'s `tag`, or None when the pair is new.
+
+    Each repository's tag resolves to a different commit, so the record names the
+    repository: `tag <repo> <tag> <sha>`. A line with no repository name (the format
+    before this check existed) never matches, and is read by nothing here."""
+    for line in records.splitlines():
+        fields = line.split()
+        if len(fields) == 4 and fields[0] == "tag" and fields[1] == name and fields[2] == tag:
+            if SHA.fullmatch(fields[3]):
+                return fields[3]
+    return None
+
+
+def last_recorded_commit(records: str, name: str) -> str | None:
+    """The last commit `src/installed` recorded for `name`, or None on a first install."""
+    for line in records.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0] == name and SHA.fullmatch(fields[1]):
+            return fields[1]
+    return None
+
+
+def fetch_tag(bare: str, url: str, tag: str) -> None:
+    """Fetch `main` and the tag without force, so a tag that moved on the remote is
+    refused rather than overwritten. A failed fetch is a refusal; root never retries
+    with force."""
+    done = git_in(bare, "fetch", "--no-write-fetch-head", "--quiet", url,
+                  f"{MAIN}:{MAIN}", f"refs/tags/{tag}:refs/tags/{tag}")
+    if done.returncode:
+        raise Refused(f"git could not fetch tag {tag} from {url}: {tail(done.stderr)}. "
+                      f"Nothing was installed from it.")
+
+
+def peeled_tag_commit(bare: str, tag: str) -> str:
+    """The commit the fetched tag resolves to, peeled with `rev-parse`."""
+    done = git_in(bare, "rev-parse", "--verify", "--quiet", f"refs/tags/{tag}^{{commit}}")
+    if done.returncode:
+        raise Refused(f"the fetched tag {tag} does not resolve to a commit. "
+                      f"Nothing was installed.")
+    return done.stdout.decode().strip()
+
+
+def is_ancestor(bare: str, ancestor: str, descendant: str) -> bool:
+    return git_in(bare, "merge-base", "--is-ancestor", ancestor, descendant).returncode == 0
+
+
+def parse_release_tag(value: str) -> str:
+    """Normalise and validate a `--release` value into a `v<semver>` tag."""
+    tag = value[1:] if value.startswith("v") else value
+    if not TAG.fullmatch(f"v{tag}"):
+        raise Refused(f"'{value}' is not a release tag. Pass --release with a tag "
+                      f"such as v1.0.0. Nothing was changed.")
+    return f"v{tag}"
+
+
+def fetch_release_tag(bare: str, name: str, url: str, tag: str, prior_records: str,
+                      expected: str | None = None) -> str:
+    """One repository's tag, fetched by the four-step order (ls-remote, recorded-tag
+    check, fetch without force, peel and ancestry): a tag moved backward, or a recorded
+    tag moved forward, is refused. `expected`, when given, is the commit `--commit` named
+    for `name`; a mismatch with the remote's own tag is refused before anything is
+    fetched from this repository, and chooses nothing. Returns the peeled commit."""
+    # Step 1: read the tag's commit from the remote. Changes no local ref.
+    remote_commit = remote_tag_commit(url, tag)
+    print(f"remote: tag {tag} -> {remote_commit}")
+
+    if expected is not None and expected != remote_commit:
+        raise Refused(f"--commit named {expected} for {name}, and {url}'s tag {tag} names "
+                      f"{remote_commit}. Nothing was fetched.")
+
+    # Step 2: refuse a recorded tag name that now names a different commit, fetching nothing.
+    prior = recorded_tag(prior_records, name, tag)
+    if prior is not None and prior != remote_commit:
+        raise Refused(f"tag {tag} was recorded at {prior} for {name}, and {url} now names "
+                      f"{remote_commit}. A recorded tag that moved is refused. Nothing was fetched.")
+
+    # Step 3: fetch main and the tag without force. A failed fetch is a refusal.
+    ensure_bare(bare)
+    fetch_tag(bare, url, tag)
+
+    # Step 4: peel, verify against the remote commit, and check ancestry.
+    peeled = peeled_tag_commit(bare, tag)
+    if peeled != remote_commit:
+        raise Refused(f"the fetched tag {tag} of {name} resolves to {peeled}, but the remote "
+                      f"named {remote_commit}. Nothing was installed.")
+    if not is_on_main(bare, peeled):
+        raise Refused(f"{peeled} (tag {tag}) is not on {MAIN} of {name}. Nothing was installed.")
+    last_commit = last_recorded_commit(prior_records, name)
+    if last_commit is not None and not is_ancestor(bare, last_commit, peeled):
+        raise Refused(f"{peeled} (tag {tag}) does not descend from {last_commit}, the commit this "
+                      f"install last recorded for {name}. A tag moved backward is refused. "
+                      f"Nothing was installed.")
+    return peeled
+
+
 def extract(prefix: str, bare: str, name: str, sha: str) -> str:
     """The tree of `name` at `sha`, root-owned. An existing tree for the same SHA is the same tree."""
     dest = os.path.join(prefix, "src", f"{name}@{sha}")
@@ -556,7 +734,7 @@ def home_of(cfg: dict, account: str) -> str:
         value = fields[5] if done.returncode == 0 and len(fields) > 5 else ""
     if not value.startswith("/"):
         raise Refused(f"the directory service has no account {account}. Create it with "
-                      f"bin/provision-accounts first.")
+                      f"bin/provision-accounts --shape three first.")
     return value
 
 
@@ -675,6 +853,119 @@ def fetch_claude(cfg: dict, ap_tree: str) -> tuple[str, str]:
     return scratch, text.strip()
 
 
+# The pinned macOS Python (decision 3): a checksum-verified standalone CPython,
+# extracted under the prefix so a service account's venv can be built on an
+# interpreter `agents` cannot change.
+
+def checked_tar_members(dest: str, tar: tarfile.TarFile) -> list:
+    """Every member of `tar`, refused if its own path escapes `dest`, or if a symbolic
+    link's target does. Unlike extract()'s git trees, where any link at all is refused,
+    a symbolic link that stays inside `dest` is kept: the archive's own links (such as
+    `bin/python3`) must reach their targets in the extracted tree."""
+    members = []
+    for member in tar.getmembers():
+        name = member.name
+        if os.path.isabs(name):
+            raise Refused(f"{name} in the Python archive is an absolute path. Nothing was changed.")
+        target = os.path.normpath(os.path.join(dest, name))
+        if target != dest and not target.startswith(dest + os.sep):
+            raise Refused(f"{name} in the Python archive escapes {dest}. Nothing was changed.")
+        if member.issym():
+            link = member.linkname
+            resolved = (os.path.normpath(link) if os.path.isabs(link)
+                       else os.path.normpath(os.path.join(os.path.dirname(target), link)))
+            if resolved != dest and not resolved.startswith(dest + os.sep):
+                raise Refused(f"{name} in the Python archive links outside {dest}. "
+                              f"Nothing was changed.")
+        members.append(member)
+    return members
+
+
+def pinned_python_prints(interpreter: str) -> bool:
+    """True when `interpreter --version` reports exactly PYTHON_VERSION."""
+    try:
+        ran = subprocess.run([interpreter, "--version"], env=CLEAN_ENV, cwd="/",
+                             capture_output=True, timeout=CLAUDE_VERSION_TIMEOUT, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if ran.returncode:
+        return False
+    words = ran.stdout.decode("utf-8", "replace").split()
+    return len(words) >= 2 and words[0] == "Python" and words[1] == PYTHON_VERSION
+
+
+def fetch_pinned_python(prefix: str) -> str:
+    """Download the pinned Python tarball to a root-owned scratch file under `prefix`,
+    checking its sha256 before anything is opened. Returns the scratch path; the
+    caller removes it."""
+    scratch_dir = os.path.join(prefix, "scratch")
+    make_dir(scratch_dir, 0o700)
+    scratch = os.path.join(scratch_dir, f"python-{token()}.tar.gz")
+    fd = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    digest = hashlib.sha256()
+    with os.fdopen(fd, "wb") as out:
+        os.fchown(fd, gg.ROOT_UID, gg.ROOT_GID)
+        try:
+            with urllib.request.urlopen(PYTHON_URL, timeout=600) as resp:
+                for chunk in iter(lambda: resp.read(1 << 20), b""):
+                    digest.update(chunk)
+                    out.write(chunk)
+        except OSError as exc:
+            os.unlink(scratch)
+            raise Refused(f"could not download {PYTHON_URL}: {exc}. Nothing was changed.")
+    got = digest.hexdigest()
+    if got != PYTHON_SHA256:
+        os.unlink(scratch)
+        raise Refused(f"{PYTHON_URL} has sha256 {got}, and the pin says {PYTHON_SHA256}. "
+                      f"Nothing was changed, and the download was deleted.")
+    return scratch
+
+
+def install_pinned_python(cfg: dict) -> None:
+    """On a Mac, extract the pinned CPython standalone build under the prefix, so a
+    service account's venv can be built on an interpreter `agents` cannot change.
+    Linux installs nothing here: root's system interpreter already passes
+    serve.sh's walk. A directory already there, with a passing version check,
+    needs no download."""
+    if platform_mod.system() != "Darwin":
+        return
+    prefix = cfg["prefix"]
+    pydir = os.path.join(prefix, "python")
+    dest = os.path.join(pydir, PYTHON_VERSION)
+    interpreter = os.path.join(dest, "bin", "python3.11")
+    if os.path.lexists(dest):
+        if not os.path.isdir(dest) or os.path.islink(dest):
+            raise Refused(f"{dest} is not a plain directory. Nothing was changed.")
+        if pinned_python_prints(interpreter):
+            return
+        raise Refused(f"{dest} exists, and {interpreter} does not report {PYTHON_VERSION}. "
+                      f"Fix or remove it by hand. Nothing was changed.")
+    make_dir(pydir, 0o755)
+    scratch = fetch_pinned_python(prefix)
+    staged_parent = f"{dest}.tmp-{token()}"
+    os.mkdir(staged_parent, 0o755)
+    try:
+        with tarfile.open(scratch, "r:gz") as tar:
+            tar.extractall(path=staged_parent, members=checked_tar_members(staged_parent, tar))
+    except BaseException:
+        os.unlink(scratch)
+        shutil.rmtree(staged_parent, ignore_errors=True)
+        raise
+    os.unlink(scratch)
+    extracted = os.path.join(staged_parent, "python")
+    if not os.path.isdir(extracted) or os.path.islink(extracted):
+        shutil.rmtree(staged_parent, ignore_errors=True)
+        raise Refused("the Python archive has no top-level python/ directory. Nothing was changed.")
+    own_tree(extracted)
+    os.rename(extracted, dest)
+    shutil.rmtree(staged_parent, ignore_errors=True)
+    if not pinned_python_prints(interpreter):
+        shutil.rmtree(dest, ignore_errors=True)
+        raise Refused(f"{interpreter} does not report {PYTHON_VERSION} after being installed. "
+                      f"Nothing is left at {dest}.")
+    print(f"python: {PYTHON_VERSION} at {dest}")
+
+
 def stage_reviewers(cfg: dict, args, ap_tree: str, sw_tree: str, plan: Plan) -> None:
     rv = os.path.join(cfg["prefix"], "reviewers")
     make_dir(rv, 0o755)
@@ -697,17 +988,23 @@ def stage_reviewers(cfg: dict, args, ap_tree: str, sw_tree: str, plan: Plan) -> 
 
 # The updater and the handoff.
 
-def write_updater(prefix: str, interpreter: str, sha: str) -> None:
+def write_updater(prefix: str, interpreter: str, sha: str, shape: str) -> None:
     target = os.path.join(prefix, "src", f"shipwright@{sha}", "bin", "install-privileged")
     text = (f"#!/bin/sh\n"
-            f"exec {' '.join(ENTRY_ARGV)} {shlex.quote(interpreter)} -I {shlex.quote(target)}\n")
+            f"exec {' '.join(ENTRY_ARGV)} {shlex.quote(interpreter)} -I {shlex.quote(target)} "
+            f"--shape {shape}\n")
     write_atomic(os.path.join(prefix, "libexec", "update-privileged"), text.encode("utf-8"), 0o755)
 
 
-def hand_off(cfg: dict, args, sw_tree: str, shas: dict[str, str]) -> int:
-    """Run the newer commit's own copy, which installs and rewrites the entry point."""
+def hand_off(cfg: dict, args, sw_tree: str, shas: dict[str, str], tag: str | None = None) -> int:
+    """Run the newer commit's own copy, which installs and rewrites the entry point.
+    `tag`, given on the anonymous path, is carried on so the newer copy runs that same
+    path rather than falling back to a token fetch."""
     argv = [*ENTRY_ARGV, cfg["interpreter"], "-I",
-            os.path.join(sw_tree, "bin", "install-privileged"), "--consent", args.consent]
+            os.path.join(sw_tree, "bin", "install-privileged"), "--shape", cfg["shape"],
+            "--consent", args.consent]
+    if tag:
+        argv += ["--release", tag]
     for repo, sha in sorted(shas.items()):
         argv += ["--commit", f"{repo}={sha}"]
     print(f"{PROG}: handing off to {sw_tree}")
@@ -757,8 +1054,109 @@ def install(args: argparse.Namespace) -> int:
     if euid != 0 and cfg["require_root"]:
         raise Refused("this installs the root-owned half, and only root may run it. "
                       "Run it with sudo.")
-    commits = parse_commits(args.commit, {r: cfg[f"{r.replace('-', '_')}_repo"] for r in ROLES})
     print(f"{PROG}: running {HERE_FILE}")
+    if cfg["shape"] == "two":
+        return install_two(cfg, args)
+    return install_three(cfg, args)
+
+
+def latest_recorded_tag(records: str) -> str | None:
+    """The most recent tag name in `src/installed`, or None when no tag is recorded.
+    Reads the repository-qualified form (`tag <repo> <tag> <sha>`) only; every
+    repository an anonymous install records is tagged alike, so the tag name alone
+    is enough to replay it."""
+    tag = None
+    for line in records.splitlines():
+        fields = line.split()
+        if len(fields) == 4 and fields[0] == "tag" and TAG.fullmatch(fields[2]):
+            tag = fields[2]
+    return tag
+
+
+def install_two(cfg: dict, args: argparse.Namespace) -> int:
+    """The shipwright-only root half: fetch anonymously, take the release by tag,
+    install the bare copy, the extracted tree, the record and the entry point."""
+    # Shape two takes none of the three-account flags. Refusing before anything
+    # is written keeps a stray --commit from looking like a pin: it is silently
+    # ignored today, so `--shape two --commit shipwright=<sha>` reads as a pin
+    # and is not.
+    if args.commit:
+        raise Refused(f"--commit is not taken by shape two. Shape two fetches the "
+                      f"release by tag and never pins a commit. Nothing was changed.")
+    if args.consent is not None:
+        raise Refused(f"--consent is not taken by shape two. The instruction-file "
+                      f"diff is a shape-three step. Nothing was changed.")
+    if args.agent_platform_repo is not None:
+        raise Refused(f"--agent-platform-repo is not taken by shape two. Shape two "
+                      f"fetches shipwright alone and never agent-platform. "
+                      f"Nothing was changed.")
+    if args.library_repo is not None:
+        raise Refused(f"--library-repo is not taken by shape two. Shape two "
+                      f"fetches shipwright alone and never library. "
+                      f"Nothing was changed.")
+    prefix = cfg["prefix"]
+    make_dir(prefix, 0o755)
+    make_dir(os.path.join(prefix, "src"), 0o755)
+    make_dir(os.path.join(prefix, "libexec"), 0o755)
+    persisted = {k: cfg[k] for k in PERSISTED_TWO if k in cfg}
+    data = (json.dumps(persisted, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    if read_beneath(prefix, (CONFIG,)) != data:
+        write_atomic(os.path.join(prefix, CONFIG), data, 0o644)
+
+    # When --release is not given, the updater is replaying the recorded shape.
+    # Read the tag the last install recorded.
+    installed_path = os.path.join(prefix, "src", "installed")
+    prior_records = (read_beneath(prefix, ("src", "installed")) or b"").decode("utf-8") \
+        if os.path.lexists(installed_path) else ""
+    if args.release:
+        tag = parse_release_tag(args.release)
+    else:
+        tag = latest_recorded_tag(prior_records)
+        if not tag:
+            raise Refused("name the release tag with --release (e.g. v1.0.0). Nothing was changed.")
+    name = cfg["shipwright_repo"]
+    url = f"{cfg['github_base'].rstrip('/')}/{cfg['org']}/{name}"
+    bare = os.path.join(prefix, "src", f"{name}.git")
+
+    peeled = fetch_release_tag(bare, name, url, tag, prior_records)
+    sw_tree = extract(prefix, bare, name, peeled)
+    print(f"source: {name} at {peeled} from {sw_tree}")
+
+    if RUN_SHA != peeled:
+        return hand_off_two(cfg, args, sw_tree, tag)
+
+    records = f"tag {name} {tag} {peeled}\n{name} {peeled}\n"
+    write_atomic(os.path.join(prefix, "src", "installed"), records.encode("utf-8"), 0o644)
+    write_updater(prefix, cfg["interpreter"], peeled, cfg["shape"])
+    print(f"installed: {name}@{peeled}; entry point "
+          f"{os.path.join(prefix, 'libexec', 'update-privileged')}")
+    return 0
+
+
+def hand_off_two(cfg: dict, args, sw_tree: str, tag: str) -> int:
+    """Run the newer commit's own copy on the shape-two path."""
+    argv = [*ENTRY_ARGV, cfg["interpreter"], "-I",
+            os.path.join(sw_tree, "bin", "install-privileged"),
+            "--shape", cfg["shape"], "--release", tag]
+    print(f"{PROG}: handing off to {sw_tree}")
+    return subprocess.run(argv, cwd="/", check=False).returncode
+
+
+def install_three(cfg: dict, args: argparse.Namespace) -> int:
+    prefix = cfg["prefix"]
+    if args.consent is None:
+        args.consent = "ask"
+    names = {r: cfg[f"{r.replace('-', '_')}_repo"] for r in ROLES}
+    commits = parse_commits(args.commit, names)
+
+    release_tag = None
+    if args.release:
+        release_tag = parse_release_tag(args.release)
+        missing = sorted(set(names.values()) - set(commits))
+        if missing:
+            raise Refused(f"--release names a tag, and shape three then needs --commit for "
+                          f"every repository it names; missing: {', '.join(missing)}. "
+                          f"Nothing was changed.")
 
     make_dir(prefix, 0o755)
     make_dir(os.path.join(prefix, "etc"), 0o700)
@@ -768,6 +1166,42 @@ def install(args: argparse.Namespace) -> int:
     if read_beneath(prefix, (CONFIG,)) != data:
         write_atomic(os.path.join(prefix, CONFIG), data, 0o644)
 
+    # With no --release, the tag a previous anonymous install recorded selects the path,
+    # so a bare `--shape three` replay, which is what the entry point runs, stays anonymous.
+    installed_path = os.path.join(prefix, "src", "installed")
+    prior_records = (read_beneath(prefix, ("src", "installed")) or b"").decode("utf-8") \
+        if os.path.lexists(installed_path) else ""
+    tag = release_tag or latest_recorded_tag(prior_records)
+
+    if tag:
+        return install_three_anonymous(cfg, args, names, commits, tag, prior_records)
+    return install_three_token(cfg, args, names, commits)
+
+
+def install_three_anonymous(cfg: dict, args: argparse.Namespace, names: dict[str, str],
+                            commits: dict[str, str], tag: str, prior_records: str) -> int:
+    """The three-account root half's anonymous path: each repository fetched over
+    HTTPS by `tag`, needing no approver key."""
+    prefix = cfg["prefix"]
+    ensure_slots(prefix)
+
+    trees: dict[str, tuple[str, str, str]] = {}
+    for role in ROLES:
+        name = names[role]
+        url = f"{cfg['github_base'].rstrip('/')}/{cfg['org']}/{name}"
+        bare = os.path.join(prefix, "src", f"{name}.git")
+        peeled = fetch_release_tag(bare, name, url, tag, prior_records, commits.get(name))
+        trees[role] = (name, peeled, extract(prefix, bare, name, peeled))
+        print(f"source: {name} at {peeled} from {trees[role][2]}")
+    install_pinned_python(cfg)
+    return finish_three(cfg, args, trees, tag)
+
+
+def install_three_token(cfg: dict, args: argparse.Namespace, names: dict[str, str],
+                        commits: dict[str, str]) -> int:
+    """The three-account root half's token path: each repository fetched as GitHub's
+    own `main`, with a read token minted from the approver key."""
+    prefix = cfg["prefix"]
     ensure_slots(prefix)
     key_path = os.path.join(prefix, gg.KEY_SLOT)
     if not gg.read_slot(key_path):
@@ -779,7 +1213,6 @@ def install(args: argparse.Namespace) -> int:
     jwt = gg.app_jwt(key_path, app_id)
     gh = gg.GitHub(api=cfg["api_base"])
 
-    names = {r: cfg[f"{r.replace('-', '_')}_repo"] for r in ROLES}
     trees: dict[str, tuple[str, str, str]] = {}
     for role in ROLES:
         name = names[role]
@@ -798,13 +1231,26 @@ def install(args: argparse.Namespace) -> int:
                           f"on {MAIN} is installed. Nothing was installed.")
         trees[role] = (name, sha, extract(prefix, bare, name, sha))
         print(f"source: {name} at {sha} from {trees[role][2]}")
+    install_pinned_python(cfg)
+    return finish_three(cfg, args, trees, None)
 
+
+def finish_three(cfg: dict, args: argparse.Namespace,
+                 trees: dict[str, tuple[str, str, str]], tag: str | None) -> int:
+    """Hand off to a newer shipwright commit, or stage, swap and record what both
+    three-account fetches extracted. `tag` is the anonymous path's release tag, and
+    None on the token path, which records no tag."""
+    prefix = cfg["prefix"]
     sw_name, sw_sha, sw_tree = trees["shipwright"]
     if RUN_SHA != sw_sha:
-        return hand_off(cfg, args, sw_tree, {n: s for n, s, _ in trees.values()})
+        return hand_off(cfg, args, sw_tree, {n: s for n, s, _ in trees.values()}, tag=tag)
 
     ap_name, ap_sha, ap_tree = trees["agent-platform"]
-    records = "".join(f"{n} {s}\n" for n, s, _ in trees.values())
+    lib_name, lib_sha, _lib_tree = trees["library"]
+    records = "".join((f"tag {n} {tag} {s}\n" if tag else "") + f"{n} {s}\n"
+                      for n, s, _ in trees.values())
+    if platform_mod.system() == "Darwin":
+        records += f"python {PYTHON_VERSION} {PYTHON_SHA256}\n"
     plan = Plan()
     try:
         stage_all(cfg, args, sw_tree, ap_tree, ap_sha, records, plan)
@@ -816,8 +1262,8 @@ def install(args: argparse.Namespace) -> int:
     if bad:
         raise Refused("these paths are not root-owned, or another account can write them: "
                       + ", ".join(bad) + ". The entry point was not rewritten.")
-    write_updater(prefix, cfg["interpreter"], sw_sha)
-    print(f"installed: {sw_name}@{sw_sha}, {ap_name}@{ap_sha}; entry point "
+    write_updater(prefix, cfg["interpreter"], sw_sha, cfg["shape"])
+    print(f"installed: {sw_name}@{sw_sha}, {ap_name}@{ap_sha}, {lib_name}@{lib_sha}; entry point "
           f"{os.path.join(prefix, 'libexec', 'update-privileged')}")
     return 0
 

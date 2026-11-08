@@ -112,6 +112,9 @@ REPO=""
 # --branch stable` has no local main to fall back to, and a development
 # checkout has no stable branch at all, so the two cases never collide.
 REF=""
+# The full commit --ref must resolve to, when the caller already knows it; empty
+# means any commit the ref names. See where it is compared, below the resolution.
+EXPECT_COMMIT=""
 # **THESE TWO READ THE INHERITED `$HOME` ON PURPOSE**, before the reassignment
 # below: they are where this script writes on behalf of whoever invoked it, which
 # is a different question from which account git should believe it is.
@@ -145,7 +148,8 @@ ACTION="install"
 
 usage() {
   cat >&2 <<'EOF'
-usage: install-payload [--ref=<git-ref>] [--repo=<path>] [--deploy=<dir>]
+usage: install-payload [--ref=<git-ref>] [--expect-commit=<sha>]
+                       [--repo=<path>] [--deploy=<dir>]
                        [--skills=<dir>] [--root=<dir>] [--steward-dir=<dir>]
                        [--machine-file=<file>]
                        [--config=<file>] [--allow-non-main] [--force]
@@ -157,6 +161,9 @@ usage: install-payload [--ref=<git-ref>] [--repo=<path>] [--deploy=<dir>]
                      unless --allow-non-main is given, because a deploy area
                      serving an arbitrary branch is the fault this script
                      exists to prevent.
+  --expect-commit=<sha>
+                     The full commit --ref must name. Refused, with nothing
+                     changed, when the ref resolves to any other commit.
   --repo=<path>      The shipwright checkout to read the ref from. Defaults to
                      the repository containing this script.
   --deploy=<dir>     Where the payload is extracted to. Default
@@ -195,6 +202,7 @@ die() { echo "$PROG: $*" >&2; exit 1; }
 for arg in "$@"; do
   case "$arg" in
     --ref=*) REF=${arg#--ref=} ;;
+    --expect-commit=*) EXPECT_COMMIT=${arg#--expect-commit=} ;;
     --repo=*) REPO=${arg#--repo=} ;;
     --deploy=*) DEPLOY_DIR=${arg#--deploy=} ;;
     --skills=*) SKILLS_DIR=${arg#--skills=} ;;
@@ -277,11 +285,34 @@ if [ "$ACTION" = "status" ]; then
   exit 0
 fi
 
-# A ref other than main or stable is the fault this script exists to prevent,
-# so it is refused rather than warned about, and the override is recorded in
-# the stamp where a later reader will see what was deployed and on whose
-# say-so. stable needs no override: it is the release, exactly as main is.
-if [ "$REF" != "main" ] && [ "$REF" != "stable" ] && [ "$ALLOW_NON_MAIN" -eq 0 ]; then
+# **A RELEASE TAG NEEDS NO OVERRIDE EITHER: IT IS THE RELEASE, EXACTLY AS
+# STABLE IS.** The shape is the one builder-install itself checks before
+# trusting a --release argument: "vX.Y.Z", optionally followed by
+# "-alpha"/"-beta"/"-rc", itself optionally followed by a number with or
+# without a leading dot (the union of what commit-export tags, `-rc1`, and
+# what build-site accepts, `-rc.1`). A ref outside that shape is still the
+# fault this check exists to prevent.
+is_release_tag() {
+  case "$1" in
+    v[0-9]*) ;;
+    *) return 1 ;;
+  esac
+  version=${1#v}
+  case "$version" in
+    *"
+"*) return 1 ;;
+  esac
+  printf '%s\n' "$version" \
+    | sed -n -E '/^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)(\.?[0-9]+)?)?$/p' \
+    | grep -q .
+}
+
+# A ref other than main, stable or a release tag is the fault this script
+# exists to prevent, so it is refused rather than warned about, and the
+# override is recorded in the stamp where a later reader will see what was
+# deployed and on whose say-so.
+if [ "$REF" != "main" ] && [ "$REF" != "stable" ] && ! is_release_tag "$REF" \
+  && [ "$ALLOW_NON_MAIN" -eq 0 ]; then
   die "refusing to install from '$REF': pass --allow-non-main to override"
 fi
 
@@ -295,6 +326,34 @@ for candidate in "refs/heads/$REF" "refs/remotes/origin/$REF" "$REF"; do
   COMMIT=$(git -C "$REPO" rev-parse --verify "${candidate}^{commit}" 2>/dev/null) && break
 done
 [ -n "$COMMIT" ] || die "no such ref in $REPO: $REF"
+
+# **A LOCAL BRANCH BEHIND ITS REMOTE IS REFUSED.** `--ref=main` names the
+# checkout's own `main`, which is whatever was last pulled there: a dry run
+# from an unfetched checkout once reported "would deploy" a main that predated
+# the merge it was run for, and said nothing. The fetch moves only the
+# remote-tracking ref, so a shared checkout's branches and working tree stay as
+# they are. A fetch that fails leaves the comparison to the last fetch. It is
+# the one call here that writes a ref in that checkout, so `core.hooksPath` is
+# pinned on it, as on every other ref-writing call in this file.
+if git -C "$REPO" show-ref --verify --quiet "refs/heads/$REF" \
+   && git -C "$REPO" remote get-url origin >/dev/null 2>&1; then
+  git -c core.hooksPath=/dev/null -C "$REPO" fetch --quiet origin \
+    "+refs/heads/$REF:refs/remotes/origin/$REF" 2>/dev/null || true
+  UPSTREAM=$(git -C "$REPO" rev-parse --verify --quiet "refs/remotes/origin/$REF^{commit}" || true)
+  if [ -n "$UPSTREAM" ] && [ "$UPSTREAM" != "$COMMIT" ] \
+     && git -C "$REPO" merge-base --is-ancestor "$COMMIT" "$UPSTREAM"; then
+    die "$REF in $REPO is at $COMMIT, behind origin/$REF at $UPSTREAM: update it first (git -C $REPO pull --ff-only when $REF is checked out there, git -C $REPO fetch origin $REF:$REF when it is not). Nothing has been changed"
+  fi
+fi
+
+# **THE COMMIT A CALLER VERIFIED, NOT WHATEVER THE TAG NAMES NOW.** builder-update
+# checks a release's commits against its signed manifest and then calls this with
+# the tag. A tag re-pointed in the clone between that check and this resolution
+# would otherwise be extracted below and run. Everything after this line reads
+# `$COMMIT`, never `$REF`, so comparing here is comparing what is installed.
+if [ -n "$EXPECT_COMMIT" ] && [ "$COMMIT" != "$EXPECT_COMMIT" ]; then
+  die "$REF in $REPO names $COMMIT, not the expected commit $EXPECT_COMMIT: nothing has been changed"
+fi
 
 # **WHERE THIS MACHINE'S PROJECTS LIVE, DECIDED BEFORE ANYTHING IS CHANGED**
 # Everything Builder owns lives under one root, `~/builder` unless the install

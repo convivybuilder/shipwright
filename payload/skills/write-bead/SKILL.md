@@ -270,7 +270,8 @@ Every entry from the approved-not-built and still-proposed buckets becomes one o
   (`issue_create` with `type: epic`, from the interactive session only). This is progress.
 - **Restore** — drift the bead turned up: a stale claim, something documented as built that is
   partial, a seam that rotted. File it as an ISSUE. This is **cleanup, not progress**, and it
-  belongs in the interrupt lane that autonomous crews drain, never on the Course.
+  belongs in the interrupt lane, the queue sessions take items from between Course work, never on
+  the Course.
 
 **A first pass over an existing project mostly turns up drift**, so filing everything as epics is
 the default mistake rather than a rare one — it would put the project's own cleanup on its route to

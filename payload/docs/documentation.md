@@ -23,6 +23,8 @@ fifth.
 - **[Installing Builder](installing.md)** explains the server-and-laptop layout Builder is built for
   and the words the install uses, shows how to clone Builder's repositories, and says what to do
   when a step refuses.
+- **[Install checklist](install-checklist.md)** lists every step you do by hand across the whole
+  install, in order, each with a checkbox to tick off as you go.
 - **[Installing on Linux, with administrator access](install-linux.md)** is the install for a Linux account that can install software
   for the whole machine.
 - **[Installing on Linux, without administrator access](install-linux-without-sudo.md)** is the install for a Linux account someone
@@ -30,6 +32,8 @@ fifth.
 - **[Installing on a Mac](install-mac.md)** is the install for any Mac.
 - **[After the install](after-installing.md)** shows what the install put where, how to move to a
   later release, and how to meet the steward, and covers backups.
+- **[Supported setups](supported-setups.md)** lists the servers, laptops and account shapes Builder
+  1.0 supports.
 - **[What works and what does not yet](install-status.md)** lists what release 0.6.0 has been seen
   doing on each test machine, and what it cannot do yet.
 - **[Release notes](release-notes.md)** says what changed in each release, newest first.
@@ -43,8 +47,7 @@ Each guide covers one job, and you can read any of them on its own once Builder 
 - **[Forking Builder](forking.md)** covers installing from your own copy of Builder's repositories,
   and choosing which of Builder's later changes to take.
 - **[Connecting GitHub on the single-account install](connecting-github.md)** gives your agents a
-  GitHub identity of their own, and lets GitHub refuse to merge a pull request an agent opened
-  until you approve it.
+  GitHub identity of their own, separate from yours.
 - **[The Slate](the-slate.md)** is where a crew leaves the questions it needs you to answer, and
   where you keep notes to send it at a break point.
 - **[Your own Cloudflare account](your-cloudflare-account.md)** prepares a Cloudflare account and

@@ -1,0 +1,1523 @@
+#!/usr/bin/env python3
+"""Move a single-account Builder install to a later release, and put it back when a step fails.
+
+    builder-update --shape single|two|three                 report, ask to confirm, then update
+    builder-update --shape single|two|three --plan           report only; exit 0
+    builder-update --shape single|two|three --release vX.Y.Z  update to a named release
+    builder-update --rollback                                 finish an unfinished update's rollback
+
+Exit codes: 0 the install is on the new release with its jobs running again, or
+was already current; 2 refused with nothing changed; 3 a step failed and the
+install is back on the old release with its jobs running; 4 a step failed and
+the rollback did not finish, naming the steps it undid. `--rollback` exits 3
+once it has finished a rollback, 4 when it still cannot, and 2 when no update
+is unfinished.
+
+**WHAT THIS BUILDS.** The single-account shape only. `--shape two` is refused
+before anything is read, and `--shape three` is refused once its report is
+printed, because the root half and the `sudo -u agents` steps are not built.
+
+**THE STEPS, IN ORDER.** After the preflight below and the operator's
+confirmation, an update:
+
+  1. writes its record, `<state>/builder-update/<from>-to-<to>/record.json`:
+     each clone's commit, the commit verification checked for each, each
+     deploy stamp, the jobs running, and the knowledge repository's `main`;
+  3. moves shipwright's clone to the target tag and hands control to that
+     release's own copy of this command, which runs the preflight again and
+     moves the other tagged clones, then fast-forwards write-better's `main`
+     to the commit the target's signed manifest names for it;
+  4. stops every running job except tmux-keeper, waiting for each to exit;
+  5. takes a snapshot with `builder-backup` into the record's directory;
+  6. places the new release: `install-payload`, then `install-backend`,
+     `link-commands` and `register-mcp`, the steps `stand-up-backend` names
+     place, link and register, all at the target tag, each installer told the
+     verified commit that tag must name;
+  7. re-renders the jobs with the target's `install-jobs`, whose prepare steps
+     run the Library's migration and Orient's database initialisation;
+  8. starts every job that ran before, plus any job the target adds that is
+     enabled by default, then rebuilds the knowledge index now the Library is
+     answering again — warning rather than failing the update if `agentctl
+     kb sync` refuses, since an update's index is usually already built;
+  9. checks that `stand-up-backend --check` passes, that every job started in
+     step 8 is running, that the Library answers `/whoami` for Orient's
+     credential with its schema at the release's head, and that the deploy
+     stamps name the release's commits.
+
+Step 2, moving the root half, belongs to the three-account shape.
+
+**THE RECORD COMES BEFORE THE HAND-OFF.** The plan lists moving shipwright's
+clone in the preflight, ahead of the record. Moving it is the first change to
+the machine, so here it is the first part of step 3: a run killed between the
+move and the record would otherwise leave shipwright on the new release with
+nothing saying where it came from. The hand-off is `--continue <record>`,
+hidden from `--help`, and it is a contract between releases: the copy that
+starts an update calls the target's copy that way.
+
+**HOW A FAILURE IS UNDONE.** Each step is marked begun in the record before it
+changes anything. On a failure the rollback undoes every begun step, each undo
+safe to repeat, in this order:
+
+  - stop the jobs again, when step 4 began;
+  - put back the snapshot's `library.db`, `cold.db` and Orient's `control.db`,
+    and delete `vectors.db`, when step 7 began. It never runs `alembic
+    downgrade`, whose downgrades drop the rows they reverse;
+  - check each clone out at its recorded commit, when step 3 began;
+  - reset the knowledge repository, when step 6 began;
+  - place the old release again at its own tag, each installer told the
+    recorded commit that tag must name, when step 6 began;
+  - re-render the old release's jobs with its own `install-jobs`, when step 7
+    began;
+  - start the jobs that ran before, when step 4 began;
+
+and then runs step 9's checks against the old release.
+
+That reverses the plan's undo column with one exception: the clones go back
+before the old release is placed and its jobs re-rendered. Placing comes
+first because the jobs' prepare steps run `alembic upgrade head` from the
+deploy area, and run while the new release was still placed they would migrate
+the restored database forward again. The clones go back first so that the old
+release's own installers and declarations are the ones that run.
+
+A run killed partway leaves its record unfinished. Every later run refuses
+except `--rollback`, which finishes the rollback from the record.
+
+**THE KNOWLEDGE REPOSITORY IS RESET ONLY WHEN NOTHING ELSE MOVED IT.**
+`install-payload` can commit the starter set to it and push to its remote, a
+folder on the machine. The rollback resets `main` to the recorded commit, and
+force-pushes to that local remote, only when `main` is still at the commit the
+update made. Otherwise it leaves `main` alone and lists the documents the
+update changed.
+
+**WHY IT REFUSES RATHER THAN GUESSES.** An update that moves five
+repositories and restarts the Library and Orient is not something to run on a
+machine that cannot already say what it has installed. Every preflight check
+refuses outright, naming what it found.
+
+**WHY VERIFICATION HAS NO OVERRIDE.** No flag, environment variable or
+configuration skips it. The verifier and its trust list are the INSTALLED
+release's `bin/builder-install` and `release-signers`, extracted with `git
+show <installed tag>:<path>` into a fresh temporary directory outside every
+checkout, so a target release never vouches for itself. That copy fetches the
+target's signed manifest from the site and checks it against each clone's
+commit for the target tag. Until a signed release exists, this refuses every
+update.
+
+**WHAT IS CHECKED OUT IS WHAT WAS VERIFIED.** Verification returns the commit
+it checked for each repository, and the record carries them as
+`target_commits` before anything moves. Step 3 checks out those commits and
+never resolves the tag, or write-better's fetched `main`, again, so a tag
+moved in a local clone after verification (a concurrent `git fetch --tags`)
+is never checked out or run. The target's copy refuses, putting shipwright
+back as the rollback does, when the tag in any clone no longer names the
+recorded commit, write-better's clone no longer has or can no longer reach
+the recorded commit from its fetched `main`, or verification run again
+checked a different commit.
+
+write-better ships no release of its own, so its commit comes from the
+target's signed manifest rather than a tag: `verify_release` fetches that
+manifest once here, before the clones it stages for the verifier are built,
+to read the commit it names for write-better, and refuses, naming it, when
+write-better's clone lacks that commit or cannot reach it from its own
+fetched `main`. That read is never trusted on its own — the verifier called
+right after fetches and signature-checks its own copy of the same manifest
+and refuses when write-better's staged clone does not match what that copy
+names, so a wrong or tampered read here is caught there.
+
+Step 6 still names the tag to `install-payload` and `install-backend`, which
+resolve it themselves, so each is also passed `--expect-commit` with the
+recorded commit and refuses before placing anything when the tag names another.
+A tag moved after step 3 therefore never reaches a deploy area, and step 7
+never migrates with its code. write-better carries no tag to resolve, so both
+the normal step 6 and the rollback's also pass `install-backend`'s `--commit`
+naming the commit the record holds for it — the one the target's manifest
+named, or the one the rollback is going back to — rather than letting
+`install-backend` resolve its own ref against its own fetched `main`, which
+can by now sit elsewhere. That places exactly the recorded commit, and
+`--expect-commit` then checks it the same as every other repository's. Like
+`--continue`, `--expect-commit` and `--commit` are a contract between
+releases: the installers gained `--expect-commit`, and write-better's
+recording in the update record, in the release that first shipped this
+command, and `--commit` in this one, so every release an update can start
+from, or roll back to, accepts all three.
+
+**THE DEPLOY STAMP FORMAT IS DUPLICATED HERE ON PURPOSE, NOT IMPORTED.**
+`bin/install-backend` writes `.installed-by-install-backend`, and the schema
+read here is deliberately the minimal part of it: a JSON object with a string
+`commit`. Importing that 2000-line module would pull in its own `sys.path`
+surgery and its `tools/stale_holders` dependency, neither of which a fake
+clone in a test carries, for one field this already knows how to read.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pwd
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+PROG = "builder-update"
+
+# The five repositories a release tags the same way, plus write-better, which
+# ships no release of its own (bin/builder-install's own TAGGED_REPOS
+# comment): its clone stays on its own `main` branch rather than a tag, and
+# the commit each release places it at comes from that release's signed
+# manifest. Of the five, three are the repositories `bin/install-backend`
+# places into a deploy area and stamps; shipwright is the control checkout
+# itself and convivy-deck is a laptop app, so neither carries a deploy stamp
+# to check.
+TAGGED_CLONES = ("shipwright", "agent-platform", "library", "convivy-orient", "convivy-deck")
+STAMPED_REPOS = ("library", "agent-platform", "convivy-orient")
+WRITE_BETTER = "write-better"
+
+# `bin/install-backend`'s own constant; duplicated rather than imported — see
+# the module docstring.
+STAMP = ".installed-by-install-backend"
+
+# What the installed release's verifier is extracted from, relative to the
+# root of shipwright at that release's tag. The verifier finds the trust list
+# beside its own `bin/`.
+VERIFIER = "bin/builder-install"
+TRUST_LIST = "release-signers"
+
+# Where the verifier itself fetches a release's signed manifest from when
+# given no local copy (bin/builder-install's own SITE_BASE); read here, once,
+# to learn the commit the target's manifest names for write-better, before
+# the view below stages that commit for the verifier's own, independent
+# fetch and signature check. MANIFEST_NAME is tools/release's own constant.
+SITE_BASE = "https://convivybuilder.org"
+MANIFEST_NAME = "release-manifest"
+
+AGENTS_ACCOUNT = "agents"
+REVIEWERS_ACCOUNT = "reviewers"
+
+SHAPES = {
+    "single": "one account, the operator's own, with no administrator",
+    "two": "the operator and an agents account — not built yet in this release",
+    "three": "the agents and reviewers accounts and a root-owned privileged half",
+}
+
+DEFAULT_SRC_DIR = Path.home() / "src"
+DEFAULT_STATE_DIR = Path.home() / ".local" / "state" / "builder-update"
+# Each run's record lives at <DEFAULT_STATE_DIR>/<installed>-to-<target>/record.json,
+# named for the two releases it is a record between, so a finished update's
+# record never collides with a later one's.
+RECORD_NAME = "record.json"
+SNAPSHOT_NAME = "snapshot"
+
+# Where the single-account install keeps the Library's state and Orient's
+# database: `jobs/library.toml` names `{state}/library`, and Orient's
+# `control.db` is its own default, as `builder-backup` reads them.
+LIBRARY_STATE = Path.home() / ".local" / "state" / "library"
+ORIENT_DB = Path.home() / ".orient-control" / "control.db"
+# Orient's Library credential, minted by `jobs/library.toml`'s prepare steps,
+# and the address `payload/docs/after-installing.md` checks `/whoami` at.
+ORIENT_TOKEN = Path.home() / ".orient-control" / "library-token"
+LIBRARY_URL = "http://127.0.0.1:8100"
+LIBRARY_LABEL = "com.convivy.library"
+# The Library is started in step 8 and may not be serving yet when step 9
+# first asks it; `install-jobs --start` confirms the process, not the port.
+WHOAMI_WAIT_SECONDS = 30
+# What the snapshot holds, by the names `builder-backup` writes, and where
+# each goes back to, in the order the restore page gives.
+RESTORED = (
+    ("library.db", LIBRARY_STATE / "library.db"),
+    ("cold.db", LIBRARY_STATE / "cold.db"),
+    ("orient-control.db", ORIENT_DB),
+)
+# Left out of every backup, and rebuilt by `init_vectors.py` and a reindex.
+VECTORS_DB = LIBRARY_STATE / "vectors.db"
+
+# Accepts "0.6.1" or "v0.6.1" alike, as builder-install and stand-up-backend do.
+RELEASE_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)(\.?[0-9]+)?)?$")
+TAG_VERSION = re.compile(
+    r"^v(?P<maj>[0-9]+)\.(?P<min>[0-9]+)\.(?P<patch>[0-9]+)"
+    r"(-(?P<kind>alpha|beta|rc)(\.?(?P<n>[0-9]+))?)?$"
+)
+PRERELEASE_RANK = {"alpha": 0, "beta": 1, "rc": 2}
+
+
+class Refused(Exception):
+    """Something the operator has to decide about. Never a stack trace."""
+
+
+class StepFailed(Exception):
+    """A step of the update, or of its rollback, that did not complete."""
+
+
+@dataclass
+class Clone:
+    name: str
+    path: Path
+    commit: str | None = None
+    tag: str | None = None
+    problem: str | None = None
+
+
+def now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def stamp_time(when: datetime) -> str:
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def say(message: str) -> None:
+    print(f"{PROG}: {message}", flush=True)
+
+
+def git(*args: str, cwd: Path) -> tuple[int, str, str]:
+    try:
+        result = subprocess.run(
+            ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False
+        )
+    except OSError as exc:
+        return 127, "", str(exc)
+    return result.returncode, result.stdout, result.stderr
+
+
+def git_step(*args: str, cwd: Path, what: str) -> str:
+    """`git` that raises StepFailed, naming `what`, on a non-zero exit."""
+    rc, out, err = git(*args, cwd=cwd)
+    if rc != 0:
+        raise StepFailed(f"{what}: git {' '.join(args)} in {cwd} failed: {err.strip()}")
+    return out.strip()
+
+
+def run_step(argv: list[str], what: str, capture: bool = False) -> str:
+    """Run one installer, its output passed through, or StepFailed naming `what`."""
+    say(f"running {what}")
+    sys.stdout.flush()
+    try:
+        result = subprocess.run(argv, capture_output=capture, text=True, check=False)
+    except OSError as exc:
+        raise StepFailed(f"{what} could not run: {exc}") from exc
+    if capture:
+        for stream, text in ((sys.stdout, result.stdout), (sys.stderr, result.stderr)):
+            if text:
+                print(text, end="" if text.endswith("\n") else "\n", file=stream)
+    if result.returncode != 0:
+        raise StepFailed(f"{what} exited {result.returncode}")
+    return result.stdout or ""
+
+
+def version_key(tag: str) -> tuple[int, int, int, int, int]:
+    """An orderable key for a release tag, or a refusal when it is not one.
+
+    A final release outranks every prerelease of the same core version, so a
+    tag with no `-alpha|beta|rc` suffix is ranked above the three that have one.
+    """
+    match = TAG_VERSION.fullmatch(tag)
+    if match is None:
+        raise Refused(f"'{tag}' is not a release tag such as v1.2.3 or v1.2.3-rc1.")
+    core = (int(match["maj"]), int(match["min"]), int(match["patch"]))
+    if match["kind"] is None:
+        return core + (len(PRERELEASE_RANK), 0)
+    return core + (PRERELEASE_RANK[match["kind"]], int(match["n"] or 0))
+
+
+def normalized_release(value: str) -> str:
+    """`value`, normalised to "vX.Y.Z", or a refusal when its shape is wrong."""
+    version = value[1:] if value.startswith("v") else value
+    if not RELEASE_VERSION.fullmatch(version):
+        raise Refused(
+            f"'{value}' is not a release version. Pass --release with a version "
+            f"such as 1.2.3 or v1.2.3-rc1."
+        )
+    return f"v{version}"
+
+
+def read_stamp(area: Path) -> dict | None:
+    """The deploy stamp at `area`, or None when there is none to read.
+
+    Minimal reader for the schema `bin/install-backend` writes — see the
+    module docstring for why this is not imported from there.
+    """
+    path = area / STAMP
+    if not path.is_file():
+        return None
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError):
+        return {"unreadable": True}
+    if not isinstance(loaded, dict) or not isinstance(loaded.get("commit"), str):
+        return {"unreadable": True}
+    return loaded
+
+
+def inspect_clone(name: str, src_dir: Path) -> Clone:
+    """`name`'s checkout under `src_dir`, with its commit and release tag.
+
+    A clone checked out at a commit with no release tag, or with more than
+    one, is reported as a problem rather than silently picking one — picking
+    one is how a disagreement among the five clones would go unnoticed.
+    """
+    path = src_dir / name
+    clone = Clone(name=name, path=path)
+    if not (path / ".git").exists():
+        clone.problem = f"no checkout at {path}"
+        return clone
+    rc, out, err = git("rev-parse", "HEAD", cwd=path)
+    if rc != 0:
+        clone.problem = f"could not read its commit at {path} ({err.strip()})"
+        return clone
+    clone.commit = out.strip()
+    rc, out, err = git("tag", "--points-at", clone.commit, cwd=path)
+    if rc != 0:
+        clone.problem = f"could not read its tags at {path} ({err.strip()})"
+        return clone
+    tags = sorted({t for t in out.splitlines() if TAG_VERSION.fullmatch(t)})
+    if not tags:
+        clone.problem = f"{path} is checked out at {clone.commit[:9]}, which carries no release tag"
+    elif len(tags) > 1:
+        clone.problem = (
+            f"{path} is checked out at {clone.commit[:9]}, which carries more than one "
+            f"release tag: {', '.join(tags)}"
+        )
+    else:
+        clone.tag = tags[0]
+    return clone
+
+
+def default_deploy_root() -> Path:
+    """The same default `bin/install-backend` and `bin/link-commands` use."""
+    from_env = os.environ.get("BUILDER_DEPLOY_ROOT")
+    root = Path(from_env) if from_env else (Path.home() / ".local" / "deploy")
+    return root.expanduser()
+
+
+def account_exists(name: str) -> bool:
+    try:
+        pwd.getpwnam(name)
+    except KeyError:
+        return False
+    return True
+
+
+def shape_mismatch(shape: str, exists=account_exists) -> str | None:
+    """Why `shape` contradicts this machine, or None when it does not.
+
+    Asked of the accounts the way `stand-up-backend`'s own shape check is,
+    rather than of a mode nobody recorded.
+    """
+    agents = exists(AGENTS_ACCOUNT)
+    reviewers = exists(REVIEWERS_ACCOUNT)
+    if shape == "single" and (agents or reviewers):
+        present = [n for n, have in ((AGENTS_ACCOUNT, agents), (REVIEWERS_ACCOUNT, reviewers)) if have]
+        return (
+            f"--shape single names an install with no administrator, and this machine "
+            f"carries {' and '.join(present)}: that looks like the three-account shape. "
+            f"Pass --shape three."
+        )
+    if shape == "three" and not (agents and reviewers):
+        missing = [n for n, have in ((AGENTS_ACCOUNT, agents), (REVIEWERS_ACCOUNT, reviewers)) if not have]
+        return (
+            f"--shape three needs the {' and '.join(missing)} account(s), and this machine "
+            f"lacks {'it' if len(missing) == 1 else 'them'}."
+        )
+    return None
+
+
+def find_installed_release(src_dir: Path, deploy_root: Path) -> tuple[str, dict[str, Clone]]:
+    """The release every tagged clone and every deploy stamp agree on, or a refusal.
+
+    write-better is never checked here: it ships no release and follows main.
+    """
+    clones = {name: inspect_clone(name, src_dir) for name in TAGGED_CLONES}
+    lines = [
+        f"  {name:<14} {clone.problem or f'{clone.tag}  {clone.commit[:9]}'}"
+        for name, clone in clones.items()
+    ]
+    tags = {clone.tag for clone in clones.values() if clone.tag}
+    if any(clone.problem for clone in clones.values()) or len(tags) != 1:
+        raise Refused(
+            "the tagged clones do not agree on the installed release:\n" + "\n".join(lines)
+        )
+    installed = tags.pop()
+    for name in STAMPED_REPOS:
+        area = deploy_root / name
+        clone_commit = clones[name].commit
+        found = read_stamp(area)
+        if found is None:
+            raise Refused(
+                f"{area} carries no install stamp ({STAMP}); cannot confirm {name} is "
+                f"serving {installed}, which its clone at {clones[name].path} is checked "
+                f"out at ({clone_commit[:9]})"
+            )
+        if found.get("unreadable"):
+            raise Refused(f"{area / STAMP} is unreadable; cannot confirm what {name} is serving")
+        if found.get("commit") != clone_commit:
+            raise Refused(
+                f"{name}'s clone at {clones[name].path} is {clone_commit[:9]}, and its deploy "
+                f"stamp at {area / STAMP} names {str(found.get('commit'))[:9]}"
+            )
+    return installed, clones
+
+
+def fetch_tags(src_dir: Path) -> None:
+    """Fetch every tagged clone's tags, and write-better's main, so the commit the
+    target's manifest names for it can be confirmed reachable from it."""
+    for name in TAGGED_CLONES:
+        path = src_dir / name
+        rc, _, err = git("fetch", "--tags", "origin", cwd=path)
+        if rc != 0:
+            raise Refused(f"git fetch --tags origin failed in {path}: {err.strip()}")
+    path = src_dir / WRITE_BETTER
+    if not (path / ".git").exists():
+        raise Refused(f"no checkout of {WRITE_BETTER} at {path}")
+    rc, _, err = git("fetch", "origin", "main", cwd=path)
+    if rc != 0:
+        raise Refused(f"git fetch origin main failed in {path}: {err.strip()}")
+
+
+def stable_tag(src_dir: Path) -> str:
+    shipwright = src_dir / "shipwright"
+    rc, out, err = git("rev-parse", "origin/stable", cwd=shipwright)
+    if rc != 0:
+        raise Refused(
+            f"{shipwright} has no origin/stable, so there is no default target. "
+            f"Pass --release naming one."
+        )
+    commit = out.strip()
+    rc, out, err = git("tag", "--points-at", commit, cwd=shipwright)
+    if rc != 0:
+        raise Refused(f"could not read tags at {commit[:9]} in {shipwright}: {err.strip()}")
+    tags = sorted({t for t in out.splitlines() if TAG_VERSION.fullmatch(t)})
+    if len(tags) != 1:
+        raise Refused(
+            f"origin/stable in {shipwright} names {commit[:9]}, which carries "
+            f"{'no release tag' if not tags else 'more than one release tag: ' + ', '.join(tags)}"
+        )
+    return tags[0]
+
+
+def pick_target(release: str | None, src_dir: Path, installed: str) -> tuple[str, bool]:
+    """The target release, and whether it is already the installed one.
+
+    Refused when it is later than stable, or at or before the installed
+    release — except an unnamed target that simply equals the installed one,
+    which is "already current" rather than a refusal.
+    """
+    stable = stable_tag(src_dir)
+    explicit = release is not None
+    target = normalized_release(release) if explicit else stable
+    if version_key(target) > version_key(stable):
+        raise Refused(f"{target} is later than stable ({stable}); stable is the newest release here.")
+    if version_key(target) == version_key(installed):
+        if not explicit:
+            return target, True
+        raise Refused(f"{target} is the installed release ({installed}); there is nothing to update.")
+    if version_key(target) < version_key(installed):
+        raise Refused(f"{target} is at or before the installed release ({installed}).")
+    return target, False
+
+
+def tag_commit(clone: Path, tag: str) -> str | None:
+    rc, out, _ = git("rev-parse", "--verify", "--quiet", f"refs/tags/{tag}^{{commit}}", cwd=clone)
+    return out.strip() if rc == 0 else None
+
+
+def verify_clones_ready(src_dir: Path, target: str) -> None:
+    """Every tagged clone carries `target`, write-better is on main, and none
+    has uncommitted changes to tracked files; or a refusal."""
+    problems = []
+    for name in TAGGED_CLONES + (WRITE_BETTER,):
+        path = src_dir / name
+        if name == WRITE_BETTER:
+            rc, out, _ = git("symbolic-ref", "--quiet", "HEAD", cwd=path)
+            if rc != 0 or out.strip() != "refs/heads/main":
+                problems.append(f"{name}: is not checked out at main at {path}")
+                continue
+        elif tag_commit(path, target) is None:
+            problems.append(f"{name}: no tag {target} at {path}")
+            continue
+        rc, out, err = git("status", "--porcelain", "--untracked-files=no", cwd=path)
+        if rc != 0:
+            problems.append(f"{name}: could not read its status at {path} ({err.strip()})")
+        elif out.strip():
+            problems.append(f"{name}: has uncommitted changes to tracked files at {path}")
+    if problems:
+        raise Refused(f"not every clone is ready for {target}:\n" + "\n".join(f"  {p}" for p in problems))
+
+
+def extract_verifier(shipwright: Path, installed: str, into: Path) -> Path:
+    """The installed release's verifier and trust list, written under `into`.
+
+    Read with `git show <installed>:<path>`, so neither comes from whatever
+    the clone's working tree holds, and never from the target release.
+    """
+    for relpath in (VERIFIER, TRUST_LIST):
+        try:
+            shown = subprocess.run(
+                ["git", "show", f"refs/tags/{installed}:{relpath}"],
+                cwd=str(shipwright), capture_output=True, check=False,
+            )
+        except OSError as exc:
+            raise Refused(f"could not read {relpath} at {installed}: {exc}") from exc
+        if shown.returncode != 0:
+            raise Refused(
+                f"release verification is not installed: the installed release {installed} "
+                f"carries no {relpath} in {shipwright}"
+            )
+        dest = into / relpath
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(shown.stdout)
+    verifier = into / VERIFIER
+    verifier.chmod(0o700)
+    return verifier
+
+
+def write_better_unreachable(clone: Path, commit: str) -> str | None:
+    """None when `commit` is an object `clone` has and an ancestor of its
+    fetched `origin/main`, else why not."""
+    rc, _, _ = git("cat-file", "-e", f"{commit}^{{commit}}", cwd=clone)
+    if rc != 0:
+        return "the clone does not have it"
+    rc, _, _ = git("merge-base", "--is-ancestor", commit, "refs/remotes/origin/main", cwd=clone)
+    if rc != 0:
+        return "it is not reachable from its fetched origin/main"
+    return None
+
+
+def resolve_write_better_commit(src_dir: Path, target: str) -> str:
+    """The commit `target`'s signed manifest names for write-better, confirmed
+    reachable from its fetched `origin/main`.
+
+    Fetched here, from the same address the verifier itself fetches a
+    release's manifest from, for staging purposes only: `target_view` stages
+    write-better's clone at the commit this returns, and `verify_release`
+    then has the installed release's verifier fetch and signature-check its
+    own, independent copy of the same manifest and refuse when that staged
+    commit does not match what it names. A wrong or tampered read here is
+    caught there, not trusted on its own.
+    """
+    clone = src_dir / WRITE_BETTER
+    if not (clone / ".git").exists():
+        raise Refused(f"no checkout of {WRITE_BETTER} at {clone}")
+    version = target[1:] if target.startswith("v") else target
+    url = f"{SITE_BASE}/releases/{version}/{MANIFEST_NAME}"
+    tmp = Path(tempfile.mkdtemp(prefix=".builder-update-manifest."))
+    try:
+        manifest_path = tmp / MANIFEST_NAME
+        try:
+            fetched = subprocess.run(["curl", "-fsSL", "-o", str(manifest_path), url],
+                                     capture_output=True, text=True, check=False)
+        except OSError as exc:
+            raise Refused(f"could not fetch {url} to learn {WRITE_BETTER}'s pinned commit: {exc}") from exc
+        if fetched.returncode != 0 or not manifest_path.is_file():
+            raise Refused(f"could not fetch {url} to learn {WRITE_BETTER}'s pinned commit: "
+                          f"{fetched.stderr.strip()}")
+        commit = None
+        for line in manifest_path.read_text(encoding="utf-8").splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] == WRITE_BETTER:
+                commit = parts[1]
+                break
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    if not commit or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise Refused(f"the {target} release manifest at {url} names no commit for {WRITE_BETTER}")
+    problem = write_better_unreachable(clone, commit)
+    if problem:
+        raise Refused(f"{WRITE_BETTER}: the {target} manifest names {commit}, and {problem} at {clone}")
+    return commit
+
+
+def target_view(src_dir: Path, target: str, write_better_commit: str, into: Path) -> dict[str, str]:
+    """Under `into`, one repository per clone whose HEAD is the commit the update would install.
+
+    `builder-install --verify` checks each clone's HEAD against the signed
+    manifest, and before step 3 the clones are still at the installed release.
+    Each entry here shares its clone's objects (`clone --shared`) and is
+    detached at the target tag's commit, or at `write_better_commit` — the
+    commit `resolve_write_better_commit` read for it — so the verifier checks
+    exactly what step 3 would check out, and no clone moves before it has
+    been verified. Returns each repository's staged commit.
+    """
+    commits: dict[str, str] = {}
+    for name in TAGGED_CLONES + (WRITE_BETTER,):
+        clone = src_dir / name
+        commit = write_better_commit if name == WRITE_BETTER else tag_commit(clone, target)
+        if not commit:
+            raise Refused(f"could not find the commit {name} would move to at {clone}")
+        dest = into / name
+        for args in (("clone", "-q", "--shared", "--no-checkout", str(clone), str(dest)),
+                     ("-C", str(dest), "update-ref", "--no-deref", "HEAD", commit)):
+            rc, _, err = git(*args, cwd=into)
+            if rc != 0:
+                raise Refused(f"could not stage {name} at {commit[:9]} for verification: {err.strip()}")
+        commits[name] = commit
+    return commits
+
+
+def verify_release(src_dir: Path, installed: str, target: str) -> dict[str, str]:
+    """The commit verified for each repository, or a refusal unless the installed
+    release's `builder-install --verify` passes for `target`.
+
+    Prints the verifier's output. Given no `--manifest`, the verifier fetches
+    the target's signed manifest from the site itself, independently of
+    `resolve_write_better_commit`'s own fetch of the same manifest, above.
+    Both temporary directories are made by `mkdtemp` under the system's
+    temporary directory, outside every checkout: the verifier refuses to
+    vouch from inside one.
+    """
+    verifier_dir = Path(tempfile.mkdtemp(prefix=".builder-update-verifier."))
+    view_dir = Path(tempfile.mkdtemp(prefix=".builder-update-view."))
+    try:
+        verifier = extract_verifier(src_dir / "shipwright", installed, verifier_dir)
+        write_better_commit = resolve_write_better_commit(src_dir, target)
+        verified = target_view(src_dir, target, write_better_commit, view_dir)
+        result = subprocess.run(
+            ["sh", str(verifier), "--verify", target, "--src-dir", str(view_dir)],
+            capture_output=True, text=True, check=False,
+        )
+    finally:
+        shutil.rmtree(verifier_dir, ignore_errors=True)
+        shutil.rmtree(view_dir, ignore_errors=True)
+    if result.stdout:
+        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+    if result.stderr:
+        print(result.stderr, end="" if result.stderr.endswith("\n") else "\n", file=sys.stderr)
+    if result.returncode != 0:
+        raise Refused(
+            f"release verification failed for {target} (exit {result.returncode}), checked "
+            f"by the verifier and trust list of the installed release {installed}."
+        )
+    return verified
+
+
+def plan_steps(shape: str, target: str) -> list[str]:
+    """The plan's steps, in order. `root half on three-account` is this shape's alone."""
+    steps = [
+        "record the update: each clone's commit, each deploy stamp, which jobs "
+        "install-jobs reports running, and the knowledge repository's main",
+    ]
+    if shape == "three":
+        steps.append("stand up the root-owned privileged half for the new release")
+    steps += [
+        f"move shipwright to {target} and hand control to that copy, which moves "
+        f"the other clones and write-better to the commit its manifest named",
+        "stop the backend jobs install-jobs reports running",
+        "take a verified snapshot with builder-backup",
+        "place the new release (the payload, library, agent-platform, convivy-orient)",
+        "re-render the jobs for the new release and migrate",
+        "restart the jobs that were stopped, and any new job enabled by default",
+        "rebuild the knowledge index now the Library is answering again, warning "
+        "rather than failing if it refuses",
+        "verify the restarted backend",
+    ]
+    return steps
+
+
+def render_report(installed: str, target: str, shape: str, steps: list[str]) -> str:
+    lines = [
+        f"{PROG}: installed release {installed}",
+        f"{PROG}: target release {target}",
+        f"{PROG}: shape {shape}",
+        f"{PROG}: this update would, in order:",
+    ]
+    lines += [f"  {i}. {step}" for i, step in enumerate(steps, start=1)]
+    lines.append(
+        f"{PROG}: the Library and Orient will be down from the stop step until the "
+        f"restart and verify steps finish."
+    )
+    return "\n".join(lines)
+
+
+def install_jobs_argv(src_dir: Path, *args: str) -> list[str]:
+    """The clone's own `install-jobs`, as the single-account shape runs it.
+
+    `--single-account` turns the declarations' system-scope jobs into this
+    account's own, as `stand-up-backend --shape single` installs them, so
+    asking without it would look for the jobs where this shape never puts them.
+    """
+    shipwright = src_dir / "shipwright"
+    return [sys.executable, str(shipwright / "bin" / "install-jobs"), "--single-account",
+            "--jobs", str(shipwright / "jobs"), *args]
+
+
+def jobs_running(src_dir: Path) -> list[str] | None:
+    """The labels `install-jobs --running` reports, or None when that cannot be asked."""
+    cmd = src_dir / "shipwright" / "bin" / "install-jobs"
+    if not cmd.is_file():
+        return None
+    result = subprocess.run(install_jobs_argv(src_dir, "--running"),
+                            capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        return None
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def knowledge_root() -> Path | None:
+    """The knowledge repository, as `builder-backup` finds it: `builder-root`/knowledge."""
+    try:
+        found = subprocess.run(["builder-root"], capture_output=True, text=True, check=True)
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    root = found.stdout.strip()
+    return Path(root) / "knowledge" if root else None
+
+
+def knowledge_main(repo: Path | None) -> str | None:
+    if repo is None:
+        return None
+    rc, out, _ = git("rev-parse", "--verify", "--quiet", "refs/heads/main", cwd=repo)
+    return out.strip() if rc == 0 else None
+
+
+# --- the record -------------------------------------------------------------
+
+def record_finished(path: Path) -> bool:
+    """Whether the record at `path` says its run finished. Unreadable is unfinished."""
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError):
+        return False
+    return isinstance(loaded, dict) and bool(loaded.get("finished"))
+
+
+def find_unfinished_record(state_dir: Path) -> Path | None:
+    """The record of a run that did not finish, under any subdirectory of `state_dir`.
+
+    A run writes its record to `<state_dir>/<installed>-to-<target>/record.json`
+    (see `write_record`) before the installed or target release for THIS run is
+    known, so this looks across every such subdirectory rather than at one
+    fixed path. A record marked finished, by a success or a completed
+    rollback, stays as the account of that run and is skipped."""
+    found = [p for p in sorted(state_dir.glob(f"*/{RECORD_NAME}")) if not record_finished(p)]
+    return found[0] if found else None
+
+
+def save_record(path: Path, record: dict) -> None:
+    """Replace the record at `path` whole, at 0600, so a kill never leaves half of one."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(record, indent=2) + "\n")
+    os.replace(tmp, path)
+
+
+def load_record(path: Path) -> dict:
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise Refused(f"the update record at {path} cannot be read: {exc}") from exc
+    if not isinstance(loaded, dict) or not isinstance(loaded.get("clones"), dict):
+        raise Refused(f"the update record at {path} is not one this command wrote")
+    if loaded.get("shape") != "single":
+        raise Refused(
+            f"the update record at {path} is for the {loaded.get('shape')!r} shape, and this "
+            f"release updates and rolls back only the single-account shape"
+        )
+    return loaded
+
+
+def write_record(
+    state_dir: Path, installed: str, target: str, shape: str, clones: dict[str, Clone],
+    deploy_root: Path, jobs: list[str] | None, knowledge: Path | None, src_dir: Path,
+    verified: dict[str, str],
+) -> Path:
+    """Write this run's record under its own `<installed>-to-<target>` subdirectory
+    of `state_dir` (see `find_unfinished_record`), and return its path.
+
+    `state_dir` and the subdirectory are each `chmod`ed 0o700 explicitly:
+    `mkdir` applies `mode` only to a directory it creates, never to one that
+    already exists, and `parents=True` creates missing parents with the
+    default mode."""
+    record_dir = state_dir / f"{installed}-to-{target}"
+    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(state_dir, 0o700)
+    record_dir.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(record_dir, 0o700)
+    commits = {name: clone.commit for name, clone in clones.items()}
+    commits[WRITE_BETTER] = git_step("rev-parse", "HEAD", cwd=src_dir / WRITE_BETTER,
+                                     what="recording write-better's commit")
+    record = {
+        "started": stamp_time(now()),
+        "initiated_by": pwd.getpwuid(os.getuid()).pw_name,
+        "shape": shape,
+        "installed_release": installed,
+        "target_release": target,
+        "src_dir": str(src_dir),
+        "deploy_root": str(deploy_root),
+        "clones": commits,
+        # The commit verification checked for each repository: what step 3
+        # checks out, and all it checks out.
+        "target_commits": dict(verified),
+        "deploy_stamps": {
+            name: (read_stamp(deploy_root / name) or {}).get("commit") for name in STAMPED_REPOS
+        },
+        "jobs_running": jobs,
+        "knowledge_repo": str(knowledge) if knowledge else None,
+        "knowledge_main": knowledge_main(knowledge),
+        # The knowledge repository's main once install-payload has run in
+        # step 6: the commit the update made, if it made one.
+        "knowledge_after_update": None,
+        "jobs_started": None,
+        # Step names, in the order each began changing something.
+        "begun": [],
+        "undone": [],
+        "finished": None,
+    }
+    path = record_dir / RECORD_NAME
+    save_record(path, record)
+    return path
+
+
+def begin(path: Path, record: dict, step: str) -> None:
+    if step not in record["begun"]:
+        record["begun"].append(step)
+    save_record(path, record)
+
+
+# --- the steps --------------------------------------------------------------
+
+def checkout(clone: Path, commit: str, what: str) -> None:
+    git_step("checkout", "-q", "--detach", commit, cwd=clone, what=what)
+
+
+def hand_off(path: Path, record: dict) -> int:
+    """Step 3's first part: move shipwright to the target, then run that copy with `--continue`.
+
+    Anything other than the exit codes this command defines (a crash, a
+    signal, a target copy that cannot run) leaves the update to this copy's
+    rollback, read from the same record.
+    """
+    src_dir = Path(record["src_dir"])
+    target = record["target_release"]
+    shipwright = src_dir / "shipwright"
+    begin(path, record, "clones")
+    try:
+        say(f"moving shipwright to {target}")
+        checkout(shipwright, record["target_commits"]["shipwright"], "moving shipwright")
+    except StepFailed as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return rollback(path)
+    successor = shipwright / "payload" / "bin" / PROG
+    say(f"handing control to {target}'s own {PROG} at {successor}")
+    try:
+        done = subprocess.run([sys.executable, str(successor), "--continue", str(path)], check=False)
+        code = done.returncode
+    except OSError as exc:
+        print(f"{PROG}: {target}'s {PROG} could not run: {exc}", file=sys.stderr)
+        code = None
+    if code in (0, 3, 4):
+        return code
+    if record_finished(path):
+        return code if code is not None else 4
+    print(f"{PROG}: {target}'s {PROG} ended with {code} and left the update unfinished; "
+          f"rolling back from {path}", file=sys.stderr)
+    return rollback(path)
+
+
+def refuse_moved_tags(record: dict) -> None:
+    """Refuse when the target tag in any clone no longer names the commit the
+    record says was verified, or write-better's clone no longer has, or can
+    no longer reach from its fetched main, the commit its manifest named."""
+    src_dir = Path(record["src_dir"])
+    target = record["target_release"]
+    for name in TAGGED_CLONES:
+        clone = src_dir / name
+        now_names = tag_commit(clone, target)
+        if now_names != record["target_commits"].get(name):
+            raise Refused(
+                f"{target} in {clone} now names {str(now_names)[:9]}, and the commit verified for "
+                f"it is {str(record['target_commits'].get(name))[:9]}"
+            )
+    clone = src_dir / WRITE_BETTER
+    recorded = record["target_commits"].get(WRITE_BETTER)
+    problem = write_better_unreachable(clone, recorded) if recorded else "the record names no commit for it"
+    if problem:
+        raise Refused(f"{WRITE_BETTER}: {problem} at {clone}, and its manifest named "
+                      f"{str(recorded)[:9]}")
+
+
+def preflight_again(record: dict) -> None:
+    """The target copy's own preflight, on a machine where only shipwright has moved."""
+    src_dir = Path(record["src_dir"])
+    deploy_root = Path(record["deploy_root"])
+    installed, target = record["installed_release"], record["target_release"]
+    shipwright = src_dir / "shipwright"
+    rc, out, err = git("rev-parse", "HEAD", cwd=shipwright)
+    if rc != 0 or out.strip() != record["target_commits"].get("shipwright"):
+        raise Refused(f"shipwright at {shipwright} is not at the verified commit for {target}, "
+                      f"where the hand-off left it")
+    refuse_moved_tags(record)
+    for name in TAGGED_CLONES[1:] + (WRITE_BETTER,):
+        rc, out, _ = git("rev-parse", "HEAD", cwd=src_dir / name)
+        if rc != 0 or out.strip() != record["clones"].get(name):
+            raise Refused(f"{name} at {src_dir / name} is no longer at the commit the record names")
+    for name in STAMPED_REPOS:
+        if (read_stamp(deploy_root / name) or {}).get("commit") != record["deploy_stamps"].get(name):
+            raise Refused(f"{name}'s deploy stamp no longer names the commit the record names")
+    verify_clones_ready(src_dir, target)
+    verified = verify_release(src_dir, installed, target)
+    if verified != record["target_commits"]:
+        differ = sorted(n for n in set(verified) | set(record["target_commits"])
+                        if verified.get(n) != record["target_commits"].get(n))
+        raise Refused(f"{target}'s verification here checked other commits than the record names, "
+                      f"for {', '.join(differ)}")
+
+
+def move_clones(record: dict) -> None:
+    """Step 3's second part: the other tagged clones to their verified commits, write-better's
+    `main` fast-forwarded to the commit its manifest named.
+
+    A tag moved since the preflight refuses here, before any clone moves.
+    """
+    src_dir = Path(record["src_dir"])
+    target = record["target_release"]
+    refuse_moved_tags(record)
+    for name in TAGGED_CLONES[1:]:
+        say(f"moving {name} to {target}")
+        checkout(src_dir / name, record["target_commits"][name], f"moving {name}")
+    say(f"moving {WRITE_BETTER}'s main to the commit its manifest named")
+    git_step("merge", "-q", "--ff-only", record["target_commits"][WRITE_BETTER],
+             cwd=src_dir / WRITE_BETTER, what=f"moving {WRITE_BETTER}'s main")
+
+
+def stop_jobs(src_dir: Path) -> None:
+    run_step(install_jobs_argv(src_dir, "--stop"), "install-jobs --stop")
+
+
+def take_snapshot(path: Path, record: dict) -> None:
+    src_dir = Path(record["src_dir"])
+    argv = [sys.executable, str(src_dir / "shipwright" / "payload" / "bin" / "builder-backup"),
+            "--dest", str(path.parent / SNAPSHOT_NAME), "--library-state", str(LIBRARY_STATE),
+            "--orient-db", str(ORIENT_DB)]
+    if record.get("knowledge_repo"):
+        argv += ["--knowledge", record["knowledge_repo"]]
+    run_step(argv, "builder-backup, into the update's own snapshot")
+    if not (path.parent / SNAPSHOT_NAME / "latest" / "manifest.json").is_file():
+        raise StepFailed(f"builder-backup exited 0 and left no snapshot at {path.parent / SNAPSHOT_NAME}")
+
+
+def place(src_dir: Path, release: str, commits: dict[str, str], after_payload=None,
+          pin: dict[str, str] | None = None) -> None:
+    """Step 6 at `release`: the payload, then `stand-up-backend`'s place, link and register.
+
+    Run as that command runs each tool for `--shape single --seed-registry`,
+    with this interpreter. `--seed-registry` keeps the projects registry the
+    deploy area already holds. `commits` names the commit each repository's
+    ref must resolve to; an installer refuses, placing nothing, when it names
+    another. A repository absent from `commits` is placed unchecked.
+
+    `pin`, when given, names a repository's commit to pass to
+    `install-backend`'s `--commit`, which places it at exactly that commit
+    rather than resolving its ref. Always passed for write-better, whose ref
+    is its own `main` rather than a release tag: `install-backend` resolves
+    that ref against its own fetched `origin/main`, which can by now differ
+    from `commits[WRITE_BETTER]` — the commit a signed manifest named, or the
+    one a rollback is going back to — in either direction, so resolving the
+    ref again here could place the wrong one.
+    """
+    bin_dir = src_dir / "shipwright" / "bin"
+    run_step(["sh", str(bin_dir / "install-payload"), f"--ref={release}",
+              f"--expect-commit={commits['shipwright']}"], f"install-payload at {release}")
+    if after_payload is not None:
+        after_payload()
+    expect = [arg for name in STAMPED_REPOS + (WRITE_BETTER,) if name in commits
+              for arg in ("--expect-commit", f"{name}={commits[name]}")]
+    pin_args = [arg for name, commit in (pin or {}).items()
+                for arg in ("--commit", f"{name}={commit}")]
+    run_step([sys.executable, str(bin_dir / "install-backend"), "--release", release, "--seed-registry",
+              *pin_args,
+              *expect], f"install-backend at {release}")
+    run_step([sys.executable, str(bin_dir / "link-commands")], "link-commands")
+    run_step([sys.executable, str(bin_dir / "register-mcp")], "register-mcp")
+
+
+def render_jobs(src_dir: Path) -> None:
+    run_step(install_jobs_argv(src_dir), "install-jobs, re-rendering the jobs and running their prepare steps")
+
+
+def start_jobs(src_dir: Path, labels: list[str]) -> None:
+    """Start each of `labels` that is not running now.
+
+    tmux-keeper is never stopped (`install-jobs --stop` leaves it up), so it
+    is in the record's running jobs and still running here.
+    """
+    running = jobs_running(src_dir)
+    if running is None:
+        raise StepFailed("install-jobs --running could not say which jobs are running")
+    stopped = [label for label in labels if label not in running]
+    if stopped:
+        run_step(install_jobs_argv(src_dir, "--start", *stopped), "install-jobs --start")
+
+
+def sync_knowledge_index(src_dir: Path, deploy_root: Path) -> None:
+    """Rebuild the knowledge index now the Library has restarted, with `--soft`.
+
+    An update's index is usually already built, and `agentctl kb sync`
+    refuses rather than overwrite a diverged local checkout (see
+    `jobs/library.toml`'s own comment) — not a reason to fail the whole
+    update, unlike a genuinely empty index on a fresh install, which is why
+    `bin/stand-up-backend` runs the same tool without `--soft`.
+    """
+    run_step(
+        [sys.executable, str(src_dir / "shipwright" / "bin" / "sync-knowledge-index"),
+         "--deploy", str(deploy_root), "--soft"],
+        "sync-knowledge-index, rebuilding the knowledge index now the Library is answering",
+    )
+
+
+def default_jobs(shipwright: Path, commit: str) -> dict[str, bool]:
+    """Each label `commit`'s declarations list for this platform, and whether it is enabled by default.
+
+    Read with `git show` at the commit, and parsed by `tools/jobs/declaration.py`
+    from shipwright's checkout, the loader its `install-jobs` renders them with.
+    """
+    sys.path.insert(0, str(shipwright / "tools"))
+    try:
+        from jobs import declaration
+    finally:
+        sys.path.pop(0)
+
+    platform = "macos" if sys.platform == "darwin" else "linux"
+    listing = git_step("ls-tree", "--name-only", commit, "jobs/", cwd=shipwright,
+                       what=f"listing the job declarations at {commit[:9]}")
+    found: dict[str, bool] = {}
+    for relpath in listing.splitlines():
+        if not relpath.endswith(".toml"):
+            continue
+        text = git_step("show", f"{commit}:{relpath}", cwd=shipwright,
+                        what=f"reading {relpath} at {commit[:9]}")
+        try:
+            job = declaration.parse(text, source=f"{relpath} at {commit[:9]}")
+        except declaration.DeclarationError as exc:
+            raise StepFailed(str(exc)) from exc
+        if job.runs_on(platform):
+            found[job.label] = job.enabled_by_default
+    return found
+
+
+def jobs_to_start(record: dict) -> list[str]:
+    """The jobs that ran before, then each job the target adds that is enabled by default."""
+    shipwright = Path(record["src_dir"]) / "shipwright"
+    before = default_jobs(shipwright, record["clones"]["shipwright"])
+    after = default_jobs(shipwright, record["target_commits"]["shipwright"])
+    labels = list(record["jobs_running"])
+    labels += sorted(label for label, on in after.items() if on and label not in before
+                     and label not in labels)
+    return labels
+
+
+def library_answers() -> str | None:
+    """None when the Library answers `/whoami` for Orient's credential, else why not.
+
+    The credential reaches `curl` on its standard input, never on its command
+    line, the way `payload/docs/after-installing.md` passes it.
+    """
+    try:
+        token = ORIENT_TOKEN.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        return f"cannot read Orient's Library credential at {ORIENT_TOKEN}: {exc}"
+    deadline = time.monotonic() + WHOAMI_WAIT_SECONDS
+    while True:
+        try:
+            result = subprocess.run(
+                ["curl", "-fsS", "--max-time", "5", "-H", "Library-Protocol: 1", "-H", "@-",
+                 f"{LIBRARY_URL}/whoami"],
+                input=f"Authorization: Bearer {token}\n", capture_output=True, text=True, check=False,
+            )
+            why = None if result.returncode == 0 else (result.stderr.strip() or f"curl exited {result.returncode}")
+        except OSError as exc:
+            why = f"curl could not run: {exc}"
+        if why is None or time.monotonic() >= deadline:
+            return None if why is None else f"the Library did not answer /whoami for Orient's credential: {why}"
+        time.sleep(2)
+
+
+def schema_problem(deploy_root: Path) -> str | None:
+    """None when the Library's database is at every head of the placed release's migrations."""
+    library = deploy_root / "library"
+    try:
+        conn = sqlite3.connect(f"file:{LIBRARY_STATE / 'library.db'}?mode=ro", uri=True)
+        try:
+            current = {row[0] for row in conn.execute("SELECT version_num FROM alembic_version")}
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return f"cannot read the Library's schema version: {exc}"
+    try:
+        result = subprocess.run([str(library / ".venv" / "bin" / "python"), "-m", "alembic", "heads"],
+                                cwd=str(library), capture_output=True, text=True, check=False)
+    except OSError as exc:
+        return f"cannot ask the placed Library for its migration heads: {exc}"
+    if result.returncode != 0:
+        return f"alembic heads exited {result.returncode}: {result.stderr.strip()}"
+    heads = {line.split()[0] for line in result.stdout.splitlines() if line.strip()}
+    if current != heads:
+        return (f"the Library's schema is at {', '.join(sorted(current)) or '(none)'}, and the placed "
+                f"release's head is {', '.join(sorted(heads)) or '(none)'}")
+    return None
+
+
+def check_release(record: dict, release: str, started: list[str], commits: dict[str, str]) -> list[str]:
+    """Step 9's four checks against `release`, whose commits are `commits`; each problem found, in words."""
+    src_dir = Path(record["src_dir"])
+    deploy_root = Path(record["deploy_root"])
+    shipwright = src_dir / "shipwright"
+    problems = []
+    try:
+        run_step([sys.executable, str(shipwright / "bin" / "stand-up-backend"), "--shape", "single",
+                  "--check"], "stand-up-backend --shape single --check", capture=True)
+    except StepFailed as exc:
+        problems.append(str(exc))
+    running = jobs_running(src_dir)
+    if running is None:
+        problems.append("install-jobs --running could not say which jobs are running")
+    else:
+        missing = [label for label in started if label not in running]
+        if missing:
+            problems.append(f"not running: {', '.join(missing)}")
+    if LIBRARY_LABEL in started:
+        for problem in (library_answers(), schema_problem(deploy_root)):
+            if problem:
+                problems.append(problem)
+    for name in STAMPED_REPOS:
+        want = commits.get(name)
+        have = (read_stamp(deploy_root / name) or {}).get("commit")
+        if want is None or have != want:
+            problems.append(f"{name}'s deploy stamp names {str(have)[:9]}, not {release}'s "
+                            f"{str(want)[:9]}")
+    return problems
+
+
+def finish(path: Path, record: dict, outcome: str) -> None:
+    record["finished"] = {"outcome": outcome, "at": stamp_time(now())}
+    save_record(path, record)
+
+
+def prune_snapshots(state_dir: Path, keep: Path) -> None:
+    """Remove the snapshot of every earlier finished update, now that `keep`'s update has succeeded."""
+    for other in sorted(state_dir.glob(f"*/{RECORD_NAME}")):
+        if other.parent == keep.parent or not record_finished(other):
+            continue
+        snapshot = other.parent / SNAPSHOT_NAME
+        if snapshot.is_dir() and not snapshot.is_symlink():
+            shutil.rmtree(snapshot)
+
+
+def continue_update(path: Path) -> int:
+    """The target release's half of an update: preflight again, then steps 3 to 9."""
+    try:
+        record = load_record(path)
+    except Refused as exc:
+        print(f"{PROG}: refusing — {exc}", file=sys.stderr)
+        return 2
+    if record.get("finished"):
+        print(f"{PROG}: refusing — the update recorded at {path} has already finished", file=sys.stderr)
+        return 2
+    if not isinstance(record.get("target_commits"), dict):
+        print(f"{PROG}: refusing — the update record at {path} names no verified commits",
+              file=sys.stderr)
+        return 2
+    src_dir = Path(record["src_dir"])
+    installed, target = record["installed_release"], record["target_release"]
+    try:
+        say(f"{target}'s {PROG} running the preflight again")
+        preflight_again(record)
+        move_clones(record)
+    except Refused as exc:
+        # Nothing but shipwright has moved; the rollback puts it back.
+        print(f"{PROG}: refusing — {exc}", file=sys.stderr)
+        code = rollback(path)
+        return 2 if code == 3 else code
+    except (StepFailed, OSError) as exc:
+        print(f"{PROG}: the update to {target} failed: {exc}", file=sys.stderr)
+        return rollback(path)
+
+    try:
+        begin(path, record, "stop")
+        say("stopping the jobs; the Library and Orient are down until the restart")
+        stop_jobs(src_dir)
+
+        begin(path, record, "snapshot")
+        take_snapshot(path, record)
+
+        def note_knowledge() -> None:
+            record["knowledge_after_update"] = knowledge_main(
+                Path(record["knowledge_repo"]) if record.get("knowledge_repo") else None)
+            save_record(path, record)
+
+        begin(path, record, "place")
+        place(src_dir, target, record["target_commits"], after_payload=note_knowledge,
+              pin={WRITE_BETTER: record["target_commits"][WRITE_BETTER]})
+
+        begin(path, record, "migrate")
+        render_jobs(src_dir)
+
+        labels = jobs_to_start(record)
+        record["jobs_started"] = labels
+        begin(path, record, "restart")
+        start_jobs(src_dir, labels)
+        if LIBRARY_LABEL in labels:
+            sync_knowledge_index(src_dir, Path(record["deploy_root"]))
+
+        begin(path, record, "verify")
+        problems = check_release(record, target, labels, record["target_commits"])
+        if problems:
+            raise StepFailed("the restarted backend did not check out:\n" +
+                             "\n".join(f"  {p}" for p in problems))
+    except (StepFailed, Refused, OSError) as exc:
+        print(f"{PROG}: the update to {target} failed: {exc}", file=sys.stderr)
+        return rollback(path)
+
+    finish(path, record, "updated")
+    prune_snapshots(path.parent.parent, path)
+    say(f"ok — updated from {installed} to {target}; every job that ran before is running again")
+    if record["target_commits"].get("convivy-deck") != record["clones"].get("convivy-deck"):
+        say(f"Deck changed in {target}. On your Mac laptop, move Deck to it with:\n"
+            f"    git -C ~/src/convivy-deck fetch --tags origin\n"
+            f"    python3 ~/src/shipwright/bin/install-deck --ref {target}")
+    return 0
+
+
+# --- the rollback -----------------------------------------------------------
+
+def restore_databases(path: Path) -> None:
+    """Put the snapshot's three databases back, as the restore page does, and delete vectors.db."""
+    latest = path.parent / SNAPSHOT_NAME / "latest"
+    for name, dest in RESTORED:
+        source = latest / name
+        if not source.is_file():
+            raise StepFailed(f"the snapshot at {latest} holds no {name}")
+    for name, dest in RESTORED:
+        tmp = dest.with_name(f".{dest.name}.restore-{os.getpid()}")
+        shutil.copyfile(latest / name, tmp)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, dest)
+        for suffix in ("-wal", "-shm"):
+            Path(f"{dest}{suffix}").unlink(missing_ok=True)
+        say(f"restored {dest} from the snapshot")
+    for extra in ("", "-wal", "-shm"):
+        Path(f"{VECTORS_DB}{extra}").unlink(missing_ok=True)
+    say(f"deleted {VECTORS_DB}; init_vectors.py and a reindex rebuild it")
+
+
+def move_clones_back(record: dict) -> None:
+    src_dir = Path(record["src_dir"])
+    for name in TAGGED_CLONES:
+        checkout(src_dir / name, record["clones"][name], f"moving {name} back")
+    git_step("reset", "-q", "--keep", record["clones"][WRITE_BETTER], cwd=src_dir / WRITE_BETTER,
+             what=f"moving {WRITE_BETTER}'s main back")
+    say(f"every clone is back at the commit the record names")
+
+
+def local_remote(repo: Path) -> bool:
+    """Whether `repo`'s origin is a folder on this machine, as the install makes it."""
+    rc, out, _ = git("remote", "get-url", "origin", cwd=repo)
+    url = out.strip()
+    if rc != 0 or not url:
+        return False
+    if url.startswith("file://"):
+        url = url[len("file://"):]
+    elif "://" in url or re.match(r"^[^/]+:", url):
+        return False
+    return Path(url).is_dir()
+
+
+def reset_knowledge(record: dict) -> None:
+    """Reset the knowledge repository's main only when it is still at the commit the update made."""
+    if not record.get("knowledge_repo") or not record.get("knowledge_main"):
+        return
+    repo = Path(record["knowledge_repo"])
+    before, made = record["knowledge_main"], record.get("knowledge_after_update")
+    current = knowledge_main(repo)
+    if current == before:
+        return
+    if made is not None and current == made and local_remote(repo):
+        rc, out, _ = git("symbolic-ref", "--quiet", "HEAD", cwd=repo)
+        if rc == 0 and out.strip() == "refs/heads/main":
+            git_step("reset", "-q", "--keep", before, cwd=repo, what="resetting the knowledge repository")
+        else:
+            git_step("update-ref", "refs/heads/main", before, made, cwd=repo,
+                     what="resetting the knowledge repository")
+        git_step("push", "-q", f"--force-with-lease=main:{made}", "origin", "main", cwd=repo,
+                 what="pushing the reset knowledge repository to its local remote")
+        say(f"reset the knowledge repository's main to {before[:9]}")
+        return
+    rc, out, _ = git("diff", "--name-only", before, made or current or before, cwd=repo)
+    changed = [line for line in out.splitlines() if line.strip()] if rc == 0 else []
+    say(f"left the knowledge repository's main alone: it has moved since the update "
+        f"changed it. The documents the update changed:" +
+        ("".join(f"\n    {name}" for name in changed) if changed else " (could not list them)"))
+
+
+def rollback(path: Path) -> int:
+    """Undo every begun step from the record, then check the old release; 3 when it did, 4 when not."""
+    try:
+        record = load_record(path)
+    except Refused as exc:
+        print(f"{PROG}: the rollback cannot start — {exc}", file=sys.stderr)
+        return 4
+    src_dir = Path(record["src_dir"])
+    old = record["installed_release"]
+    begun = set(record["begun"])
+    previously = record.get("jobs_running") or []
+    say(f"rolling back to {old}")
+
+    undo_steps = [
+        ("stop the jobs again", "stop" in begun, lambda: stop_jobs(src_dir)),
+        ("restore the snapshot's databases (step 7)", "migrate" in begun, lambda: restore_databases(path)),
+        ("check each clone out at its recorded commit (step 3)", "clones" in begun,
+         lambda: move_clones_back(record)),
+        ("reset the knowledge repository (step 6)", "place" in begun, lambda: reset_knowledge(record)),
+        ("place the old release again (step 6)", "place" in begun,
+         lambda: place(src_dir, old, record["clones"], pin={WRITE_BETTER: record["clones"][WRITE_BETTER]})),
+        ("re-render the old release's jobs (step 7)", "migrate" in begun, lambda: render_jobs(src_dir)),
+        ("start the jobs that ran before (step 4)", "stop" in begun, lambda: start_jobs(src_dir, previously)),
+    ]
+    undone: list[str] = []
+    for name, needed, action in undo_steps:
+        if not needed:
+            continue
+        try:
+            action()
+        except (StepFailed, Refused, OSError) as exc:
+            record["undone"] = undone
+            save_record(path, record)
+            print(f"{PROG}: the rollback did not finish. It could not {name}: {exc}", file=sys.stderr)
+            print(f"{PROG}: undone so far: " + ("; ".join(undone) if undone else "nothing"), file=sys.stderr)
+            print(f"{PROG}: the record stays at {path}. Run `{PROG} --rollback` to finish the rollback.",
+                  file=sys.stderr)
+            return 4
+        undone.append(name)
+        record["undone"] = undone
+        save_record(path, record)
+
+    problems = check_release(record, old, previously, record["clones"])
+    if problems:
+        print(f"{PROG}: the rollback did not finish: {old} did not check out:\n" +
+              "\n".join(f"  {p}" for p in problems), file=sys.stderr)
+        print(f"{PROG}: undone: " + ("; ".join(undone) if undone else "nothing"), file=sys.stderr)
+        print(f"{PROG}: the record stays at {path}. Run `{PROG} --rollback` to finish the rollback.",
+              file=sys.stderr)
+        return 4
+    finish(path, record, "rolled-back")
+    say(f"rolled back — the install is on {old} again and the jobs that ran before are running. "
+        f"Undone: " + ("; ".join(undone) if undone else "nothing had changed"))
+    return 3
+
+
+# --- the command ------------------------------------------------------------
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Move a single-account Builder install to a later release, and put it back when a step fails.",
+    )
+    parser.add_argument("--shape", choices=tuple(SHAPES),
+                        help="the install shape, which this never chooses for you: "
+                             + "; ".join(f"{k}, {v}" for k, v in SHAPES.items()))
+    parser.add_argument("--release", default=None, metavar="vX.Y.Z",
+                        help="the release to update to (default: the tag stable points at)")
+    parser.add_argument("--plan", action="store_true",
+                        help="print the report and exit; ask nothing, change nothing but fetched refs")
+    parser.add_argument("--src-dir", type=Path, default=DEFAULT_SRC_DIR,
+                        help=f"where the six repositories are cloned (default {DEFAULT_SRC_DIR})")
+    parser.add_argument("--rollback", action="store_true",
+                        help="finish rolling back an update that did not finish, from its record")
+    # The hand-off from the release that started the update; see the module docstring.
+    parser.add_argument("--continue", dest="continue_record", type=Path, default=None,
+                        help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+
+    if args.continue_record is not None:
+        return continue_update(args.continue_record)
+
+    unfinished = find_unfinished_record(DEFAULT_STATE_DIR)
+    if args.rollback:
+        if unfinished is None:
+            print(f"{PROG}: no unfinished update to roll back under {DEFAULT_STATE_DIR}. "
+                  f"Nothing was changed.", file=sys.stderr)
+            return 2
+        return rollback(unfinished)
+
+    if unfinished is not None:
+        print(
+            f"{PROG}: refusing — an update record already exists at {unfinished}, from a "
+            f"run that did not finish. Nothing further runs until it is resolved: run "
+            f"`{PROG} --rollback` to finish rolling it back.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.shape is None:
+        shapes = "\n".join(f"  --shape {k:<7} {v}" for k, v in SHAPES.items())
+        print(f"{PROG}: name the install shape; this never chooses one for you:\n{shapes}",
+              file=sys.stderr)
+        return 2
+    if args.shape == "two":
+        print(f"{PROG}: the two-account install is not built yet in this release. "
+              f"Nothing was changed.", file=sys.stderr)
+        return 2
+
+    src_dir = args.src_dir.expanduser().absolute()
+
+    try:
+        # Looked up here, at call time, so a test can stand in for this
+        # machine's account list.
+        mismatch = shape_mismatch(args.shape, exists=account_exists)
+        if mismatch:
+            raise Refused(mismatch)
+        deploy_root = default_deploy_root()
+        installed, clones = find_installed_release(src_dir, deploy_root)
+        fetch_tags(src_dir)
+        target, already_current = pick_target(args.release, src_dir, installed)
+        if already_current:
+            print(f"{PROG}: ok — already current at {installed}")
+            return 0
+        verify_clones_ready(src_dir, target)
+        verified = verify_release(src_dir, installed, target)
+    except Refused as exc:
+        print(f"{PROG}: refusing — {exc}", file=sys.stderr)
+        return 2
+
+    steps = plan_steps(args.shape, target)
+    print(render_report(installed, target, args.shape, steps))
+
+    if args.plan:
+        return 0
+
+    if args.shape == "three":
+        print(f"{PROG}: the three-account update is not built yet in this release. "
+              f"Nothing was changed.", file=sys.stderr)
+        return 2
+
+    try:
+        answer = input(f"{PROG}: proceed with this update? [y/N] ")
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() not in ("y", "yes"):
+        print(f"{PROG}: not confirmed; nothing was changed.", file=sys.stderr)
+        return 2
+
+    jobs = jobs_running(src_dir)
+    if jobs is None:
+        print(f"{PROG}: refusing — install-jobs --running could not say which jobs are running, "
+              f"so there is no telling which to start again. Nothing was changed.", file=sys.stderr)
+        return 2
+    try:
+        path = write_record(DEFAULT_STATE_DIR, installed, target, args.shape, clones, deploy_root,
+                            jobs, knowledge_root(), src_dir, verified)
+    except StepFailed as exc:
+        print(f"{PROG}: refusing — {exc}. Nothing was changed.", file=sys.stderr)
+        return 2
+    say(f"recorded the update at {path}")
+    return hand_off(path, load_record(path))
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

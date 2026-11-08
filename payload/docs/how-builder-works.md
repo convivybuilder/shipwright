@@ -114,8 +114,8 @@ activity, so an abandoned session blocks nobody for long.
 
 This section explains how Builder makes sure a change was reviewed before it is accepted, and where
 that protection is weaker. The protection depends on the install's shape. The next two paragraphs
-describe the two-account install, which is not built yet; the single-account install, the only
-shape built today, comes after them and has the weaker protection.
+describe the three-account install, which comes in a later release; the single-account install, the
+only shape built today, comes after them and has the weaker protection.
 
 A change to code becomes a pull request, and two agents review it: a **reviewer**, who reads it for
 mistakes, and a **security reviewer**, who reads it for what an attacker could do with it. Each
@@ -132,32 +132,26 @@ review program can read, so a green check means a review ran on exactly that com
 is an identity on GitHub that belongs to a program, and a commit is one recorded change. A crew
 that rewrote Builder's own code still could not produce a green check.
 
-That is the two-account install. The single-account install runs Builder as your own account and has
+That is the three-account install. The single-account install runs Builder as your own account and has
 no approver: the reviewers post their findings on the pull request, and the rule on `main` that you
 set on GitHub can require a pull request and the repository's own automated checks. Its agents reach
-GitHub as an App you create, and you choose one of two merge modes, which [Connecting
-GitHub](connecting-github.md) sets up. In **Enforced**, the rule on `main` requires an approval from
-the one person a file named `CODEOWNERS` lists, you, so GitHub refuses to merge a pull request an
-agent opened until you approve it. On a pull request you opened and only you pushed
-to, GitHub asks for no code owner's review and would count an agent's approval, as [What Enforced
-still allows](connecting-github.md#what-enforced-still-allows) explains. In **Instruction only**, nothing on GitHub stops an
-agent from merging, so the rule that you merge is held by the machine-wide instruction every session
-reads, `~/.claude/CLAUDE.md`. That instruction stands in both modes. The install writes that file
-only when you have none, and [One account vs. multiple accounts on the
-server](accounts-on-the-server.md#the-single-account-install)
-says what to do if you had one.
+GitHub as an App you create, through the mode called Instruction only, which [Connecting
+GitHub](connecting-github.md) sets up. Nothing on GitHub stops an agent from merging, so the rule
+that you merge is held by the machine-wide instruction every session reads, `~/.claude/CLAUDE.md`.
+The install writes that file only when you have none, and [One account vs. multiple accounts on the
+server](accounts-on-the-server.md#the-single-account-install) says what to do if you had one. In
+Deterministic, the other mode that page describes, GitHub itself lets only you merge.
 
-The decision to merge is yours. On the two-account install the review checks say a change may merge;
+The decision to merge is yours. On the three-account install the review checks say a change may merge;
 on either install you decide that it does, unless your agent policy names that kind of change. The
 agent policy is a file you own that lists what agents may do without you. Your knowledge repository,
 the git repository that holds the Reference Room, is the one place the Library merges for itself.
 `agentctl kb merge`, the command the Library merges through, and `agentctl docs merge`, which merges
 reviewed documentation, each read the policy and refuse anything it does not permit. On the
-single-account install that refusal covers only merges made through those commands. In Enforced
-mode GitHub refuses the rest without your approval, except on a pull request you opened, where only
-the instruction stops an agent approving; in Instruction only, an agent could merge
-another way, and the `~/.claude/CLAUDE.md` instruction above is the rule against it. A merge you start from Deck or Orient takes a separate path, through a merge check in
-the Library, and that check approves every merge it is asked about for now, as [What works and what does not yet](install-status.md) says.
+single-account install that refusal covers only merges made through those commands; an agent could
+merge another way, and the `~/.claude/CLAUDE.md` instruction above is the rule against it. A merge
+you start from Deck or Orient takes a separate path, through a merge check in the Library, and that
+check approves every merge it is asked about for now, as [What works and what does not yet](install-status.md) says.
 
 ## The Bosun: how an agent is put to work
 

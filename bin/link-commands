@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Put Builder's commands where an operator can type their names, and its two
-writing skills and its session hook where every session loads them.
+writing skills, its session hook and its non-login PATH line where every
+session, and every bare command over ssh, finds them.
 
     bin/link-commands              link the core set into ~/.local/bin, the
-                                   writing skills into ~/.claude/skills, and
-                                   add the stale-backup hook to
-                                   ~/.claude/settings.json
+                                   writing skills into ~/.claude/skills, add
+                                   the stale-backup hook to
+                                   ~/.claude/settings.json, and add the PATH
+                                   line to the login shell's non-login
+                                   startup file
     bin/link-commands --status     what is linked, and to what
     bin/link-commands --dry-run    say what would happen, change nothing
     bin/link-commands --check      report only; 1 if work is left, 2 if refused
@@ -52,14 +55,16 @@ command deciding to end that, which is not its call.
 
 ## What it reports rather than fixes
 
-**Whether the link directory is on PATH.** Linking into a directory the shell
-does not search produces an install where every check passes and nothing can be
-typed — the exact shape of failure this whole file exists to end, one level
-further out. It is reported and not repaired: editing a stranger's shell
-profile is a larger liberty than an installer should take, and which file to
-edit depends on a shell and a login mode this command cannot see.
+**Whether the link directory is on PATH in a LOGIN shell.** Linking into a
+directory the shell does not search produces an install where every check
+passes and nothing can be typed — the exact shape of failure this whole file
+exists to end, one level further out. For a session at a prompt this is
+reported and not repaired: which file a login shell reads (`~/.profile`,
+`~/.zprofile`, and which of those an actual login runs) is a larger liberty
+than an installer should take, and depends on a login mode this command
+cannot see. **A bare, non-login command is different, and is fixed below.**
 
-## The session hook, the one thing here that is not a link
+## The session hook, and the PATH line — the two things here that are not links
 
 **A STALE BACKUP IS REPORTED WHERE THE OPERATOR IS, WHICH IS A SESSION.** The
 operator decided that a Claude Code SessionStart hook runs
@@ -71,6 +76,21 @@ is read, the entry is appended to `hooks.SessionStart` if no entry already runs
 the same command, and the whole is written back through a staging file and an
 atomic rename. A file that is not a JSON object, or whose `hooks` is shaped
 differently from what Claude Code reads, is refused by name and left alone.
+
+**A BARE COMMAND OVER SSH READS NEITHER LOGIN FILE ABOVE.** Deck runs
+`session-agent` by bare name over a plain, non-login `ssh host command`, which
+loads neither `~/.profile` nor `~/.zprofile` — seen on a fresh Debian 12 host,
+where PATH was `/usr/local/bin:/usr/bin:/bin:/usr/games` and `command -v
+session-agent` failed, reading the host as not installed. So this prepends
+`export PATH="$HOME/.local/bin:$PATH:/opt/homebrew/bin" # added by Builder's link-commands` as
+the first line — never appended, since a stock Debian `~/.bashrc` returns
+early for a non-interactive shell before it ever reaches the end — of the one
+file the running account's own login shell (read from the password database,
+never `$SHELL`) reads for exactly that case: `~/.bashrc` for bash, `~/.zshenv`
+for zsh. Every other byte and the file's own mode are kept; the file is
+created at mode 644 if it was absent. An exact copy of the line already
+anywhere in the file counts as done. A login shell this knows no such file
+for is left alone, reported by name, never a reason to fail the install.
 """
 
 from __future__ import annotations
@@ -78,6 +98,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pwd
 import secrets
 import shlex
 import sys
@@ -102,7 +123,7 @@ SOURCE_REPOSITORY = "agent-platform"
 # know what the ten have in common: everything here is something a session, a
 # steward skill, or the person at the prompt invokes by name.
 COMMANDS = (
-    ("co", "start a session in a crew's directory — what new-crew and new-subcrew run"),
+    ("co", "start a session in a crew's directory — what new-crew runs"),
     ("agentctl", "dispatch agents and register a crew's agent prefix"),
     ("co-working-on", "announce what a session is doing right now"),
     ("co-rollover", "rotate a session that has filled its context"),
@@ -119,10 +140,15 @@ COMMANDS = (
 # that set is a decision about which agent-platform commands a stranger sees,
 # and these are Builder's own. `builder-backup` is here because the backup
 # decision has the operator run it by hand before a reboot, which means typing
-# its name.
+# its name. `builder-update` is here for the same reason: an update is
+# something the operator types. `mint-crew-ops-credentials` is here because
+# `new-crew` runs it by name right after registering a crew, and an operator
+# re-runs it by hand to recover a crew left without its ops tools.
 PAYLOAD_REPOSITORY = "builder-payload"
 PAYLOAD_COMMANDS = (
     ("builder-backup", "back up the Library and the knowledge repository, or say when the last backup succeeded"),
+    ("builder-update", "report what updating Builder would do, and refuse until it verifies"),
+    ("mint-crew-ops-credentials", "give every registered crew its own pair of ops credentials"),
 )
 
 # Which command places each area, for the refusal that finds one missing.
@@ -166,6 +192,120 @@ def hook_command(deploy_root: Path) -> str:
     """
     path = source_for("builder-backup", deploy_root, PAYLOAD_REPOSITORY)
     return f"{shlex.quote(str(path))} --session-hook"
+
+
+# **THE PATH LINE.** A login shell's own startup reaches `~/.profile` (or, on
+# a Mac, `~/.zprofile`) and that is enough to put `~/.local/bin` on PATH for
+# a session at a prompt — but Deck runs `session-agent` by bare name over a
+# plain, non-login `ssh host command`, which reads neither file. Seen on a
+# fresh Debian 12 host: PATH was `/usr/local/bin:/usr/bin:/bin:/usr/games`,
+# and `command -v session-agent` failed, so Deck read the host as not
+# installed. This line, placed in the file each shell's own NON-LOGIN
+# startup reads, is what a bare command over ssh actually sees.
+PROFILE_NAME = "shell-profile"
+PROFILE_WHY = ("put ~/.local/bin on PATH for a bare command run over plain, "
+               "non-login ssh, which a login shell's own profile never reaches")
+#
+# `/opt/homebrew/bin` IS ON THE END BECAUSE `session-agent` RUNS `tmux` BY BARE NAME
+# OVER THE SAME SSH, and Homebrew's `/etc/paths.d` file reaches only a login shell:
+# on a test Mac, plain ssh's PATH was `/usr/bin:/bin:/usr/sbin:/sbin`, which holds no
+# tmux. Last, where a Mac's login shell also puts it, so it shadows no system tool.
+# It is one fixed line for every platform, which is what lets the uninstaller remove
+# it by its exact text, and a directory that is absent on Linux costs nothing.
+PROFILE_LINE = 'export PATH="$HOME/.local/bin:$PATH:/opt/homebrew/bin" # added by Builder\'s link-commands'
+# The file each shell reads for a non-interactive, non-login command — never
+# the login-shell files (`~/.profile`, `~/.zprofile`) PATH is reported as
+# missing from elsewhere in this file, which a bare ssh command never reads.
+PROFILE_FILES = {
+    "bash": ".bashrc",
+    "zsh": ".zshenv",
+}
+
+
+def login_shell_name() -> str:
+    """The basename of the running account's own login shell, from the
+    password database.
+
+    **`pwd.getpwuid(os.getuid()).pw_shell`, NEVER `$SHELL`.** `$SHELL` is
+    inherited from whatever started this process and is unset entirely over
+    a plain, non-interactive `ssh host command` — the password database is
+    what decides which startup file a shell invoked by name actually reads,
+    regardless of what this process happened to inherit.
+    """
+    return os.path.basename(pwd.getpwuid(os.getuid()).pw_shell)
+
+
+def profile_target(home: Path) -> tuple[Path | None, str]:
+    """The file this account's login shell reads for a non-login command,
+    paired with the shell's own name — or `(None, name)` for a login shell
+    this knows no such file for."""
+    name = login_shell_name()
+    rel = PROFILE_FILES.get(name)
+    return (home / rel if rel else None), name
+
+
+def has_profile_line(path: Path) -> bool:
+    """Whether `PROFILE_LINE` already appears, verbatim, anywhere in `path`."""
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise Refused(f"could not read {path} ({exc.strerror or exc})") from None
+    return PROFILE_LINE in text.splitlines()
+
+
+def place_profile_line(path: Path) -> None:
+    """Prepend `PROFILE_LINE` as the first line of `path`, keeping every
+    other byte and the file's own mode exactly as they were. Absent, `path`
+    is created at mode 644.
+
+    **FIRST, NEVER APPENDED.** A stock Debian `~/.bashrc` returns early near
+    its own top for a non-interactive shell (`[ -z "$PS1" ] && return`), so a
+    line appended at the end would never run for exactly the case this
+    exists to fix.
+
+    **WRITTEN TO THE FILE A SYMLINK NAMES, NOT OVER THE SYMLINK**, and
+    through the same staging-file-and-atomic-rename `place_hook` uses, for
+    the same reason: this is a file the operator owns, and a rename that
+    replaced a dotfiles-managed link would quietly end that arrangement.
+    """
+    real = Path(os.path.realpath(path))
+    try:
+        existing = real.read_text()
+    except FileNotFoundError:
+        existing = None
+    except OSError as exc:
+        raise Refused(f"could not read {real} ({exc.strerror or exc})") from None
+    if existing is not None and PROFILE_LINE in existing.splitlines():
+        return
+    mode = 0o644
+    if existing is not None:
+        try:
+            mode = real.stat().st_mode & 0o777
+        except OSError:
+            pass
+    body = PROFILE_LINE + "\n" + (existing or "")
+    try:
+        fd, staging = tempfile.mkstemp(prefix=f".{real.name}.link-commands.",
+                                       dir=real.parent)
+    except OSError as exc:
+        raise Refused(f"could not write in {real.parent} ({exc.strerror or exc}); "
+                      f"{real} was not changed") from None
+    try:
+        with os.fdopen(fd, "w") as out:
+            out.write(body)
+            os.fchmod(out.fileno(), mode)
+        os.replace(staging, real)
+    except BaseException as exc:
+        try:
+            os.unlink(staging)
+        except OSError:
+            pass
+        if isinstance(exc, OSError):
+            raise Refused(f"could not write {real} ({exc.strerror or exc}); "
+                          f"it was not changed") from None
+        raise
 
 
 class Refused(Exception):
@@ -286,13 +426,18 @@ def classify(link: Path, want: Path) -> str:
 
 
 def plan(deploy_root: Path, bin_dir: Path, skills_dir: Path | None = None,
-         commands: bool = True, settings: Path | None = None) -> list[dict]:
+         commands: bool = True, settings: Path | None = None,
+         home: Path | None = None) -> list[dict]:
     """One record per link: where it should point, and what is there now.
 
     A command is a file linked into `bin_dir`. A skill is a directory linked
     into `skills_dir`, and counts as deployed when its `SKILL.md` is there.
     `commands=False` plans the skills alone, for `--only skills`. The session
     hook is one more record, with `link` naming the settings file it goes in.
+    The PATH line is a further one, with `link` naming the shell's own
+    startup file, or `None` for a login shell this knows no such file for —
+    `home` defaults to `Path.home()`, the real operator's, so a caller
+    testing this (or acting for another account entirely) must pass its own.
     """
     items = []
     wanted = ([(n, w, SOURCE_REPOSITORY) for n, w in COMMANDS]
@@ -326,6 +471,23 @@ def plan(deploy_root: Path, bin_dir: Path, skills_dir: Path | None = None,
             "command": command,
             "deployed": want.is_file(),
             "state": hook_state(read_settings(settings), settings, command),
+        })
+    if commands:
+        profile_path, shell_name = profile_target(home if home is not None else Path.home())
+        if profile_path is None:
+            profile_state = "unsupported"
+        else:
+            profile_state = "ours" if has_profile_line(profile_path) else "absent"
+        items.append({
+            "name": PROFILE_NAME,
+            "why": PROFILE_WHY,
+            "repository": None,
+            "want": None,
+            "link": profile_path,
+            "line": PROFILE_LINE,
+            "shell": shell_name,
+            "deployed": True,
+            "state": profile_state,
         })
     if skills_dir is None:
         return items
@@ -424,6 +586,10 @@ def refuse_escaping(items: list[dict], deploy_root: Path) -> None:
     root = os.path.realpath(deploy_root)
     escaping = []
     for item in items:
+        # The PATH-line item names no deploy-area target at all — "want" is
+        # `None` — so it is not a candidate for this check in the first place.
+        if item["want"] is None:
+            continue
         landed = os.path.realpath(item["want"])
         if landed != root and not landed.startswith(root + os.sep):
             escaping.append((item["name"], landed))
@@ -741,6 +907,21 @@ def on_path(bin_dir: Path) -> bool:
     return False
 
 
+def zsh_line_covers(items: list[dict], bin_dir: Path) -> bool:
+    """Whether zsh's `~/.zshenv` holds the PATH line and the line names `bin_dir`.
+
+    zsh reads that file for login shells too. bash does not read `~/.bashrc` for
+    a login shell, so the advice to edit a profile still stands there. The line
+    names `$HOME/.local/bin`, so a `--bin` elsewhere is not covered.
+    """
+    if login_shell_name() != "zsh":
+        return False
+    for item in items:
+        if "line" in item and item["link"] is not None and has_profile_line(item["link"]):
+            return (item["link"].parent / ".local" / "bin").resolve() == bin_dir.resolve()
+    return False
+
+
 def report(items: list[dict], bin_dir: Path | None, changed: list[str], verb: str) -> None:
     for item in items:
         state = item["state"]
@@ -750,6 +931,15 @@ def report(items: list[dict], bin_dir: Path | None, changed: list[str], verb: st
             said = verb
         else:
             said = "not linked"
+        if "line" in item:
+            if item["link"] is None:
+                print(f"  {item['name']:<16} not supported   {item['shell']} has no known "
+                      f"startup file for a non-login command; add this where it is needed:\n"
+                      f"      {item['line']}")
+                continue
+            said = said.replace("linked", "added").replace("link", "add")
+            print(f"  {item['name']:<16} {said:<14} the PATH line in {item['link']}")
+            continue
         if "command" in item:
             said = said.replace("linked", "added").replace("link", "add")
             print(f"  {item['name']:<16} {said:<14} {item['command']} in {item['link']}")
@@ -759,7 +949,12 @@ def report(items: list[dict], bin_dir: Path | None, changed: list[str], verb: st
         print(f"\n{PROG}: {verb} {', '.join(changed)}")
     else:
         print(f"\n{PROG}: nothing changed; every command and skill was already linked")
-    if bin_dir is not None and not on_path(bin_dir):
+    if bin_dir is not None and not on_path(bin_dir) and zsh_line_covers(items, bin_dir):
+        # THIS PROCESS'S PATH PREDATES THE LINE. On a test Mac the run that wrote
+        # `~/.zshenv` still told the operator to add the same directory by hand.
+        print(f"\n{PROG}: {bin_dir} is on PATH in any new shell, because zsh reads "
+              f"~/.zshenv for all of them. Open a new shell to type these by name.")
+    elif bin_dir is not None and not on_path(bin_dir):
         # REPORTED, NOT REPAIRED. The file docstring says why.
         print(
             f"\n{PROG}: {bin_dir} is NOT on PATH, so none of these can be typed "
@@ -773,6 +968,16 @@ def status(items: list[dict], bin_dir: Path | None) -> int:
     missing = 0
     for item in items:
         link, state = item["link"], item["state"]
+        if "line" in item:
+            if state == "unsupported":
+                print(f"  {item['name']:<16} not supported for {item['shell']}; add by "
+                      f"hand: {item['line']}")
+                continue
+            said = f"in {link}" if state == "ours" else f"not in {link}"
+            print(f"  {item['name']:<16} {said}")
+            if state == "absent":
+                missing += 1
+            continue
         if "command" in item:
             ok = "" if item["deployed"] else "  (TARGET MISSING)"
             said = f"in {link}{ok}" if state == "ours" else f"not in {link}"
@@ -812,10 +1017,13 @@ def outstanding(skills_only: bool = False) -> list[str]:
     return lines + [
         "",
         (
-            "It also does not edit your shell profile. If it says the link "
-            "directory is not on PATH, that is the one step left and it is "
-            "yours — which file to edit depends on your shell and whether the "
-            "session is a login one."
+            "It also does not edit your shell's LOGIN profile. If it says the "
+            "link directory is not on PATH in a session at a prompt, that is "
+            "the one step left and it is yours — which file to edit depends "
+            "on your shell and whether the session is a login one. The "
+            "startup file a non-login shell reads for a bare command — "
+            "the shape ssh takes — is the one piece of this it does edit. "
+            "On zsh that file, ~/.zshenv, reaches login shells too."
         ),
     ]
 
@@ -838,6 +1046,10 @@ def main(argv: list[str]) -> int:
                         help="the Claude Code settings file the session hook "
                              "goes in (default: ~/.claude/settings.json, or "
                              "$BUILDER_CLAUDE_SETTINGS)")
+    parser.add_argument("--home", type=Path, default=None,
+                        help="the account this runs for, used only to find "
+                             "its login shell's non-login startup file for "
+                             "the PATH line (default: ~, or $BUILDER_HOME)")
     # **`--only skills` LEAVES THE LINK DIRECTORY ALONE.** A machine whose
     # commands are linked by another installer has a `~/.local/bin` this
     # command did not make, and no `agent-platform` deploy area, so a full run
@@ -870,14 +1082,17 @@ def main(argv: list[str]) -> int:
     settings_env = os.environ.get("BUILDER_CLAUDE_SETTINGS")
     settings = (args.settings
                 or (Path(settings_env) if settings_env else DEFAULT_SETTINGS)).expanduser()
+    home_env = os.environ.get("BUILDER_HOME")
+    home = (args.home or (Path(home_env) if home_env else Path.home())).expanduser()
     for flag, path in (("--deploy", deploy_root), ("--bin", bin_dir),
-                       ("--skills", skills_dir), ("--settings", settings)):
+                       ("--skills", skills_dir), ("--settings", settings),
+                       ("--home", home)):
         if not path.is_absolute():
             raise Refused(f"{flag} must be an absolute path: {path}")
 
     skills_only = args.only == "skills"
     items = plan(deploy_root, bin_dir, skills_dir, commands=not skills_only,
-                 settings=settings)
+                 settings=settings, home=home)
     header = f"{PROG}: {skills_dir} -> {deploy_root / SKILLS_REPOSITORY}/skills"
     if not skills_only:
         header = (f"{PROG}: {bin_dir} -> {deploy_root / SOURCE_REPOSITORY}/bin, "
@@ -909,8 +1124,13 @@ def main(argv: list[str]) -> int:
     if args.check:
         print(header)
         for item in items:
-            print(f"  {item['name']:<16} "
-                  f"{'not linked' if item['state'] == 'absent' else 'linked'}")
+            if item["state"] == "unsupported":
+                label = "not supported"
+            elif item["state"] == "absent":
+                label = "not linked"
+            else:
+                label = "linked"
+            print(f"  {item['name']:<16} {label}")
         if pending:
             print(f"\n{PROG}: {len(pending)} command(s) or skill(s) not linked: "
                   f"{', '.join(item['name'] for item in pending)}")
@@ -935,10 +1155,18 @@ def main(argv: list[str]) -> int:
     # linked into it, by the same rules: the skills directory is read by every
     # session, as the link directory is searched by every shell, and the
     # settings file's directory holds what every session runs as it starts.
-    for directory in dict.fromkeys(item["link"].parent for item in pending):
+    # **NEVER THE HOME DIRECTORY A PATH-LINE ITEM NAMES.** `~/.bashrc` and
+    # `~/.zshenv` sit directly in the operator's own home, which this command
+    # never creates and has no business narrowing — only its own PATH and
+    # skills directories, and the settings file's directory, get that
+    # treatment.
+    for directory in dict.fromkeys(item["link"].parent for item in pending
+                                    if "line" not in item):
         ensure_bin_dir(directory)
     for item in pending:
-        if "command" in item:
+        if "line" in item:
+            place_profile_line(item["link"])
+        elif "command" in item:
             place_hook(item)
         else:
             link_one(item)

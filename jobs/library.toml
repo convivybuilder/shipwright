@@ -25,7 +25,10 @@ stop-timeout-seconds = 60
 # below, which is the one place the path is named.
 #
 # ORIENT NEEDS TWO LIBRARY CREDENTIALS BEFORE IT WILL START, an agent token and
-# an approved-client token, and a fresh install had neither. THE WORK-QUEUE
+# an approved-client token, and a fresh install had neither. The approved-client
+# token carries `signal.post_draft`, which no role carries: Orient's blog routes
+# read draft posts on that token, and without the grant the Library refused
+# them on a fresh install. THE WORK-QUEUE
 # TOOLS NEED A THIRD, an agent token of their own, and without it every session
 # that files or reads a work item is refused with "no ops token". AGENTCTL
 # REVIEW-POST NEEDS A FOURTH, an agent token named `agent-platform`, to write
@@ -40,11 +43,59 @@ stop-timeout-seconds = 60
 # none of the human-reserved capabilities, because the Bosun acts for no person
 # and must not approve. Its token file sits beside the store, which already
 # holds the same secret, since nothing reads the file and it exists for
-# `creates`. An install may
+# `creates`.
+#
+# A FRESH INSTALL ALSO MINTED NO CREDENTIAL THAT COULD READ THE CREW REGISTRY.
+# After agent-platform's registry move (PR 1054), agent-platform and, soon,
+# Orient read the registry only over the Library's `GET /registry`, which
+# requires the `registry.read` grant. ORIENT'S OWN AGENT TOKEN above now carries
+# that grant too, so Orient reads the registry with the credential it already
+# holds. THE LIBRARY MINTS A SIXTH CREDENTIAL for every other reader on this
+# code path: an agent token named `agent-platform-registry-reader`, holding
+# only `registry.read`, at the path `lib/agent-platform/projects.py` reads by
+# default (`~/.orient-control/agent-platform-registry-reader-token`,
+# overridable by `AGENT_PLATFORM_REGISTRY_TOKEN`).
+#
+# NOR ANY CREDENTIAL THAT COULD WRITE IT, SO `agentctl crew register` AND THE
+# STEWARD'S `new-crew` REFUSED ON EVERY INSTALL. THE LIBRARY MINTS A SEVENTH: a
+# `registrar` named `agent-platform-registry-writer`, which holds
+# `registry.write` alone, at the path `lib/agent-platform/crew_registration.py`
+# reads (`~/.orient-control/agent-platform-registry-writer-token`).
+#
+# An install may
 # generate a new local credential and never copy or overwrite one, so each mint
 # runs only while its token file is absent (`creates`), and mint_credential.py
 # itself refuses a name the store already holds. Run with this job's
 # environment, each entry lands in the store the running Library reads.
+#
+# AN INSTALL FROM BEFORE THAT GRANT EXISTED NEVER GETS IT, BECAUSE THE MINT
+# ABOVE RUNS ONLY WHILE ITS TOKEN FILE IS ABSENT. `builder-update`
+# re-runs this file's `prepare` on every update, but an install already
+# carrying `library-token` from before the grant was added skips that step and
+# keeps the ungranted token forever, and Orient's own `GET /registry` call then
+# fails on it after the update. The step below replaces that token with one
+# carrying the grant, guarded by its own marker rather than the token file, so
+# it runs exactly once: on a fresh install, right after the mint above, and on
+# an update from before this step shipped. Orient reads the token file on each
+# request rather than holding it in memory, so replacing it is safe even while
+# Orient is running. This is the one exception to create-only: an update may
+# replace a credential the install generated, once, when a release adds a
+# permission it needs, and never one a person supplied.
+#
+# THE SAME HOLDS FOR `signal.post_draft` ON THE APPROVED-CLIENT TOKEN. An
+# install from before that grant keeps an ungranted `library-client-token`, and
+# its Writing Desk finds no drafts after the update. The step after that mint
+# replaces the token the same way, once, under its own marker
+# `library-client-token-post-draft-granted`; Orient reads this file on each
+# request too.
+#
+# A FRESH INSTALL ALSO MINTED NO CREDENTIAL A CREW'S OWN SESSION OR A RUN
+# DISPATCHED INTO IT COULD PRESENT. `bin/mcp-ops-server` now refuses every
+# call unless `ORIENT_OPS_CREW_TOKEN_FILE` names a readable file, with no
+# fallback to a shared token, so a crew left without that file has no ops
+# tools at all. The step below, near the end of this list, mints the pair
+# every registered crew needs; see its own comment there for why it runs
+# after the registry load rather than beside the mints above.
 #
 # THE BLOB STORE'S ROOT IS CREATED HERE because the Library refuses to start
 # without it and will not create it, so a missing mount cannot pass for an empty
@@ -52,13 +103,37 @@ stop-timeout-seconds = 60
 directories = ["{state}/library", "{state}/library/blobs", "{home}/.orient-control"]
 prepare = [
     ["{deploy}/library/.venv/bin/python", "-m", "alembic", "upgrade", "head"],
+    # THE PROJECTS REGISTRY IS ONE TABLE, HELD HERE, NEVER A FILE ON EVERY
+    # MACHINE (platform decision 0098's 2026-10-25 amendment). install-backend
+    # stages the seed document at {state}/library/projects-registry-seed.json
+    # when nothing is there yet; this loads it into an empty table. After it,
+    # crews register through POST /registry/crews. The loader's exit codes:
+    # 0 loaded, 3 the table already holds a registry (nothing written), 1 a
+    # bad file, 2 a wrong invocation. 0 and 3 both write the marker; 1 and 2
+    # fail the start, so a bad seed never leaves an install with no registry
+    # and no error. Never `--replace`: that would overwrite crews registered
+    # since. The marker keeps later starts from asking again, the same way
+    # the roster load below does.
+    { run = ["/bin/sh", "-c", "\"$0\" load_project_registry.py \"$1\" --actor install; s=$?; if [ \"$s\" -eq 0 ] || [ \"$s\" -eq 3 ]; then : > \"$2\"; else exit \"$s\"; fi", "{deploy}/library/.venv/bin/python", "{state}/library/projects-registry-seed.json", "{state}/library/projects-registry-loaded"], creates = "{state}/library/projects-registry-loaded" },
     ["{deploy}/library/.venv/bin/python", "init_vectors.py"],
     ["{deploy}/library/.venv/bin/python", "init_cold.py"],
-    { run = ["{deploy}/library/.venv/bin/python", "mint_credential.py", "--file", "agents", "--name", "orient", "--out", "{home}/.orient-control/library-token"], creates = "{home}/.orient-control/library-token" },
-    { run = ["{deploy}/library/.venv/bin/python", "mint_credential.py", "--file", "clients", "--name", "orient", "--out", "{home}/.orient-control/library-client-token"], creates = "{home}/.orient-control/library-client-token" },
+    { run = ["{deploy}/library/.venv/bin/python", "mint_credential.py", "--file", "agents", "--name", "orient", "--grants", "registry.read", "--out", "{home}/.orient-control/library-token"], creates = "{home}/.orient-control/library-token" },
+    { run = ["/bin/sh", "-c", "\"$0\" mint_credential.py --file agents --name orient --grants registry.read --out \"$1\" --replace && : > \"$2\"", "{deploy}/library/.venv/bin/python", "{home}/.orient-control/library-token", "{home}/.orient-control/library-token-registry-read-granted"], creates = "{home}/.orient-control/library-token-registry-read-granted" },
+    { run = ["{deploy}/library/.venv/bin/python", "mint_credential.py", "--file", "clients", "--name", "orient", "--grants", "signal.post_draft", "--out", "{home}/.orient-control/library-client-token"], creates = "{home}/.orient-control/library-client-token" },
+    { run = ["/bin/sh", "-c", "\"$0\" mint_credential.py --file clients --name orient --grants signal.post_draft --out \"$1\" --replace && : > \"$2\"", "{deploy}/library/.venv/bin/python", "{home}/.orient-control/library-client-token", "{home}/.orient-control/library-client-token-post-draft-granted"], creates = "{home}/.orient-control/library-client-token-post-draft-granted" },
     { run = ["{deploy}/library/.venv/bin/python", "mint_credential.py", "--file", "agents", "--name", "ops-mcp", "--out", "{home}/.orient-control/ops-mcp-token"], creates = "{home}/.orient-control/ops-mcp-token" },
     { run = ["{deploy}/library/.venv/bin/python", "mint_credential.py", "--file", "agents", "--name", "agent-platform", "--grants", "review_record.create", "--out", "{home}/.orient-control/agent-platform-token"], creates = "{home}/.orient-control/agent-platform-token" },
     { run = ["{deploy}/library/.venv/bin/python", "mint_credential.py", "--file", "clients", "--name", "bosun", "--holds-reserved=", "--out", "{state}/library/bosun-client-token"], creates = "{state}/library/bosun-client-token" },
+    # DECK APPROVES, DECLINES AND SETS A MODEL WITH ITS OWN CREDENTIAL, read from
+    # this file, so the Library records `deck` as the actor rather than Orient. A
+    # fresh install had none, and each of those failed. Temporary in this form: it
+    # holds the human-reserved capabilities until the Library's route takes a
+    # Touch ID proof for them. An install from before this step can hold a `deck`
+    # entry whose file is gone, which `mint_credential.py` refuses. An install never
+    # overwrites a credential, so the step fails and says how to replace it.
+    { run = ["/bin/sh", "-c", "\"$0\" mint_credential.py --file clients --name deck --out \"$1\" || { echo \"builder: could not create Deck's credential at $1. If the line above says 'deck' already has a credential, the Library holds one whose file is gone, so Deck cannot present it. To replace it, run this and then run the install or update again: cd \\\"$PWD\\\" && LIBRARY_CLIENT_TOKENS=\\\"$LIBRARY_CLIENT_TOKENS\\\" \\\"$0\\\" mint_credential.py --file clients --name deck --out \\\"$1\\\" --replace\" >&2; exit 1; }", "{deploy}/library/.venv/bin/python", "{home}/.orient-control/deck-library-token"], creates = "{home}/.orient-control/deck-library-token" },
+    { run = ["{deploy}/library/.venv/bin/python", "mint_credential.py", "--file", "agents", "--name", "agent-platform-registry-reader", "--grants", "registry.read", "--out", "{home}/.orient-control/agent-platform-registry-reader-token"], creates = "{home}/.orient-control/agent-platform-registry-reader-token" },
+    { run = ["{deploy}/library/.venv/bin/python", "mint_credential.py", "--file", "agents", "--name", "agent-platform-registry-writer", "--kind", "registrar", "--out", "{home}/.orient-control/agent-platform-registry-writer-token"], creates = "{home}/.orient-control/agent-platform-registry-writer-token" },
     # THE ROSTER AND THE PROFILES HAVE TO BE IN THE DATABASE BEFORE ANY AGENT
     # CAN BE DISPATCHED. knowledge-ctx asks the Library for an agent's bundle,
     # and an empty roster answers `'reviewer' is not on the roster` for every
@@ -70,7 +145,36 @@ prepare = [
     # every install against the knowledge repository the Library serves.
     { run = ["/bin/sh", "-c", "\"$0\" load_crew_registry.py roster \"$1\" --actor 'builder install' && : > \"$2\"", "{deploy}/library/.venv/bin/python", "{deploy}/agent-platform/lib/knowledge/knowledge.py", "{state}/library/roster-loaded"], creates = "{state}/library/roster-loaded" },
     ["{deploy}/library/.venv/bin/python", "load_crew_registry.py", "profiles", "{root}/knowledge", "--actor", "builder install"],
+    # A FRESH INSTALL ALSO MINTED NO OPS CREDENTIAL A CREW COULD PRESENT.
+    # `bin/mcp-ops-server` refuses every call unless `ORIENT_OPS_CREW_TOKEN_FILE`
+    # names a readable file, with no fallback to a shared token, and `bin/co`
+    # and `bin/agentctl` each set that variable to one crew's own file —
+    # `ops-co-<crew>-token` for a crew's session, `ops-<crew>-token` for a run
+    # dispatched into it. Nothing minted either before this line.
+    # `mint-crew-ops-credentials` is internally idempotent — it checks each
+    # file before minting and never passes `--replace` — so it runs on every
+    # install and update, here, right after the registry it reads is loaded:
+    # the seeded `library` crew on a fresh install, and every crew an adopter
+    # has registered since, on an update. It reads that registry straight
+    # from this database rather than over the wire, since the Library is not
+    # yet serving anything the first time this runs.
+    ["{bin}/mint-crew-ops-credentials", "--library-db", "{state}/library/library.db",
+     "--tokens-file", "{state}/library/api-tokens.json", "--library-dir", "{deploy}/library",
+     "--orient-control", "{home}/.orient-control"],
 ]
+
+# THE INDEX THE LIBRARY SERVES AGENTS FROM IS NOT BUILT HERE. `agentctl kb
+# sync` asks the Library for the project registry over the Library's own
+# HTTP API, and `prepare` runs before this job's service starts, so a
+# `prepare` step that ran it refused every document with "the project
+# registry could not be read", left the index at 0 docs, and never ran
+# again once its own marker was written — a rehearsal on a clean machine hit
+# exactly that. `bin/stand-up-backend` now runs `bin/sync-knowledge-index`
+# once the Library has actually started (with `--activate`), and
+# `payload/bin/builder-update` runs it, with `--soft`, after its own restart
+# step. Both wait for the Library to answer before asking it to sync. An
+# install that activates nothing has no Library to ask, and is told so by
+# `bin/stand-up-backend`'s own closing report.
 
 [log]
 stdout = "{state}/library.log"
@@ -106,14 +210,12 @@ LIBRARY_WRITES_ENABLED = "1"
 # lists `projects/` there to admit the adopter's own projects, and without it
 # admits only its baseline list, refusing every project an adopter creates.
 LIBRARY_KNOWLEDGE_ROOT = "{root}/knowledge"
-# NOT STATE EITHER: the projects registry the Bosun deploys, which new-crew
-# registers a crew into. The Library validates a work item's product against it
-# and, without this, looked under a hardcoded home-directory path, found
-# nothing, and accepted every product string. `PROJECTS_JSON` is the name
-# agent-platform's own commands read first, so both sides name one file;
-# `AGENT_PLATFORM_PROJECTS` stays for a Library from before it read that name.
-PROJECTS_JSON = "{deploy}/agent-platform/config/projects.json"
-AGENT_PLATFORM_PROJECTS = "{deploy}/agent-platform/config/projects.json"
+# NEITHER `PROJECTS_JSON` NOR `AGENT_PLATFORM_PROJECTS` NAMES A FILE HERE ANY
+# MORE. The projects registry is one table in the Chart House this same
+# account's Library already holds (platform decision 0098's 2026-10-25
+# amendment), loaded by the `prepare` entry above; the Library validates a
+# work item's product against that table directly, over no environment
+# variable at all.
 PATH = "{bin}:/usr/bin:/bin"
 
 [schedule]

@@ -1,17 +1,21 @@
 # Installing Builder
 
-_Last checked against Builder 0.6.3, on 2026-10-16._
+_Last checked against Builder 0.7.0, on 2026-11-02._
 
 These pages install Builder's current release; the first public release was 0.6.0, and [the release
 notes](release-notes.md) say what each release changed. Builder ships from five public
 repositories, each cloned at its `stable` branch: `shipwright`, `agent-platform`, `library`,
-`convivy-orient` and `convivy-deck`. A sixth, `write-better`, ships no release and is cloned at its
-own `main`. [Before you start](#before-you-start) shows how to clone all six.
+`convivy-orient` and `convivy-deck`. A sixth, `write-better`, ships no release of its own; each
+release's signed manifest names the commit it is installed at. [Before you start](#before-you-start)
+shows how to clone all six.
 
 Every command and message on these pages was run and seen on a test machine, except where a page
 says it was not. On Debian, that machine had nothing of Builder's on it beforehand, and a newcomer
 given only these pages used it to go from that empty machine to a crew whose session built a working
 tool.
+
+The [install checklist](install-checklist.md) lists every step on these pages as a single page of
+checkboxes, if you would rather tick each one off than read the pages in order.
 
 ## The one command
 
@@ -21,13 +25,75 @@ On the machine that will run the sessions, run:
 curl -fsSL https://convivybuilder.org/install.sh | sh
 ```
 
-It checks for `git`, Python 3.11, Claude Code and, on a Mac, `tmux`, and names anything it finds
-missing along with how to get it. It then clones the six repositories below into `~/src` and runs
-the backend's installers in order: `provision-backend`, `install-payload` and `stand-up-backend`.
-On Linux, with an account that can use `sudo`, it asks for your password once, to install the few
-system packages the backend needs; everything else runs as your own account, and on a Mac nothing
-ever asks for an administrator's password. Running it again finishes or repairs an install, and
-changes nothing that is already there.
+It checks for `git`, Python 3.11, Claude Code and, on a Mac, `tmux`, and installs what it can before
+naming what is still missing. On Linux, with an account that can use `sudo`, it installs `git`,
+Python 3.11, `curl` and `ca-certificates` with `apt-get`, asking for your password once. On a Mac
+with Homebrew already there, it installs `git`, Python 3.11 and `tmux` with `brew install`, as your
+own account, never as an administrator. On a Mac with no Homebrew but an administrator account at
+the keyboard, it runs Homebrew's own installer first, which also brings Apple's Command Line Tools,
+then finishes with `brew install`; without a terminal for that installer to ask its password and
+confirmation at, it leaves this to you and says so. Claude Code installs the same way on either
+platform, with `claude.ai`'s own script, never through `sudo`. Two things still need a person
+whatever the platform: an account with no administrator rights and no Homebrew has no route the
+install can take, and signing in to Claude Code by running `claude` once stays something only you
+can do. The install's closing lines ask for that sign-in when they installed Claude Code itself.
+
+Once it has installed what it can, it names anything still missing along with how to get it. It
+then clones the six repositories below into `~/src` and runs the backend's installers in order:
+`provision-backend`, `install-payload` and `stand-up-backend`. Everything past the prerequisite step
+runs as your own account; on a Mac nothing ever asks for an administrator's password. Running it
+again finishes or repairs an install, and changes nothing that is already there.
+
+Before any installer runs, the install checks that the release is one Convivy signed. It fetches the
+release's signed manifest and checks the signature against the release keys this copy trusts: those
+built into the one-line install script, or, for the Homebrew copy, those shipped beside it from the
+same archive. It then checks the commit of each of the six repositories and the sha256 of the
+release archive against what the manifest names, and it runs no installer unless every check
+passes. No option, environment variable or prompt skips the check. The Homebrew copy pinned to
+0.7.0 predates the check, so after a Homebrew install of 0.7.0, check its clones with `--verify`. The install also clones
+`write-better` at the commit the manifest names, rather than at its `main`, so a later change to
+`write-better` does not stop an older release installing.
+
+A copy of the installer run from a git checkout refuses with `could not check`, because the trusted
+keys in a checkout cannot vouch for the checkout they sit in. Use the one-line install from the
+site instead, or check clones you made by hand with the site's script:
+`curl -fsSL https://convivybuilder.org/install.sh | sh -s -- --verify vX.Y.Z`, naming the release
+you want checked.
+
+A failed check ends the install before any installer runs, leaving the machine as it was. The
+message says which check failed, and the exit status says what kind. **1** means the release is not
+one Convivy signed: the signature did not verify, or a repository or archive on disk is not what the
+manifest names. Do not run Builder from those clones. **3** means the check could not run at all:
+the manifest could not be fetched, `ssh-keygen` is missing, or a repository is absent. Fix that and
+run the command again.
+
+As its last step, it creates the GitHub App your agents will act through and pauses: open the
+address it prints in a browser and click **Create GitHub App**, and the install finishes once
+GitHub redirects back. Over SSH, where that redirect cannot reach this machine, paste the whole
+address the browser was left at (`http://127.0.0.1:<port>/callback?code=...&state=...`) at the
+terminal instead. Add `--no-github-app` to skip this and create the App later by hand; [Connecting
+GitHub](connecting-github.md) covers both the install's own step and the manual command, and the
+rest of what connects the App to your repositories.
+
+To install the three-account shape instead of the default single account, add `--shape three`. It
+needs administrator rights and one of the server platforms [Supported setups](supported-setups.md)
+lists (Debian 12, Ubuntu 22.04 or macOS 26); the install checks both before changing anything and
+names what is missing. It then creates the `agents` and `reviewers` accounts, the root-owned
+privileged half, and the backend, each as the account that step needs, and running it again
+finishes or repairs the install exactly as the single-account shape does. This shape has not been
+rehearsed end to end on a real machine yet; [What works and what does not yet](install-status.md)
+says so.
+
+The `agents` account must not be able to read your home. If your home is readable by other
+accounts, as it can be on a stock Debian 12, the install refuses and says so. Close it first:
+
+```
+chmod 750 ~
+```
+
+```
+curl -fsSL https://convivybuilder.org/install.sh | sh -s -- --shape three
+```
 
 On your laptop, to install Deck instead, add `--role laptop`:
 
@@ -35,8 +101,19 @@ On your laptop, to install Deck instead, add `--role laptop`:
 curl -fsSL https://convivybuilder.org/install.sh | sh -s -- --role laptop
 ```
 
-The laptop needs `git`, Python 3.11 and `swift`, which Apple's Command Line Tools provide
-(`xcode-select --install`); it needs neither Claude Code nor `tmux`.
+The laptop needs `git`, Python 3.11 and `swift`; it needs neither Claude Code nor `tmux`. The install
+installs `git` and Python 3.11 the same way it does on a server Mac — Homebrew when it is there,
+Homebrew's own installer first when it is not and an administrator is at the keyboard — and `swift`
+along with it, since the Command Line Tools bring both. If `swift` is still missing afterward,
+install Apple's Command Line Tools yourself (`xcode-select --install`).
+
+Once Deck is built and placed, the laptop install also sets up the ssh config Deck's crew sidebar
+reads, using a tool from the `agent-platform` tree it fetched alongside Deck's own checkout. That
+tool needs three things already set up on this laptop: this laptop's own operator config
+naming the server's address on your private network, an ssh host alias for the server, and a
+mounted share of the account that runs your crews. When any of the three is missing, Deck is
+installed anyway and the install says which is missing; fixing it and running the laptop install
+again is safe.
 
 On a Mac with Homebrew, you can install the same installer through Homebrew instead, and then run
 it. This has not been rehearsed: the formula is published and pins the release archive by its
@@ -53,8 +130,10 @@ to each new release.
 
 The rest of this page, and the pages under [Which install is yours](#which-install-is-yours), show
 the manual route: the same steps, one at a time, for anyone who wants to see or do each one
-themselves, or whose machine the one command refuses on. [What works and what does not
-yet](install-status.md) says how far the one command itself has been rehearsed.
+themselves, or whose machine the one command refuses on. The manual route runs each installer
+directly and does not perform the release check, so check its clones with `--verify` if you want
+that assurance. [What works and what does not yet](install-status.md) says how far the one command
+itself has been rehearsed.
 
 ## A server, and a laptop to work from
 
@@ -141,6 +220,9 @@ The second set is Builder's own.
 - **The Library** is where Builder keeps everything a project knows. **The Reference Room** is the
   part of it that holds what a project holds to be true, which many systems call a knowledge base.
   **Your knowledge repository** is the git repository that holds the Reference Room's documents.
+- **Your install repository** is a git repository the install makes at `install` inside your Builder
+  root, holding configuration that is not a secret and is not part of any one release — the registry
+  of your crews and the projects they work on is its first file.
 - **The work queue** is the list of pieces of work, which the Library serves.
 - **Orient** is Builder's view of the whole system, and **Deck** is the Mac application you work
   from.
@@ -259,6 +341,9 @@ prints nothing, add this line to `~/.profile`, or on a Mac to `~/.zprofile`:
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
+The install also adds a line to `~/.bashrc` (bash) or `~/.zshenv` (zsh) so a command run over ssh,
+which never reads `~/.profile` or `~/.zprofile`, finds `~/.local/bin` too.
+
 ### A skill is missing from a session
 
 Two commands link skills. List what each one linked:
@@ -268,8 +353,9 @@ sh ~/src/shipwright/bin/install-payload --status
 python3 ~/src/shipwright/bin/link-commands --status
 ```
 
-Between them they should show six: `install-payload` links `new-crew`, `new-subcrew`, `take-upstream`
-and `write-bead`, and `link-commands` links `write-better` and `talk-better`. The first command's
+Between them they should show nine: `install-payload` links `new-crew`, `new-subcrew`,
+`take-upstream`, `write-bead`, `rollover`, `handoff-pickup` and `handoff-leave`, and `link-commands`
+links `write-better` and `talk-better`. The first command's
 `live paths` list shows every skill in `~/.claude/skills`, whichever command linked it. If one is
 missing, run the command that links it again without `--status`, which puts it back, then start a
 new session: a session already running keeps the skills it started with.
@@ -291,36 +377,37 @@ The message names each job and its log. To see a service's state and its recent 
 systemctl --user status com.convivy.library.service
 tail ~/.local/state/library.log
 
-# two-account install
+# three-account install
 systemctl status com.convivy.library.service
 tail /opt/builder/var/log/com.convivy.library.out
 ```
 
-On a two-account install the log belongs to `agents` and its group, which the install adds your account
+On a three-account install the log belongs to `agents` and its group, which the install adds your account
 to. A terminal session you opened before the install does not have that group yet, so `tail` there
 answers `Permission denied`; log out and back in, or open a new login session, and it reads the log.
 
 The install checks each job once, straight after starting it, so a job that runs for a moment before
 stopping can be missed there. `systemctl --user list-units 'com.convivy*'` shows every job's state
-at any time on a single-account install, and `systemctl list-units 'com.convivy*'` on a two-account
+at any time on a single-account install, and `systemctl list-units 'com.convivy*'` on a three-account
 one. On a Mac, `launchctl print gui/$(id -u)/com.convivy.library` shows a job's `state`, `pid`,
 `last exit code` and log path on a single-account install, and `launchctl print
-system/com.convivy.library` on a two-account one. Orient's log can start with `preflight FAILED,
+system/com.convivy.library` on a three-account one. Orient's log can start with `preflight FAILED,
 build.load_docs() cannot reach the Library` from its first seconds, while the Library was still
 starting. A later `preflight ok` means it recovered.
 
 ### The install stops at `mint_credential.py`, saying `already has a credential`
 
-One of the four credential files in `~/.orient-control`, or the Bosun's in `~/.local/state/library`, is gone, and the Library still has the
+One of the seven credential files in `~/.orient-control`, or the Bosun's in `~/.local/state/library`, is gone, and the Library still has the
 credential it matched. The install will not replace a
 credential, so it stops and changes nothing. If you have the file, put it back. If not, replace the
 credential. The commands below restart Orient with `systemctl --user`, so they are for a single-account install
-on Linux; on a two-account install the files are in the `agents` account's home and Orient runs at
-system scope. For `library-token`:
+on Linux; on a three-account install the files are in the `agents` account's home and Orient runs at
+system scope. Replace `library-token` with its grant, since a replacement without `--grants` would
+lose it:
 
 ```
 cd ~/.local/deploy/library
-LIBRARY_API_TOKENS=~/.local/state/library/api-tokens.json .venv/bin/python mint_credential.py --file agents --name orient --out ~/.orient-control/library-token --replace
+LIBRARY_API_TOKENS=~/.local/state/library/api-tokens.json .venv/bin/python mint_credential.py --file agents --name orient --grants registry.read --out ~/.orient-control/library-token --replace
 systemctl --user restart com.convivy.orient.service
 ```
 
@@ -335,7 +422,26 @@ cd ~/.local/deploy/library
 LIBRARY_API_TOKENS=~/.local/state/library/api-tokens.json .venv/bin/python mint_credential.py --file agents --name agent-platform --grants review_record.create --out ~/.orient-control/agent-platform-token --replace
 ```
 
-The fifth credential, the Bosun's, lives at `~/.local/state/library/bosun-client-token`; replace
+Replace `agent-platform-registry-reader-token` the same way, with its own grant and no restart:
+
+```
+cd ~/.local/deploy/library
+LIBRARY_API_TOKENS=~/.local/state/library/api-tokens.json .venv/bin/python mint_credential.py --file agents --name agent-platform-registry-reader --grants registry.read --out ~/.orient-control/agent-platform-registry-reader-token --replace
+```
+
+Replace `agent-platform-registry-writer-token` the same way. It takes `--kind registrar` in place of a grant, and needs no restart:
+
+```
+cd ~/.local/deploy/library
+LIBRARY_API_TOKENS=~/.local/state/library/api-tokens.json .venv/bin/python mint_credential.py --file agents --name agent-platform-registry-writer --kind registrar --out ~/.orient-control/agent-platform-registry-writer-token --replace
+```
+
+For `deck-library-token`, use the same `LIBRARY_CLIENT_TOKENS`, `--file clients`, `--name deck` and
+`--out ~/.orient-control/deck-library-token`, with no restart. An install from before 0.7.0 that
+holds a `deck` credential and no file stops here when it moves to 0.7.0, and its message prints this
+command.
+
+The eighth credential, the Bosun's, lives at `~/.local/state/library/bosun-client-token`; replace
 it with
 `--file clients --name bosun --holds-reserved= --out ~/.local/state/library/bosun-client-token`
 and the same `LIBRARY_CLIENT_TOKENS`, with no restart. `--holds-reserved=` is left empty on purpose,
@@ -348,13 +454,20 @@ such as `~/.orient-control/ops-mcp-token.mint-backup`, and it still works. The n
 and run the command again. Delete it only once the new credential works, since it may hold the only
 copy of a working token.
 
+**A crew's own `ops-<crew>-token` or `ops-co-<crew>-token` refuses the same way, with the store
+already holding a credential of that name and no file to show for it.** Run `mint-crew-ops-credentials`
+again rather than minting by hand: it reports every pair this way and prints the exact `--replace`
+command for each one it cannot complete, naming the crew, the file and the grant.
+
 ### `claude mcp list` shows `kb` and `ops` as connected, and their tools fail
 
 `Connected` means only that the two tool servers started. These are the programs that give
-Claude Code its `kb` tools, for the Reference Room, and its `ops` tools, for the work queue. If the `ops` tools answer `no ops token`,
-`~/.orient-control/ops-mcp-token` is missing; [a missing credential
-file](#the-install-stops-at-mint_credentialpy-saying-already-has-a-credential) shows how to replace
-it.
+Claude Code its `kb` tools, for the Reference Room, and its `ops` tools, for the work queue. The
+`ops` tools need a per-crew file, which `co` and `agentctl` each point at a different name for the
+same crew — `ops-co-<crew>-token` in `~/.orient-control` for a crew's own session,
+`ops-<crew>-token` there for a run dispatched into it. If the `ops` tools refuse to connect, run
+`mint-crew-ops-credentials` to mint whichever of the two is missing; it changes nothing that is
+already there.
 
 ## Where to go next
 

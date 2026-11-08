@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Connect a single-account install to GitHub through the operator's GitHub App.
 
-    bin/connect-github --mode enforced|instruction   place, link, configure, rewrite, report
-    bin/connect-github                               the same, in the mode already recorded
-    bin/connect-github --check                       report only; 1 work left, 2 refused
+    bin/connect-github --mode instruction   place, link, configure, rewrite, report
+    bin/connect-github                      the same, in the mode already recorded
+    bin/connect-github --check              report only; 1 work left, 2 refused
 
 **AGENTS REACH GITHUB AS THE APP, AND NEVER AS THE OPERATOR.** This command
 makes that true for every git and gh call the account makes:
@@ -29,8 +29,11 @@ makes that true for every git and gh call the account makes:
   `create-github-app --read-only` made. Given at all, the list replaces the
   one recorded; without it the recorded list stands.
 
-**ENFORCED IS REPORTED ACTIVE ONLY WHEN THE ACCOUNT HOLDS NO OPERATOR
-CREDENTIAL IT CAN FIND.** It looks for:
+**IT LOOKS FOR ANY OPERATOR CREDENTIAL STILL ON THE ACCOUNT, AND REPORTS WHAT
+IT FINDS, NEVER FAILING ON IT.** The agents' App is the only identity meant
+to reach GitHub here; a credential of the operator's own left on the machine
+is something an agent could act with instead, held off only by the agents'
+instructions, so this is reported as hygiene:
 
 - a GitHub token variable in this shell's environment or set by a shell profile;
 - a ~/.netrc entry for github.com, or a `default` one, which git's https
@@ -46,11 +49,16 @@ CREDENTIAL IT CAN FIND.** It looks for:
 - a login the real gh holds, asked with the App's token removed;
 - an SSH key GitHub accepts.
 
-Any of these, or an answer it could not get, leaves enforced inactive and
-exits 1, naming what it found. In instruction mode it reports them and exits 0.
+It names each one found and exits 0 regardless: Deterministic, the mode in
+which GitHub itself refuses to merge while any of these remain, is designed
+and ships once it has been rehearsed, and is not available yet.
+
+A recorded merge mode of `enforced` is withdrawn: it is never read as
+`instruction`, and this command reports it so and asks for `--mode
+instruction` rather than silently running as instruction.
 
 The GitHub ruleset is not this command's: it prints the `github-gate` command
-that prints the ruleset for the mode, for the operator to import.
+that prints the ruleset, for the operator to import.
 
 The App is created first, by hand: its id in `app-id` and its key in
 `app.pem`, mode 600, in the `github-app` directory under `~/.config/convivy`.
@@ -77,6 +85,13 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 SHIPPED = ("bin/github-app-token", "bin/github-gate")
 MODES = ("enforced", "instruction")
+# `enforced` is refused wherever it is named, explicitly or recorded, rather
+# than ever running as `instruction` in its place.
+ENFORCED_WITHDRAWN = (
+    "Enforced was withdrawn. Deterministic, the mode in which GitHub itself "
+    "holds that only the operator merges, is not available yet: it waits on "
+    "a rehearsal. Run with --mode instruction."
+)
 HELPER_KEY = "credential.https://github.com.helper"
 # With it, git tells the minter which repository it wants a credential for,
 # which is how a read-only repository gets the read-only App's token.
@@ -558,11 +573,12 @@ def operator_credentials(home: Path, dest: Path, checkouts: list[Path]) -> list[
             found.append(f"a gh login ({gh} auth token answers with a token)")
     # An account that has never connected to GitHub has no host key for it,
     # and ssh in batch mode then refuses before GitHub says anything about
-    # keys, so enforced could never be active on a fresh account (rehearsal of
-    # the single-account install). GitHub's published keys go in a throwaway
-    # file listed first, and the account's own known_hosts is read after it and
-    # never written. An unverified key would let anyone on the network answer
-    # "Permission denied" and have enforced reported active (security review).
+    # keys, so an unpinned check would misreport a fresh account as holding no
+    # SSH key (rehearsal of the single-account install). GitHub's published
+    # keys go in a throwaway file listed first, and the account's own
+    # known_hosts is read after it and never written. An unverified key would
+    # let anyone on the network answer "Permission denied" and have an SSH key
+    # misreported as absent (security review).
     try:
         with tempfile.TemporaryDirectory() as scratch:
             pinned = Path(scratch) / "known_hosts"
@@ -590,8 +606,9 @@ def operator_credentials(home: Path, dest: Path, checkouts: list[Path]) -> list[
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog=PROG, description=__doc__.splitlines()[0])
     parser.add_argument("--mode", choices=MODES,
-                        help="the merge mode: enforced requires the operator's approval on "
-                             "GitHub for a pull request an agent opened; instruction leaves no-merge to the agents' instructions")
+                        help="the merge mode: instruction, the only one built, leaves "
+                             "no-merge to the agents' instructions; enforced was withdrawn "
+                             "and is refused, Deterministic not being available yet")
     parser.add_argument("--root", help="the Builder root (default: what builder-root prints)")
     parser.add_argument("--check", action="store_true", help="report only, change nothing")
     parser.add_argument("--read-only", action="append", metavar="OWNER/NAME",
@@ -607,12 +624,16 @@ def main(argv: list[str]) -> int:
 
 
 def connect(args: argparse.Namespace, home: Path) -> int:
+    if args.mode == "enforced":
+        raise Refused(ENFORCED_WITHDRAWN)
     mode = args.mode or recorded_mode(home)
+    if mode == "enforced":
+        raise Refused(f"the recorded merge mode is enforced, which was withdrawn. Run "
+                      f"{PROG} --mode instruction, and import the ruleset `github-gate` "
+                      f"then prints.")
     if not mode:
-        raise Refused("name the merge mode with --mode enforced or --mode instruction. "
-                      "Enforced requires your approval on GitHub before a pull request an agent "
-                      "opened can merge; "
-                      "instruction leaves it to the agents' instructions.")
+        raise Refused("name the merge mode with --mode instruction, the only one built. "
+                      "It leaves no-merge to the agents' instructions.")
     require_app(home)
     read_only = wanted_read_only(args.read_only, home)
     if read_only:
@@ -621,6 +642,11 @@ def connect(args: argparse.Namespace, home: Path) -> int:
     if not root.is_dir():
         raise Refused(f"the Builder root {root} is not a directory.")
     dest = deploy_dir(home)
+    if not real_gh(home, dest):
+        # The `gh` this links only adds the App's token to the real one, and
+        # agentctl's dispatch, pr-open and review verbs all run through it.
+        raise Refused("no GitHub CLI is on PATH. Install it, with `brew install gh` on a Mac or "
+                      "`sudo apt-get install gh` on Debian or Ubuntu, and run this again.")
     minter = dest / "bin" / "github-app-token"
     links = {bin_dir(home) / "github-app-token": minter, bin_dir(home) / "gh": minter,
              bin_dir(home) / "github-gate": dest / "bin" / "github-gate"}
@@ -700,28 +726,13 @@ def connect(args: argparse.Namespace, home: Path) -> int:
     found = operator_credentials(home, dest, checkouts(root))
     for item in found:
         print(f"  found {item}")
-    operator = " --operator <your GitHub login>" if mode == "enforced" else ""
-    gate = (f"github-gate --ruleset --shape single --mode {mode}{operator} "
-            f"--require-check <check>")
-    if mode == "enforced":
-        if found or on_path != os.path.realpath(minter):
-            print(f"{PROG}: enforced is recorded but NOT active: the account can still act "
-                  f"on GitHub as someone other than the App. Remove what is listed above "
-                  f"and run {PROG} again.")
-            return 1
-        print(f"{PROG}: enforced is active. Import the ruleset `{gate}` prints, if you have "
-              f"not already.")
-        print(f"{PROG}: also turn on \"Automatically delete head branches\" in the "
-              f"repository's Settings, General, Pull Requests, if you have not already: a "
-              f"pull request stacked on another lands on main by itself only when GitHub "
-              f"deletes the base branch as part of merging it.")
-    else:
-        print(f"{PROG}: instruction mode. Import the ruleset `{gate}` prints, if you have "
-              f"not already.")
-        print(f"{PROG}: also turn on \"Automatically delete head branches\" in the "
-              f"repository's Settings, General, Pull Requests, if you have not already: a "
-              f"pull request stacked on another lands on main by itself only when GitHub "
-              f"deletes the base branch as part of merging it.")
+    gate = "github-gate --ruleset --shape single --mode instruction --require-check <check>"
+    print(f"{PROG}: instruction mode. Import the ruleset `{gate}` prints, if you have "
+          f"not already.")
+    print(f"{PROG}: also turn on \"Automatically delete head branches\" in the "
+          f"repository's Settings, General, Pull Requests, if you have not already: a "
+          f"pull request stacked on another lands on main by itself only when GitHub "
+          f"deletes the base branch as part of merging it.")
     if args.check and todo:
         return 1
     return 0

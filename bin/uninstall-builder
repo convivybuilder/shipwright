@@ -1,0 +1,1992 @@
+#!/usr/bin/env python3
+"""Remove a Builder install: the inverse of `bin/builder-install`'s server
+role for the single-account shape, and of `bin/provision-accounts` plus
+`bin/install-privileged` for the two-account and three-account shapes.
+
+    bin/uninstall-builder              stop and remove what the install placed
+    bin/uninstall-builder --dry-run    say what would be removed, change nothing
+    bin/uninstall-builder --keep-data  keep the Library's store and your backups,
+                                       without being asked
+
+The two-account shape (`agents` exists, `reviewers` does not, and
+`install-privileged`'s own `install.json` at the prefix names shape "two")
+and the three-account shape (`agents` and `reviewers` both exist, and that
+same `install.json` names shape "three") both need root, since each stops
+the agents account's own system-scope jobs, removes the root-owned tree
+under the prefix, and removes the accounts themselves. The three-account
+shape also removes its one sudo rule; the two-account shape has none to
+remove, because `install-privileged --shape two` never places a sudoers
+file, a review launcher or a `reviewers` account:
+
+    sudo bin/uninstall-builder                run it
+    sudo bin/uninstall-builder --dry-run       say what would be removed, change nothing
+    sudo bin/uninstall-builder --purge-homes   also delete a home that still holds
+                                               something, once --keep-data or the
+                                               operator's answer has decided what that is
+
+## WHAT THIS REMOVES, AND WHERE EACH LIST COMES FROM
+
+This never keeps its own list of paths. Each is read off the installer that
+placed it, the same way `bin/install-jobs --single-account` renders the
+declarations in `jobs/` and `bin/link-commands --status` reports what it
+linked:
+
+- **Jobs.** `jobs/*.toml`, run through the same `as_invoker()` the install
+  itself used, so the unit each job renders to is the one this stops and
+  removes, but only once the supervisor is asked what it actually has loaded
+  for that label or unit and that answer names this same file — the
+  supervisor is a machine-wide singleton that `--home` does not scope, so a
+  label match alone would stop and remove whatever real job happens to share
+  it. Only then: `launchctl bootout` then the `.plist`, or `systemctl --user
+  disable --now` then the `.service`/`.timer`, on whichever platform this
+  runs on. Every string field of a resolved job — `tools/jobs/placeholders.py`'s
+  own `_all_strings` — is read for a path under `{state}` or `{home}/.orient-control`,
+  which is how `~/.local/state/orient`, `~/.local/state/library` and
+  `~/.local/state/builder-backup` are found without a hand-kept list; the
+  Library's store and the backups are held out of the automatic set and asked
+  about separately, below.
+- **Deploy areas.** `bin/install-backend`'s own `REPOSITORIES` and
+  `COMPONENTS`, plus `bin/install-payload`'s own payload repository name,
+  give the exact directories under `~/.local/deploy` (and, for the LLM
+  gateway component, `~/.local/lib/llm-gateway` and
+  `~/.local/venv-llm-gateway`, which `install-backend` places outside the
+  deploy root because the gateway's own launcher hardcodes them). Each is
+  removed only when it carries that installer's own stamp file — the same
+  file `install-backend --status` reads to say what a deploy area is
+  serving — so a directory this command did not make stays, the way
+  `link-commands` already refuses to replace one it does not own.
+- **Linked commands and skills.** `bin/link-commands`'s own `plan()`, read
+  against the real `~/.local/bin` and `~/.claude/skills`, so only a link this
+  command's own earlier run put there is removed; an occupied destination is
+  left and named. The skills `install-payload` links directly —
+  `new-crew`, `new-subcrew`, `take-upstream`, `write-bead` — are found the
+  same way `install-payload` itself checks them: by what is in the
+  `builder-payload` deploy area's own `skills/` directory.
+- **The session hook.** The one entry `link-commands` added to
+  `hooks.SessionStart` in `~/.claude/settings.json`, matched by its exact
+  command. Everything else in that file is untouched.
+- **The PATH line.** The one line `link-commands` prepended to the login
+  shell's own non-login startup file (`~/.bashrc` for bash, `~/.zshenv` for
+  zsh), matched by its exact text; the file it created is kept even once
+  this leaves it empty, and everything else in it is untouched. A login
+  shell `link-commands` wrote nothing for is skipped, the same way.
+- **MCP registrations.** `bin/register-mcp`'s own `plan()`: a registration
+  that still says what this install put there is removed with
+  `claude mcp remove`; one that was changed to point somewhere else is left,
+  for the same reason `register-mcp` itself will not touch a registration it
+  did not write.
+- **The knowledge index.** `~/.knowledge-index`
+  — the derived index and its own logs (`index.db`, `index.db-shm`,
+  `index.db-wal`, `autopull.log`, `watcher.log`) that agent-platform's
+  `bin/knowledge-autopull`, `bin/agentctl` and `bin/co` all hardcode at
+  `Path.home()/.knowledge-index`. No job declaration in `jobs/` names it, so
+  it is removed by content rather than read off an installer: only when every
+  entry in it is one of those five names. Anything else there is left and
+  named.
+- **The machine-wide instruction file** (single-account shape, where
+  `install-payload` runs). `~/.claude/CLAUDE.md`, placed by
+  `bin/install-payload` from this same release's `builder-payload` deploy
+  area (`knowledge-seed/machine/CLAUDE.md`, its own `MACHINE_SOURCE`).
+  Removed only when it is byte-identical to that shipped copy, compared
+  before the deploy area goes; a file that differs —
+  an edit, or a copy from a different release — or a missing shipped copy to
+  compare against, is left and named, never guessed at.
+
+## WHAT IT NEVER TOUCHES
+
+The Builder root (`~/builder`: crews, the knowledge repository, the
+steward's charter) holds the adopter's own work and is never named here. The
+operator config, the `CREWS_ROOT` pin, and any secret the operator supplied
+by hand (the LLM gateway's credentials file) are the operator's, not this
+install's, and stay. A file or link this did not make stays, named in the
+closing report. The knowledge index, and on the single-account shape the
+machine-wide instruction file, are removed only when each matches what this
+install itself would have made; an edited machine-wide file, or an index
+holding anything beyond its own five known names, is left and named the
+same way.
+
+## THE TWO-ACCOUNT SHAPE: THE SAME REMOVALS, UNDER THE AGENTS HOME, PLUS THE
+## ROOT-OWNED HALF AND THE ACCOUNT ITSELF
+
+Detected by `agents` existing, `reviewers` not existing, and
+`install-privileged`'s own `install.json` at the prefix (`/opt/builder` by
+default) naming shape "two". Runs only as root, since every one of its steps
+needs it:
+
+- **Jobs.** The same `account = "agents"` declarations in `jobs/*.toml` the
+  three-account shape removes, installed as LaunchDaemons or systemd system
+  units by that same shape's own code, over the same system domain, under
+  the same rule: a job is stopped only once the supervisor confirms what it
+  has loaded for it IS the file this run is about to remove. Their logs live
+  under the root-owned `--log-dir` (`{prefix}/var/log` by default), same as
+  on the three-account shape.
+- **Everything the single-account shape removes, pointed at the agents
+  home.** The deploy areas, the linked commands and skills, the session
+  hook, the MCP registrations, the state directories the declarations
+  name, and the knowledge index the `agents` account's own
+  `knowledge-autopull` job writes there — the exact same functions the
+  three-account shape runs for this, with `--home` the agents account's home.
+- **The root-owned tree under the prefix.** Removed whole, the same way the
+  three-account shape removes it: its own `install.json` is this shape's
+  detection marker too, so nothing else is expected to live there. This
+  shape has no sudo rule, no review launcher and no `reviewers` account to
+  remove — `install-privileged --shape two` never places any of the three —
+  so this never looks for a sudoers file or a launcher path, and their
+  absence is never reported as something left behind.
+- **The account.** `bin/provision-accounts --shape two --remove`, last, so
+  it is not gone out from under a step that still needed it. `--purge-homes`
+  works the same way it does for the three-account shape.
+
+GitHub's own state (the App installation, the branch rules on `main`) is out
+of scope here too, for the same reason it is on the three-account shape.
+
+## THE THREE-ACCOUNT SHAPE: THE SAME REMOVALS, UNDER THE AGENTS HOME, PLUS
+## THE ROOT-OWNED HALF AND THE ACCOUNTS THEMSELVES
+
+Detected by `agents` and `reviewers` both existing and `install-privileged`'s
+own `install.json` sitting at the prefix (`/opt/builder` by default) naming
+shape "three". Runs only as root, since every one of its steps needs it:
+
+- **Jobs.** The agents account's own system-scope jobs — `account = "agents"`
+  in `jobs/*.toml` — installed as LaunchDaemons or systemd system units,
+  root's own and machine-wide, with `UserName=`/`User=` set to `agents`
+  rather than as that account's per-user jobs. The same rule `stop_job`
+  applies for the single-account shape governs here too, asked of the system
+  domain these jobs actually load into (`system/<label>` on launchd, the
+  system manager on systemd, never `--user`): stop a job only once the
+  supervisor confirms what it has loaded for it IS the file this run is
+  about to remove, and leave a mismatch running, named. Their logs live under
+  the root-owned `--log-dir` (`{prefix}/var/log` by default), not the agents
+  home, the same way `install-jobs` itself places them there for this shape.
+- **Everything the single-account shape removes, pointed at the agents
+  home.** The deploy areas, the linked commands and skills, the session
+  hook, the MCP registrations, the state directories the declarations
+  name, and the knowledge index the `agents` account's own
+  `knowledge-autopull` job writes there — the exact same functions, run with
+  `--home` the agents account's home instead of the operator's, because the
+  three-account shape's `place`, `link` and `register` steps are `agents`'
+  own, the same installers the single-account shape runs for the operator.
+- **The root-owned tree under the prefix, and its one sudo rule.** The
+  sudoers file is identified by its exact path (`{sudoers-dir}/builder-review`)
+  AND its exact expected content — `install-privileged`'s own template for
+  this prefix, rendered the same way `stage_sudo_rule` renders it — never by
+  a pattern, so another file in that directory is never touched. A file at
+  that path with different content is left and named, the same way an
+  unstamped deploy area is. The prefix itself is then removed whole: its own
+  `install.json` is this shape's detection marker, so nothing else is
+  expected to live there.
+- **The accounts.** `bin/provision-accounts --shape three --remove`, last, so
+  the accounts are not gone out from under a step that still needed them.
+  `--purge-homes` is this command's own flag for the same one
+  `provision-accounts --shape three --remove` takes: without it, a home that
+  still holds something — the Library's store or your backups, if `--keep-data`
+  was given or you declined to remove them — is left, and `provision-accounts`
+  says so rather than guessing.
+
+GitHub's own state (the App installation, the branch rules on `main`) is out
+of scope. Removing this machine's install never reaches GitHub, and the
+closing report says so.
+
+## AN UNFINISHED INSTALL, OR ONE WHOSE RECORD CONTRADICTS ITS ACCOUNTS, IS
+## STILL OUT OF SCOPE
+
+A shape's name counts every account on the machine, the operator's own
+included: the two-account install is `agents` alone, with no `reviewers`
+account at all, and `install-privileged`'s own `install.json` naming shape
+"two"; the three-account install is `agents` and `reviewers` both, with that
+same file naming shape "three". `agents` existing with no readable
+`install.json` — the privileged install has not run yet — is an unfinished
+install of either shape. `install.json` naming a shape the accounts present
+contradict — "two" with `reviewers` also present, or "three" with
+`reviewers` absent — is refused the same way: an installer never leaves the
+machine in that state on its own, so it means something else changed the
+accounts or the file by hand. Neither case is guessed at: both refuse, name
+what was found, and leave the decision to the operator.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import traceback
+from collections import namedtuple
+from pathlib import Path
+
+# What `bin/install-jobs`'s own `drop_to_account` needs to become an account:
+# its name, uid and primary gid. Built from `provision-accounts`' own
+# `Account` (name, uid, gid, home) rather than a real `pwd.struct_passwd`, so
+# a `FakeAccountSystem` answers this the same way it already answers
+# `system.account()` everywhere else in this file.
+AccountIds = namedtuple("AccountIds", "pw_name pw_uid pw_gid")
+
+PROG = "uninstall-builder"
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "tools"))
+
+from jobs import declaration, placeholders, render_launchd, render_systemd  # noqa: E402
+
+
+class Refused(Exception):
+    """Something the operator has to decide about. Never a stack trace."""
+
+
+def _load(name: str, path: Path):
+    """Load `path` as a module named `name`, registered in `sys.modules`
+    before it runs.
+
+    **REGISTERED BEFORE `exec_module`, WHICH IS WHAT `import` ITSELF DOES.**
+    `install-backend` has `from __future__ import annotations`, so its
+    `@dataclass` resolves annotations through `sys.modules[cls.__module__]`;
+    absent from `sys.modules`, that lookup is `None` and the module fails to
+    load with `AttributeError: 'NoneType' object has no attribute '__dict__'`
+    — a failure in this loader that reads as a broken installer.
+    """
+    spec = importlib.util.spec_from_loader(name, importlib.machinery.SourceFileLoader(name, str(path)))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+# Each sibling installer, loaded as a module rather than re-typed, so what
+# this removes can never drift from what that one places. None of these
+# scripts does anything at import time beyond defining functions and
+# constants; the `if __name__ == "__main__":` guard at the foot of each
+# means importing it runs none of its own command-line behaviour.
+#
+# **`install-privileged` IS NEVER LOADED THIS WAY.** Unlike every module
+# here, it calls its own `running_copy()` at import time, outside any
+# `__main__` guard, and that function's whole job is to `sys.exit(2)` unless
+# the file sits at `<prefix>/src/shipwright@<sha>/bin/install-privileged`.
+# Importing it from this checkout would hit exactly that exit. What this
+# needs from it — the sudoers rule's name and template, the prefix, the
+# launcher's path once installed — are constants below instead, matching its
+# own hardcoded values rather than re-deriving them from a module this can
+# never safely load.
+ij = _load("builder_uninstall_install_jobs", REPO / "bin" / "install-jobs")
+lc = _load("builder_uninstall_link_commands", REPO / "bin" / "link-commands")
+rm = _load("builder_uninstall_register_mcp", REPO / "bin" / "register-mcp")
+ib = _load("builder_uninstall_install_backend", REPO / "bin" / "install-backend")
+su = _load("builder_uninstall_stand_up_backend", REPO / "bin" / "stand-up-backend")
+pa = _load("builder_uninstall_provision_accounts", REPO / "bin" / "provision-accounts")
+
+AGENTS = su.AGENTS
+REVIEWERS = next(name for name in pa.SERVICE_ACCOUNTS if name != AGENTS)
+PAYLOAD_REPOSITORY = lc.PAYLOAD_REPOSITORY  # "builder-payload"
+PAYLOAD_STAMP = ".installed"  # bin/install-payload's own STAMP, beside the deploy dir
+
+# install-privileged's own constants, duplicated rather than imported (see
+# above): the prefix it installs to, the sudoers file's directory and name,
+# the launcher's path once live, and its sudoers template's path in this
+# checkout.
+DEFAULT_PREFIX = "/opt/builder"
+DEFAULT_SUDOERS_DIR = "/etc/sudoers.d"
+SUDOERS_NAME = "builder-review"
+LAUNCHER_REL = os.path.join("libexec", "review-launch")
+SUDOERS_TEMPLATE_REL = os.path.join("privileged", "builder-review.sudoers")
+PRIVILEGED_INSTALL_JSON = "install.json"
+
+
+def detect_platform() -> str:
+    if sys.platform == "darwin":
+        return "macos"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    raise Refused(
+        f"{sys.platform} is neither macos nor linux, and Builder installs on "
+        f"only those two. Nothing was removed."
+    )
+
+
+def read_install_shape(install_json: str) -> str | None:
+    """The `shape` field `install-privileged` wrote to `install_json`, or
+    `None` when the file is absent, unreadable, not JSON, not an object, or
+    names no `shape` at all.
+
+    **NEVER RAISES.** The caller treats every one of those cases as "no
+    readable shape", lumped in with an install that has not finished writing
+    the file yet — the same thing a stranger reading this later would want
+    to know: there is nothing here to trust.
+    """
+    try:
+        text = Path(install_json).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    shape = data.get("shape")
+    return shape if isinstance(shape, str) else None
+
+
+def refuse_unsupported_shape(exists=None, prefix: str | None = None) -> str:
+    """Returns "single" on a machine none of the multi-account installs ever
+    touched, "two" where the two-account install has fully landed, and
+    "three" where the three-account install has fully landed. Refuses
+    outright on anything between.
+
+    **NAMED BY THE ACCOUNTS AND THE PRIVILEGED INSTALL'S OWN MARKER, NOT BY
+    ASKING WHAT ELSE IS INSTALLED.** A shape's name counts every account on
+    the machine, the operator's own included: the two-account install is
+    `agents` alone, with no `reviewers` account at all, and
+    `install-privileged`'s own `install.json` at the prefix naming shape
+    "two"; the three-account install is `agents` and `reviewers` both, with
+    that same file naming shape "three". `agents` exists only on a machine
+    `sudo bin/provision-accounts` ran on.
+
+    `agents` existing with `install.json` naming no readable shape — the
+    file is missing, unreadable, not JSON, or names none — is an unfinished
+    install of either shape: the privileged install has not run yet. A
+    readable shape that the accounts present contradict — "two" named while
+    `reviewers` also exists, or "three" named while `reviewers` is absent —
+    is refused the same way, since an installer never leaves a machine in
+    that state on its own. Neither case is guessed at: both refuse, name
+    what was found, and leave the decision to the operator.
+    """
+    exists = exists or su._account_exists
+    prefix = DEFAULT_PREFIX if prefix is None else prefix
+    if not exists(AGENTS):
+        return "single"
+    has_reviewers = exists(REVIEWERS)
+    install_json = os.path.join(prefix, PRIVILEGED_INSTALL_JSON)
+    shape = read_install_shape(install_json)
+    if shape == "two" and not has_reviewers:
+        return "two"
+    if shape == "three" and has_reviewers:
+        return "three"
+    if shape is None:
+        state = (f"`{REVIEWERS}` also exists" if has_reviewers
+                 else f"no `{REVIEWERS}` account exists")
+        raise Refused(
+            f"the `{AGENTS}` account exists and {state}, but {install_json} does "
+            f"not name a readable shape (it is missing, unreadable, not JSON, or "
+            f"names none). This command supports only the two-account install "
+            f"(`{AGENTS}` alone, with {install_json} naming shape \"two\") and the "
+            f"three-account install (`{AGENTS}` and `{REVIEWERS}` both, with that "
+            f"same file naming shape \"three\"); today this machine is an "
+            f"unfinished install of one or the other — the privileged install has "
+            f"not run yet. Nothing was removed."
+        )
+    raise Refused(
+        f"{install_json} names shape {shape!r}, but `{REVIEWERS}` "
+        f"{'exists' if has_reviewers else 'does not exist'}, which contradicts it. "
+        f"This command supports only the two-account install (`{AGENTS}` alone, "
+        f"shape \"two\") and the three-account install (`{AGENTS}` and "
+        f"`{REVIEWERS}` both, shape \"three\"); today this machine matches "
+        f"neither. Nothing was removed."
+    )
+
+
+# --------------------------------------------------------------------------
+# Jobs: stop and remove what `install-jobs --single-account` installed.
+# --------------------------------------------------------------------------
+
+
+def declarations_present(jobs_dir: Path) -> bool:
+    return jobs_dir.is_dir() and any(jobs_dir.glob("*.toml"))
+
+
+def raw_jobs(jobs_dir: Path, platform: str) -> list[declaration.Job]:
+    """Every declared job, filtered to this platform and mapped to user-scope,
+    but with no placeholder resolved yet.
+
+    The same declarations `resolved_jobs` resolves, kept as templates so
+    `state_plan` can tell which of a resolved job's fields are safe to derive
+    a removal target from: a field's *template*, not its resolved text, is
+    what says whether `{root}` — the one placeholder read from the
+    agent-writable `~/.config/convivy/session-agent.env` — fed it.
+    """
+    declared = ij.load_jobs(jobs_dir, platform)
+    return ij.as_invoker(declared)
+
+
+def resolved_jobs(jobs_dir: Path, platform: str, home: str, root: str,
+                   deploy: str, state: str, bin_dir: str) -> list[declaration.Job]:
+    """Every declared job, as the single-account install rendered it.
+
+    Mirrors `bin/install-jobs --single-account`: loaded, filtered to this
+    platform, and run through the same `as_invoker()` that turns each
+    system-scope job naming an account into a user-scope job of whoever runs
+    it. Placeholders are resolved against this machine's layout so the
+    fields that name a real path — directories, logs, environment values —
+    are the literal paths the install wrote, not the templates.
+    """
+    declared = raw_jobs(jobs_dir, platform)
+    machine = placeholders.Machine.for_home(
+        home, root=root, python=sys.executable, deploy=deploy, state=state, bin=bin_dir,
+    )
+    # The value of a program's path is never read for removal — only whether
+    # a declared `{name}` resolves at all — so a placeholder stands in for
+    # it rather than a real `shutil.which` lookup.
+    programs = {name: "" for job in declared for name in job.programs}
+    out = []
+    for job in declared:
+        try:
+            out.append(placeholders.resolve(job, machine, programs))
+        except placeholders.PlaceholderError as exc:
+            raise Refused(f"{exc} Nothing was removed.") from exc
+    return out
+
+
+def job_unit_paths(job: declaration.Job, platform: str, home: str) -> list[str]:
+    """Every file `install-jobs` would have written for this (already
+    user-scope) job, from `install-jobs`'s own `destinations()`."""
+    return sorted(ij.destinations(job, platform, home).keys())
+
+
+def loaded_launchd_path(label: str, run=subprocess.run) -> str | None:
+    """The plist path launchd currently has loaded for `label` in this
+    account's GUI domain, or `None` when nothing is loaded for it.
+
+    `launchctl print gui/<uid>/<label>` exits 113 (`stand-up-backend`'s own
+    `LAUNCHCTL_ABSENT`) when the domain has nothing loaded for `label`, read
+    here the same as any other non-zero exit or a reply with no `path =`
+    line: all three mean there is nothing loaded to compare against, so the
+    caller leaves the job alone rather than guessing.
+    """
+    result = run(["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+                 capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        return None
+    for line in (result.stdout or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("path = "):
+            return stripped[len("path = "):].strip()
+    return None
+
+
+def loaded_systemd_fragment(unit: str, run=subprocess.run) -> str | None:
+    """The unit file path systemd currently has loaded for `unit`, in this
+    account's user manager, or `None` when nothing is loaded for it.
+
+    `systemctl --user show -p FragmentPath` answers a unit systemd has never
+    heard of with exit 0 and an empty `FragmentPath=`, read here the same as
+    a non-zero exit: both mean nothing is loaded to compare against.
+    """
+    result = run(["systemctl", "--user", "show", "-p", "FragmentPath", unit],
+                 capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        return None
+    for line in (result.stdout or "").splitlines():
+        if line.startswith("FragmentPath="):
+            value = line[len("FragmentPath="):].strip()
+            return value or None
+    return None
+
+
+def stop_job(job: declaration.Job, platform: str, home: str,
+             left: list[tuple[str, str]], run=subprocess.run) -> bool:
+    """Ask the supervisor to stop this job, but only once it is confirmed
+    that what the supervisor has loaded for it IS the file this run is about
+    to remove.
+
+    **THE SUPERVISOR IS A MACHINE-WIDE SINGLETON; `--home` SCOPES ONLY THE
+    FILES THIS DELETES.** `launchctl bootout gui/<uid>/<label>` and
+    `systemctl --user disable --now <unit>` both act against the real,
+    running account's service manager, by label or unit name alone, whatever
+    `--home` says — a security reviewer running this against a throwaway
+    `--home` had it boot out a dozen of the operator's own real launchd jobs,
+    because every job here shares its label with whatever real job happens to
+    be running under that name. So before touching anything, this reads what
+    the supervisor currently has loaded for the label (macOS) or each unit
+    (Linux) and compares it, resolved with symlinks followed, against the
+    plist or unit file this run is about to remove. A mismatch is left alone
+    and named, with the path that IS loaded, in `left`. A label or unit
+    nothing is loaded for is left alone without comment, the same as a
+    supervisor that is not running at all: both fail the way a job that WAS
+    running and is now stopped does not, and removing the files is what
+    actually matters there.
+
+    Returns whether a stop was actually issued (`launchctl bootout` or
+    `systemctl --user disable --now`). **A CALLER MUST READ THIS BEFORE
+    ACTING ON THE SUPERVISOR AGAIN** — `remove_jobs`'s `systemctl --user
+    daemon-reload` is scoped to this, not to whether the job merely resolved
+    to a unit path, since a mismatch or an absent load means nothing here was
+    touched for this run to reload.
+    """
+    if platform == "macos":
+        if not shutil.which("launchctl"):
+            return False
+        unit_paths = job_unit_paths(job, platform, home)
+        loaded = loaded_launchd_path(job.label, run)
+        if loaded is None:
+            return False
+        expected = unit_paths[0] if unit_paths else None
+        if expected is None or os.path.realpath(loaded) != os.path.realpath(expected):
+            left.append((job.label, f"launchd has {loaded} loaded for this label, not the "
+                                    f"file this uninstall is removing; left running"))
+            return False
+        target = f"gui/{os.getuid()}/{job.label}"
+        run(["launchctl", "bootout", target], capture_output=True, check=False)
+        return True
+    if not shutil.which("systemctl"):
+        return False
+    stopped = False
+    for path in job_unit_paths(job, platform, home):
+        unit = Path(path).name
+        fragment = loaded_systemd_fragment(unit, run)
+        if fragment is None:
+            continue
+        if os.path.realpath(fragment) != os.path.realpath(path):
+            left.append((path, f"systemd has {fragment} loaded for {unit}, not the file "
+                               f"this uninstall is removing; left running"))
+            continue
+        run(["systemctl", "--user", "disable", "--now", unit],
+            capture_output=True, check=False)
+        stopped = True
+    return stopped
+
+
+def remove_jobs(jobs: list[declaration.Job], platform: str, home: str, machine_state: str,
+                 dry_run: bool, left: list[tuple[str, str]], removed: list[str],
+                 run=subprocess.run) -> None:
+    reloaded_linux = False
+    for job in jobs:
+        unit_paths = job_unit_paths(job, platform, home)
+        log_paths = sorted({p for p in (job.stdout, job.stderr) if p})
+        if dry_run:
+            for path in unit_paths:
+                if os.path.lexists(path):
+                    print(f"  would stop and remove job unit: {job.label} ({path})")
+            for path in log_paths:
+                if os.path.lexists(path):
+                    print(f"  would remove log: {path}")
+            continue
+        stopped = stop_job(job, platform, home, left, run)
+        for path in unit_paths:
+            if remove_path(Path(path), left):
+                removed.append(path)
+        for path in log_paths:
+            if remove_path(Path(path), left):
+                removed.append(path)
+        if platform == "linux" and stopped:
+            reloaded_linux = True
+    if reloaded_linux and shutil.which("systemctl"):
+        run(["systemctl", "--user", "daemon-reload"], capture_output=True, check=False)
+    record_dir = ij.record_path(
+        placeholders.Machine.for_home(home, root="", python=sys.executable, state=machine_state)
+    ).parent
+    if dry_run:
+        if os.path.lexists(record_dir):
+            print(f"  would remove: {record_dir}")
+    else:
+        if remove_path(record_dir, left):
+            removed.append(str(record_dir))
+
+
+# --------------------------------------------------------------------------
+# Jobs, three-account shape: stop and remove what the privileged half's own
+# `install-jobs` run rendered for the agents account.
+# --------------------------------------------------------------------------
+
+
+def agents_system_jobs(jobs_dir: Path, platform: str) -> list[declaration.Job]:
+    """Every declared job the three-account shape's root half installs: kept
+    at system scope, naming `agents`, the same filter `leave_out_as_root`
+    leaves standing — every job that is not a user-scope job with no
+    account. Kept as templates, unresolved, the same reason `raw_jobs` keeps
+    the single-account ones: so `state_plan` can tell a field `{state}` alone
+    fed from one `{root}` reached."""
+    declared = ij.load_jobs(jobs_dir, platform)
+    return [job for job in declared if job.scope == "system" and job.account == AGENTS]
+
+
+def resolved_agents_jobs(jobs_dir: Path, platform: str, agents_home: str, root: str,
+                          log_dir: str, deploy: str, state: str, bin_dir: str) -> list[declaration.Job]:
+    """Every agents-account job, resolved the way `install-jobs`' own
+    `resolve()` resolves it for this shape: against the agents account's own
+    home — already known here, so no directory-service lookup is needed —
+    with its logs moved under the root-owned `log_dir`, since a system-scope
+    job that runs as an account never logs into that account's home (root
+    would open a path the account could re-point).
+
+    **`deploy`, `state` AND `bin_dir` ARE THE CALLER'S OWN, NEVER LEFT TO
+    `Machine.for_home`'s DEFAULTS.** Without them, a `--deploy`, `--state`
+    or `--bin` the operator actually gave resolves every job field against
+    the agents-home default instead — `state_plan`'s own removal set, and
+    `remove_system_jobs`'s own record directory, would then be derived from
+    a layout this run was never told to use, finding nothing to remove at
+    the layout that is actually there. `resolved_jobs`, the single-account
+    equivalent, threads the same three for the same reason.
+    """
+    declared = agents_system_jobs(jobs_dir, platform)
+    machine = placeholders.Machine.for_home(
+        agents_home, root=root, python=sys.executable, deploy=deploy, state=state, bin=bin_dir,
+    )
+    # The value of a program's path is never read for removal — only whether
+    # a declared `{name}` resolves at all — so a placeholder stands in for
+    # it rather than a real `shutil.which` lookup (see `resolved_jobs`).
+    programs = {name: "" for job in declared for name in job.programs}
+    out = []
+    for job in declared:
+        try:
+            done = placeholders.resolve(job, machine, programs)
+        except placeholders.PlaceholderError as exc:
+            raise Refused(f"{exc} Nothing was removed.") from exc
+        if done.stdout or done.stderr:
+            done = ij.account_log_paths(done, log_dir)
+        out.append(done)
+    return out
+
+
+def system_job_unit_paths(job: declaration.Job, platform: str, system_dir: str | None) -> list[str]:
+    """Every file `install-jobs` would have written for this system-scope
+    job, by path alone.
+
+    **NEVER THROUGH `ij.destinations()`, WHICH RENDERS THE FILE'S CONTENT
+    TOO.** A job that names an account renders `UserName=`/`User=` by asking
+    the real directory service for that account (`render_launchd.render`,
+    `render_systemd.render`, both through `accounts.require`), which this
+    command has no business doing just to find a path to remove, and which
+    fails outright wherever that lookup cannot run — a test's throwaway
+    machine, or a real one between `provision-accounts` creating `agents`
+    and the directory service settling. The path itself needs no such
+    lookup on either platform (`render_launchd.install_path`,
+    `render_systemd.unit_directory` and `needs_timer`), so this computes it
+    directly rather than paying for content it never reads.
+    """
+    directory = system_dir or (
+        "/Library/LaunchDaemons" if platform == "macos" else "/etc/systemd/system"
+    )
+    if platform == "macos":
+        return [f"{directory}/{job.label}.plist"]
+    names = [f"{job.label}.service"]
+    if render_systemd.needs_timer(job):
+        names.append(f"{job.label}.timer")
+    return sorted(f"{directory}/{name}" for name in names)
+
+
+def loaded_launchd_system_path(label: str, run=subprocess.run) -> str | None:
+    """The plist path launchd currently has loaded for `label` in the SYSTEM
+    domain, or `None` when nothing is loaded for it. See `loaded_launchd_path`
+    for why a non-zero exit and no `path =` line both mean the same thing."""
+    result = run(["launchctl", "print", f"system/{label}"],
+                 capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        return None
+    for line in (result.stdout or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("path = "):
+            return stripped[len("path = "):].strip()
+    return None
+
+
+def loaded_systemd_system_fragment(unit: str, run=subprocess.run) -> str | None:
+    """The unit file path systemd's SYSTEM manager currently has loaded for
+    `unit`, or `None`. See `loaded_systemd_fragment` for why a non-zero exit
+    and an empty `FragmentPath=` both mean the same thing."""
+    result = run(["systemctl", "show", "-p", "FragmentPath", unit],
+                 capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        return None
+    for line in (result.stdout or "").splitlines():
+        if line.startswith("FragmentPath="):
+            value = line[len("FragmentPath="):].strip()
+            return value or None
+    return None
+
+
+def stop_system_job(job: declaration.Job, platform: str, system_dir: str | None,
+                     left: list[tuple[str, str]], run=subprocess.run) -> bool:
+    """`stop_job`'s own rule, asked of the domain these jobs actually load
+    into. **NEVER THE AGENTS ACCOUNT'S OWN GUI OR `--user` DOMAIN.** A
+    system-scope job that names an account is installed as a LaunchDaemon or
+    a system-manager unit — root's own, machine-wide — with `UserName=`/
+    `User=` set to the account it runs as, not as that account's own
+    per-user job; a service account provisioned with no login session does
+    not even have a `--user` manager running to ask. So this reads what the
+    SYSTEM domain currently has loaded for the label (macOS) or each unit
+    (Linux) and compares it, resolved with symlinks followed, against the
+    file this run is about to remove — the same comparison `stop_job` makes,
+    over the domain this shape's jobs are actually in. A mismatch is left
+    running and named, with the path that IS loaded; a label or unit nothing
+    is loaded for, or a supervisor not on PATH, is left alone without comment.
+
+    Returns whether a stop was actually issued, for the same reason
+    `stop_job`'s own return does: a caller's systemd reload is scoped to this.
+    """
+    if platform == "macos":
+        if not shutil.which("launchctl"):
+            return False
+        unit_paths = system_job_unit_paths(job, platform, system_dir)
+        loaded = loaded_launchd_system_path(job.label, run)
+        if loaded is None:
+            return False
+        expected = unit_paths[0] if unit_paths else None
+        if expected is None or os.path.realpath(loaded) != os.path.realpath(expected):
+            left.append((job.label, f"launchd has {loaded} loaded for this label, not the "
+                                    f"file this uninstall is removing; left running"))
+            return False
+        run(["launchctl", "bootout", f"system/{job.label}"], capture_output=True, check=False)
+        return True
+    if not shutil.which("systemctl"):
+        return False
+    stopped = False
+    for path in system_job_unit_paths(job, platform, system_dir):
+        unit = Path(path).name
+        fragment = loaded_systemd_system_fragment(unit, run)
+        if fragment is None:
+            continue
+        if os.path.realpath(fragment) != os.path.realpath(path):
+            left.append((path, f"systemd has {fragment} loaded for {unit}, not the file "
+                               f"this uninstall is removing; left running"))
+            continue
+        run(["systemctl", "disable", "--now", unit], capture_output=True, check=False)
+        stopped = True
+    return stopped
+
+
+def remove_system_jobs(jobs: list[declaration.Job], platform: str, system_dir: str | None,
+                        log_dir: str, agents_home: str, state: str, dry_run: bool,
+                        left: list[tuple[str, str]], removed: list[str],
+                        run=subprocess.run) -> None:
+    """`remove_jobs`'s own shape, over the system domain and the root-owned
+    `log_dir` the three-account shape actually uses. The `install-jobs`
+    record this removes lives under `state` — the caller's own, never
+    `agents_home`'s default — since a job naming an account resolves
+    `{state}` against whatever `--state` the operator gave `install-jobs`,
+    the same reason `remove_jobs`'s own `record_dir` takes `machine_state`
+    rather than deriving it from `home` alone."""
+    reloaded_linux = False
+    for job in jobs:
+        unit_paths = system_job_unit_paths(job, platform, system_dir)
+        log_paths = sorted({p for p in (job.stdout, job.stderr) if p})
+        if dry_run:
+            for path in unit_paths:
+                if os.path.lexists(path):
+                    print(f"  would stop and remove job unit: {job.label} ({path})")
+            for path in log_paths:
+                if os.path.lexists(path):
+                    print(f"  would remove log: {path}")
+            continue
+        stopped = stop_system_job(job, platform, system_dir, left, run)
+        for path in unit_paths:
+            if remove_path(Path(path), left):
+                removed.append(path)
+        for path in log_paths:
+            if remove_path(Path(path), left):
+                removed.append(path)
+        if platform == "linux" and stopped:
+            reloaded_linux = True
+    if reloaded_linux and shutil.which("systemctl"):
+        run(["systemctl", "daemon-reload"], capture_output=True, check=False)
+    record_dir = ij.record_path(
+        placeholders.Machine.for_home(agents_home, root="", python=sys.executable, state=state)
+    ).parent
+    if dry_run:
+        if os.path.lexists(record_dir):
+            print(f"  would remove: {record_dir}")
+    else:
+        if remove_path(record_dir, left):
+            removed.append(str(record_dir))
+
+
+# --------------------------------------------------------------------------
+# Running the agents account's own steps as that account, never as root.
+# --------------------------------------------------------------------------
+
+
+def run_as_agents_account(ids, action, drop=None) -> tuple[list[tuple[str, str]], list[str]]:
+    """Run `action()` — which touches only the `agents` account's own home
+    and returns `(left, removed)` — in a child process that has dropped to
+    `ids` first, and return what the child reports.
+
+    **A SEPARATE PROCESS, NOT A PERMANENT DROP.** `main_three_account` still
+    needs root after this returns, to stop the system-scope jobs, remove
+    the sudo rule and the prefix, and remove the accounts themselves — and
+    a real `os.setuid` cannot be undone in the same process the way `bin/
+    install-jobs`'s own `as_account` already forks for exactly this reason.
+    `drop` is that file's own `drop_to_account` by default; a test that
+    cannot become another account injects a no-op instead, the same way
+    `tools/test_install_jobs.py` already does for `as_account`.
+
+    **`(left, removed)` CROSS THE FORK OVER A PIPE**, the one thing that
+    does not survive it on its own: a list `action()` mutates in the child
+    is the child's own copy, invisible to this process once it returns.
+    Anything `action()` raises from the refusal family every sibling
+    installer uses is reported the same way a `Refused` raised directly in
+    this process would be; anything else is a crash, printed as a
+    traceback in the child (the same fd this process's own stdout and
+    stderr already write to) before this raises in its place.
+    """
+    drop = ij.drop_to_account if drop is None else drop
+    read_fd, write_fd = os.pipe()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            drop(ids)
+            left, removed = action()
+            payload = json.dumps({"left": left, "removed": removed}).encode("utf-8")
+            status = 0
+        except (Refused, ij.Refused, lc.Refused, rm.Refused, ib.Refused, pa.Refused) as exc:
+            payload = json.dumps({"error": str(exc)}).encode("utf-8")
+            status = 1
+        except BaseException:
+            traceback.print_exc()
+            payload = b""
+            status = 1
+        sys.stdout.flush()
+        sys.stderr.flush()
+        try:
+            with os.fdopen(write_fd, "wb") as out:
+                out.write(len(payload).to_bytes(8, "big"))
+                out.write(payload)
+        finally:
+            os._exit(status)
+    os.close(write_fd)
+    with os.fdopen(read_fd, "rb") as inp:
+        header = inp.read(8)
+        size = int.from_bytes(header, "big") if header else 0
+        data = inp.read(size) if size else b""
+    _, wait = os.waitpid(pid, 0)
+    status = os.WEXITSTATUS(wait) if os.WIFEXITED(wait) else 1
+    decoded = json.loads(data.decode("utf-8")) if data else {}
+    if status != 0 or "error" in decoded:
+        reason = decoded.get("error") or (
+            "the child exited without reporting why; see its traceback above"
+        )
+        raise Refused(
+            f"removing what is inside the `{AGENTS}` account's own home failed: "
+            f"{reason}. Nothing further was removed."
+        )
+    left = [tuple(item) for item in decoded.get("left", [])]
+    removed = list(decoded.get("removed", []))
+    return left, removed
+
+
+# --------------------------------------------------------------------------
+# The root-owned tree under the prefix, and its one sudo rule.
+# --------------------------------------------------------------------------
+
+
+def expected_sudoers_text(prefix: str) -> bytes:
+    """The sudoers rule `install-privileged` would write for this prefix:
+    its own template, read from this checkout, with its one placeholder
+    filled in the way `stage_sudo_rule` fills it. Read from this checkout
+    rather than kept as a copy, the same reason every removal above reads
+    off today's sibling installer instead of its own list."""
+    template = (REPO / SUDOERS_TEMPLATE_REL).read_text(encoding="utf-8")
+    launcher = os.path.join(prefix, LAUNCHER_REL)
+    return template.replace("@LAUNCHER@", launcher).encode("utf-8")
+
+
+def remove_sudo_rule(prefix: str, sudoers_dir: str, dry_run: bool,
+                      left: list[tuple[str, str]], removed: list[str]) -> None:
+    """Remove the one sudo rule `install-privileged` wrote, identified by
+    its exact path (`{sudoers_dir}/builder-review`) AND its exact expected
+    content for this prefix — never by a pattern, so another file in
+    `sudoers_dir` is never read, let alone touched. A file at that path
+    whose content does not match — a different prefix, an edited rule, or
+    something else entirely — is left and named, the same way an unstamped
+    deploy area is."""
+    path = Path(sudoers_dir) / SUDOERS_NAME
+    if not os.path.lexists(path):
+        return
+    if path.is_symlink():
+        left.append((str(path), "it is a symlink; refusing to remove through it"))
+        return
+    try:
+        live = path.read_bytes()
+    except OSError as exc:
+        left.append((str(path), f"could not be read ({exc.strerror or exc})"))
+        return
+    if live != expected_sudoers_text(prefix):
+        left.append((str(path), "exists but its content is not what install-privileged "
+                                "would write for this prefix, so it is left"))
+        return
+    if dry_run:
+        print(f"  would remove: {path}")
+        return
+    if remove_path(path, left):
+        removed.append(str(path))
+
+
+def remove_privileged_tree(prefix: str, dry_run: bool,
+                           left: list[tuple[str, str]], removed: list[str]) -> None:
+    """Remove the root-owned tree under `prefix` whole: the extracted
+    source trees, the reviewers' tools and venv, the launcher, every
+    credential slot, and `install.json` itself. Its presence is this
+    shape's own detection marker, so nothing else is expected to live
+    there — unlike a deploy area, which can sit beside one install never
+    stamped, this prefix is never shared with anything else."""
+    if not os.path.lexists(prefix):
+        return
+    if dry_run:
+        print(f"  would remove: {prefix}")
+        return
+    if remove_path(Path(prefix), left):
+        removed.append(prefix)
+
+
+# --------------------------------------------------------------------------
+# Removal primitive, shared by every step below.
+# --------------------------------------------------------------------------
+
+
+def remove_path(path: Path, left: list[tuple[str, str]]) -> bool:
+    """Remove a file or directory, never through a symlink, and never by
+    crashing: a removal that fails is reported in the closing list rather
+    than stopping the rest of the run, the way `install-jobs`'s own
+    `save_record` treats a failure as something to report, not to raise.
+
+    Returns whether `path` was actually removed. **A CALLER MUST READ THIS
+    BEFORE COUNTING `path` AS REMOVED.** A symlink refusal or an `OSError`
+    both leave `path` exactly where it was, having already added it to `left`
+    with the reason; a caller that appends to its own `removed` list
+    unconditionally, rather than on this return value, reports a failure as a
+    success in the closing counts.
+    """
+    try:
+        if not os.path.lexists(path):
+            return False
+        if os.path.islink(path):
+            left.append((str(path), "it is a symlink; refusing to remove through it"))
+            return False
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+        return True
+    except OSError as exc:
+        left.append((str(path), f"could not be removed ({exc.strerror or exc})"))
+        return False
+
+
+def unlink_path(path: Path, left: list[tuple[str, str]]) -> bool:
+    """Remove exactly this symlink, never what it points at.
+
+    **THE OPPOSITE CHECK FROM `remove_path`, ON PURPOSE.** A deploy area or a
+    state directory is never supposed to be a symlink, so `remove_path`
+    refuses one as a sign something is wrong. A linked command or skill is
+    always a symlink — that is what `link-commands` and `install-payload`
+    put there — so refusing one here would refuse to undo the one thing this
+    step exists to undo. The caller has already checked, through `classify()`
+    or an equivalent comparison, that this exact link still points where it
+    is expected to; this only re-confirms it is still a symlink at all before
+    acting, the way `install-jobs`'s own writes re-check state they already
+    saw once.
+    """
+    try:
+        if not path.is_symlink():
+            left.append((str(path), "changed since this was planned; it is no longer a symlink"))
+            return False
+        os.unlink(path)
+        return True
+    except OSError as exc:
+        left.append((str(path), f"could not be removed ({exc.strerror or exc})"))
+        return False
+
+
+# --------------------------------------------------------------------------
+# Builder state under ~/.local/state, and ~/.orient-control.
+# --------------------------------------------------------------------------
+
+LIBRARY_NAME = "library"
+BACKUP_NAME = "builder-backup"
+ORIENT_CONTROL_NAME = ".orient-control"
+
+
+def _state_top_name(state_norm: str, text: str) -> str | None:
+    """`text`'s first path segment below `state_norm`, or `None` when `text`
+    does not collapse to a strict descendant of `state_norm` at all.
+
+    **COLLAPSED (`os.path.normpath`) BEFORE THE FIRST SEGMENT IS EVER
+    TAKEN**, never matched by plain substring against `state` the way an
+    earlier version did. A `text.startswith(state + "/")` check reads
+    `{state}/./knowledge` as living under `state` and hands back the literal
+    segment `"."` — and an operator-writable `CREWS_ROOT`
+    (`~/.config/convivy/session-agent.env`, which any agent session can
+    write) of `{state}/.` turns `LIBRARY_KNOWLEDGE_ROOT = "{root}/knowledge"`
+    into exactly that text, making `"."` the auto-removal set's one entry:
+    the whole `state` directory, Library store and backups included,
+    bypassing `--keep-data` and the consent prompt both. Collapsing first
+    turns that same text into `{state}/knowledge`, whose segment is the
+    ordinary name `"knowledge"`; a `CREWS_ROOT` of `{state}/..` collapses to
+    `state`'s own parent, which no longer starts with `state_norm` at all
+    once collapsed, so nothing is derived from it either. A resulting
+    segment that is still empty, `"."`, `".."` or holds a separator — none of
+    which a genuine child name ever is — is refused rather than trusted.
+    """
+    normalized = os.path.normpath(text)
+    if normalized != state_norm and not normalized.startswith(state_norm + os.sep):
+        return None
+    rel = os.path.relpath(normalized, state_norm)
+    top = rel.split(os.sep, 1)[0]
+    if not top or top in (".", "..") or os.sep in top:
+        return None
+    return top
+
+
+def state_plan(jobs: list[declaration.Job], templates: list[declaration.Job],
+               home: str, state: str) -> tuple[set[str], bool]:
+    """Top-level names under `state` the declarations reference, and whether
+    `{home}/.orient-control` is one of them.
+
+    **DERIVED FROM EVERY STRING FIELD OF EACH RESOLVED JOB**, through
+    `placeholders._all_strings`, the same generator the installer's own
+    portability lint reads — not from a hand-kept list of "the state
+    directories Builder uses", which is exactly the kind of list this
+    command's own docstring says to avoid. `job.stdout`/`job.stderr` are the
+    one exception: `remove_jobs` already plans and removes those directly, as
+    the job's own log files, so deriving a top-level name from them too would
+    have this plan and that removal both name — and `--dry-run` both print —
+    the same path.
+
+    **EVERY RESOLVED STRING IS CHECKED AGAINST THE TEMPLATE IT CAME FROM
+    BEFORE IT CAN NAME ANYTHING**, never trusted on its own. `jobs` and
+    `templates` are the same declarations, filtered and ordered identically —
+    one resolved, one not — by `resolved_jobs` and `raw_jobs` sharing their
+    `load_jobs`/`as_invoker` filtering, so `placeholders._all_strings` yields
+    both in lockstep. A resolved field counts as a candidate only when its
+    *template* uses no placeholder beyond `{state}` (or, for the
+    `.orient-control` check, `{home}`): of the few other placeholders a
+    declaration can use (`{root}`, `{deploy}`, `{bin}`, `{python}`), `{root}`
+    is the one read from `~/.config/convivy/session-agent.env`'s
+    `CREWS_ROOT` (`configured_root()` below), which any agent session can
+    write — and `jobs/library.toml` substitutes it straight into
+    `LIBRARY_KNOWLEDGE_ROOT = "{root}/knowledge"` and into a `prepare` step's
+    own argv, either of which makes an attacker-chosen `CREWS_ROOT` of
+    `{state}/<any-name>` resolve to a string whose first segment below
+    `state` is `<any-name>`, chosen entirely by whoever wrote that config
+    file. Gating on the template rather than banning one field (`environment`,
+    say) is what keeps this working for a field that legitimately derives a
+    name from `{state}` alone, such as `ORIENT_CONFIG_ROOT = "{state}/orient"`,
+    while refusing one that only looks the same after an agent-writable value
+    has been substituted into it.
+    """
+    orient_control = f"{home}/{ORIENT_CONTROL_NAME}"
+    state_norm = os.path.normpath(state)
+    names: set[str] = set()
+    has_orient_control = False
+    for job, template in zip(jobs, templates):
+        job_log_paths = {p for p in (job.stdout, job.stderr) if p}
+        resolved_strings = list(placeholders._all_strings(job))
+        template_strings = list(placeholders._all_strings(template))
+        for text, raw in zip(resolved_strings, template_strings):
+            if text in job_log_paths:
+                continue
+            used = set(placeholders.PLACEHOLDER.findall(raw))
+            if text == orient_control or text.startswith(orient_control + "/"):
+                if used <= {"home"}:
+                    has_orient_control = True
+                continue
+            if not used <= {"state"}:
+                continue
+            top = _state_top_name(state_norm, text)
+            if top:
+                names.add(top)
+    return names, has_orient_control
+
+
+def data_paths_present(state: str) -> list[Path]:
+    """The Library's store and the backup directory, whichever exist."""
+    state_path = Path(state)
+    return [state_path / name for name in (LIBRARY_NAME, BACKUP_NAME)
+            if (state_path / name).exists()]
+
+
+def decide_data_removal(state: str, dry_run: bool, keep_data: bool, confirm) -> bool | None:
+    """Whether the Library's store and the backups should be removed, decided
+    BEFORE anything else is touched — never as the last of several steps.
+
+    **ASKED FIRST, SO A REFUSAL TO ASK LEAVES EVERYTHING ELSE UNTOUCHED
+    TOO.** Deciding this only when `apply_state_plan` got around to it would
+    mean a non-interactive run had already stopped every job, removed every
+    deploy area and every MCP registration before discovering it could not
+    answer the one question it needed to — a half-finished uninstall that
+    contradicts the "nothing was changed" a refusal is supposed to mean.
+
+    Returns `None` when there is nothing to decide (neither path exists, or
+    this is a dry run, which only reports the question rather than asking it).
+    """
+    paths = data_paths_present(state)
+    if not paths:
+        return None
+    if dry_run:
+        listed = ", ".join(str(p) for p in paths)
+        print(f"  would ask whether to remove the Library's store and your backups: {listed}")
+        print("    (skip the question with --keep-data)")
+        return None
+    if keep_data:
+        return False
+    listed = ", ".join(str(p) for p in paths)
+    return confirm(
+        f"Remove the Library's store and your backups? This holds your work queue, "
+        f"your knowledge repository's local copy of what the Library has indexed, and "
+        f"every backup Builder has taken ({listed})."
+    )
+
+
+def apply_state_plan(names: set[str], has_orient_control: bool, home: str, state: str,
+                      dry_run: bool, remove_data: bool | None, keep_data: bool,
+                      left: list[tuple[str, str]], removed: list[str]) -> None:
+    state_path = Path(state)
+    # `install-jobs`'s own record is never added here: `remove_jobs` already
+    # removes it unconditionally, jobs present or not, and both functions
+    # naming the same path is exactly the `--dry-run` double "would remove"
+    # this fix exists to stop.
+    auto = sorted(names - {LIBRARY_NAME, BACKUP_NAME})
+    for name in dict.fromkeys(auto):
+        path = state_path / name
+        if dry_run:
+            if os.path.lexists(path):
+                print(f"  would remove: {path}")
+            continue
+        if remove_path(path, left):
+            removed.append(str(path))
+    if has_orient_control:
+        path = Path(home) / ORIENT_CONTROL_NAME
+        if dry_run:
+            if os.path.lexists(path):
+                print(f"  would remove: {path}")
+        elif remove_path(path, left):
+            removed.append(str(path))
+
+    if dry_run or remove_data is None:
+        return
+    data_paths = data_paths_present(state)
+    reason = ("holds the adopter's work; kept because --keep-data was given" if keep_data
+             else "holds the adopter's work; kept on the operator's answer")
+    for path in data_paths:
+        if remove_data:
+            if remove_path(path, left):
+                removed.append(str(path))
+        else:
+            left.append((str(path), reason))
+
+
+def default_confirm(prompt: str) -> bool:
+    if not sys.stdin.isatty():
+        raise Refused(
+            f"{prompt}\nThis needs an answer and stdin is not a terminal. Pass "
+            f"--keep-data to keep the Library's store and your backups without "
+            f"being asked, or run this where you can answer. Nothing was changed."
+        )
+    answer = input(f"{prompt} [y/N] ").strip().lower()
+    return answer in ("y", "yes")
+
+
+# --------------------------------------------------------------------------
+# The knowledge index: agent-platform's own ~/.knowledge-index, which no job
+# declaration in jobs/ names.
+# --------------------------------------------------------------------------
+
+KnowledgeIndex = namedtuple("KnowledgeIndex", "dirname filenames")
+
+# agent-platform's bin/knowledge-autopull, bin/agentctl and bin/co all
+# hardcode Path.home()/.knowledge-index for the derived index and its own
+# logs, so this is read by content rather than off a job declaration the way
+# the rest of this file reads what it removes.
+KNOWLEDGE_INDEX = KnowledgeIndex(
+    dirname=".knowledge-index",
+    filenames=frozenset({"index.db", "index.db-shm", "index.db-wal", "autopull.log", "watcher.log"}),
+)
+
+
+def apply_knowledge_index_plan(home: str, dry_run: bool, left: list[tuple[str, str]],
+                                removed: list[str]) -> None:
+    """Remove `{home}/.knowledge-index` only when every entry in it is one
+    of `KNOWLEDGE_INDEX.filenames` — the derived index and its own logs,
+    never the adopter's own work. A directory holding anything else, or
+    being a symlink, is left and named, the same way an unstamped deploy
+    area is."""
+    path = Path(home) / KNOWLEDGE_INDEX.dirname
+    if not os.path.lexists(path):
+        return
+    if path.is_symlink():
+        left.append((str(path), "it is a symlink; refusing to remove through it"))
+        return
+    try:
+        entries = {entry.name for entry in path.iterdir()}
+    except OSError as exc:
+        left.append((str(path), f"could not be read ({exc.strerror or exc})"))
+        return
+    extra = entries - KNOWLEDGE_INDEX.filenames
+    if extra:
+        left.append((str(path), f"holds {', '.join(sorted(extra))}, which this install does "
+                                f"not recognize as part of the derived index, so it is left"))
+        return
+    if dry_run:
+        print(f"  would remove: {path}")
+        return
+    # EACH KNOWN FILE, THEN THE EMPTY DIRECTORY, AND NEVER `rmtree`. The check
+    # above reads names only, so an entry carrying a known name could be a
+    # directory; unlinking refuses one rather than descending into it. And
+    # agentctl and co can write here while this runs, so anything that appears
+    # after the check leaves the directory non-empty, and `rmdir` leaves it.
+    for name in sorted(entries):
+        try:
+            os.unlink(path / name)
+        except OSError as exc:
+            left.append((str(path / name), f"could not be removed ({exc.strerror or exc})"))
+    try:
+        os.rmdir(path)
+    except OSError as exc:
+        left.append((str(path), f"could not be removed ({exc.strerror or exc})"))
+        return
+    removed.append(str(path))
+
+
+# --------------------------------------------------------------------------
+# The machine-wide instruction file bin/install-payload placed from this
+# release's own deploy area, compared and removed before that area goes.
+# --------------------------------------------------------------------------
+
+# bin/install-payload's own MACHINE_SOURCE: the machine-wide instruction
+# file it copies, never links, from the builder-payload deploy area's own
+# knowledge-seed/machine/CLAUDE.md to {home}/.claude/CLAUDE.md.
+MACHINE_CLAUDE_MD_SOURCE_REL = os.path.join("knowledge-seed", "machine", "CLAUDE.md")
+
+
+def apply_machine_claude_md_plan(payload_area: Path, home: Path, dry_run: bool,
+                                  left: list[tuple[str, str]], removed: list[str]) -> None:
+    """Remove `{home}/.claude/CLAUDE.md` only when it is byte-identical to
+    the machine-wide instruction file this release's own `builder-payload`
+    deploy area would place (`MACHINE_CLAUDE_MD_SOURCE_REL` under
+    `payload_area`).
+
+    **READ WHILE `payload_area` STILL EXISTS.** The caller runs this before
+    `apply_deploy_plan` removes that area, since the shipped copy to compare
+    against lives nowhere else. Every session on the machine reads this file
+    at start, so a file that differs — an edit, or a copy from a different
+    release — or a missing shipped copy to compare against, is left and
+    named rather than guessed at; an adopter's own edit is never removed.
+    """
+    target = home / ".claude" / "CLAUDE.md"
+    if not os.path.lexists(target):
+        return
+    source = payload_area / MACHINE_CLAUDE_MD_SOURCE_REL
+    if not source.is_file():
+        left.append((str(target), "the machine-wide instruction file this install shipped, to "
+                                   "compare it against, is missing; left in place"))
+        return
+    if target.is_symlink():
+        left.append((str(target), "it is a symlink; refusing to remove through it"))
+        return
+    try:
+        live = target.read_bytes()
+    except OSError as exc:
+        left.append((str(target), f"could not be read ({exc.strerror or exc})"))
+        return
+    if live != source.read_bytes():
+        left.append((str(target), "its content differs from the machine-wide instruction file "
+                                   "this install shipped, so it may hold an edit; left in place"))
+        return
+    if dry_run:
+        print(f"  would remove: {target}")
+        return
+    if remove_path(target, left):
+        removed.append(str(target))
+
+
+# --------------------------------------------------------------------------
+# Deploy areas: install-backend's REPOSITORIES and COMPONENTS, plus
+# install-payload's own payload repository.
+# --------------------------------------------------------------------------
+
+
+def deploy_targets(deploy: Path, home: Path) -> list[tuple[str, Path, Path]]:
+    """`(name, path to remove, stamp file that must exist first)`, one per
+    area `install-backend` or `install-payload` places."""
+    targets = []
+    for name in ib.REPOSITORIES:
+        area = deploy / name
+        targets.append((name, area, area / ib.STAMP))
+    for component in ib.COMPONENTS:
+        lib = component.lib_at(home)
+        targets.append((component.name, lib, lib / ib.STAMP))
+    payload_area = deploy / PAYLOAD_REPOSITORY
+    targets.append((PAYLOAD_REPOSITORY, payload_area, payload_area / PAYLOAD_STAMP))
+    return targets
+
+
+def component_venvs(home: Path) -> dict[str, Path]:
+    """Each component's venv, home-relative, removed alongside its `lib`."""
+    return {component.name: component.venv_at(home) for component in ib.COMPONENTS}
+
+
+def apply_deploy_plan(deploy: Path, home: Path, dry_run: bool,
+                       left: list[tuple[str, str]], removed: list[str]) -> None:
+    """Remove every stamped deploy area.
+
+    **CALLED AFTER `apply_payload_skills`, NEVER BEFORE.** This removes the
+    `builder-payload` area whole, `skills/` subdirectory included; a caller
+    that unlinks the skills `install-payload` placed by looking inside that
+    same `skills/` directory has to do so while it still exists, or it finds
+    nothing to check and leaves a dangling symlink behind instead of a clean
+    unlink.
+    """
+    venvs = component_venvs(home)
+    for name, area, stamp in deploy_targets(deploy, home):
+        if not os.path.lexists(area):
+            continue
+        if not stamp.is_file():
+            left.append((str(area), "exists but carries no install stamp, so it was "
+                                    "not placed by this install"))
+            continue
+        if dry_run:
+            print(f"  would remove deploy area: {name} ({area})")
+            venv = venvs.get(name)
+            if venv is not None and os.path.lexists(venv):
+                print(f"  would remove: {venv}")
+            continue
+        if remove_path(area, left):
+            removed.append(str(area))
+        venv = venvs.get(name)
+        if venv is not None and remove_path(venv, left):
+            removed.append(str(venv))
+
+
+# --------------------------------------------------------------------------
+# Linked commands, skills (both link-commands' own and install-payload's),
+# and the session hook.
+# --------------------------------------------------------------------------
+
+
+def apply_link_plan(deploy: Path, bin_dir: Path, skills_dir: Path, settings: Path,
+                     home: Path, dry_run: bool, left: list[tuple[str, str]],
+                     removed: list[str]) -> None:
+    items = lc.plan(deploy, bin_dir, skills_dir, commands=True, settings=settings, home=home)
+    for item in items:
+        if item["name"] == lc.HOOK_NAME:
+            apply_hook_removal(item, settings, dry_run, left, removed)
+            continue
+        if item["name"] == lc.PROFILE_NAME:
+            apply_profile_removal(item, dry_run, left, removed)
+            continue
+        link = item["link"]
+        if item["state"] == "ours":
+            if dry_run:
+                print(f"  would unlink: {link}")
+            elif unlink_path(link, left):
+                removed.append(str(link))
+        elif item["state"] == "occupied":
+            left.append((str(link), "holds something this install's own link-commands run "
+                                    "did not put there"))
+
+
+def apply_hook_removal(item: dict, settings: Path, dry_run: bool,
+                        left: list[tuple[str, str]], removed: list[str]) -> None:
+    if item["state"] != "ours":
+        return
+    if dry_run:
+        print(f"  would remove the SessionStart hook from: {settings}")
+        return
+    try:
+        changed = remove_hook(Path(os.path.realpath(settings)), item["command"])
+    except lc.Refused as exc:
+        left.append((str(settings), str(exc)))
+        return
+    if changed:
+        removed.append(f"{settings} (SessionStart hook)")
+    else:
+        left.append((str(settings), "the hook was not found when this ran, even though "
+                                    "link-commands reported it as linked"))
+
+
+def remove_hook(path: Path, command: str) -> bool:
+    """Remove the one `hooks.SessionStart` entry whose command is `command`,
+    leaving the rest of `path` exactly as it is. Mirrors `link-commands`'s
+    own `place_hook`: same read, same atomic replace, same symlink-following
+    target, run the other direction."""
+    settings = lc.read_settings(path)
+    groups = lc.session_start_groups(settings, path)
+    new_groups = []
+    changed = False
+    for group in groups:
+        entries = group.get("hooks", []) if isinstance(group, dict) else []
+        if not isinstance(entries, list):
+            new_groups.append(group)
+            continue
+        kept = [e for e in entries
+                if not (isinstance(e, dict) and e.get("command") == command)]
+        if len(kept) != len(entries):
+            changed = True
+        if kept:
+            new_groups.append({**group, "hooks": kept})
+        # A group this leaves with no hooks is dropped rather than kept
+        # empty: it was this install's own `{"matcher": ..., "hooks": [...]}`
+        # entry, and an empty one left behind is litter nothing else wrote.
+    if not changed:
+        return False
+    settings.setdefault("hooks", {})[lc.HOOK_EVENT] = new_groups
+    try:
+        mode = path.stat().st_mode & 0o777
+    except FileNotFoundError:
+        mode = 0o600
+    fd, staging = tempfile.mkstemp(prefix=f".{path.name}.uninstall-builder.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as out:
+            json.dump(settings, out, indent=2)
+            out.write("\n")
+            os.fchmod(out.fileno(), mode)
+        os.replace(staging, path)
+    except BaseException:
+        try:
+            os.unlink(staging)
+        except OSError:
+            pass
+        raise
+    return True
+
+
+def apply_profile_removal(item: dict, dry_run: bool, left: list[tuple[str, str]],
+                           removed: list[str]) -> None:
+    if item["state"] != "ours":
+        return
+    link = item["link"]
+    if dry_run:
+        print(f"  would remove the PATH line from: {link}")
+        return
+    try:
+        changed = remove_profile_line(Path(os.path.realpath(link)), item["line"])
+    except lc.Refused as exc:
+        left.append((str(link), str(exc)))
+        return
+    if changed:
+        removed.append(f"{link} (PATH line)")
+    else:
+        left.append((str(link), "the PATH line was not found when this ran, even though "
+                                "link-commands reported it as present"))
+
+
+def remove_profile_line(path: Path, line: str) -> bool:
+    """Remove the one line `line` from `path`, exactly, leaving every other
+    byte — and the file itself, even once this leaves it empty — exactly as
+    it is. Mirrors `link-commands`'s own `place_profile_line`: same read,
+    same atomic replace, same symlink-following target, run the other
+    direction. A line the operator wrote themselves, without the exact
+    marker text this compares against, is never a match and stays."""
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise lc.Refused(f"could not read {path} ({exc.strerror or exc})") from None
+    lines = text.splitlines(keepends=True)
+    kept = [one for one in lines if one.rstrip("\n") != line]
+    if len(kept) == len(lines):
+        return False
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        mode = 0o644
+    fd, staging = tempfile.mkstemp(prefix=f".{path.name}.uninstall-builder.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as out:
+            out.write("".join(kept))
+            os.fchmod(out.fileno(), mode)
+        os.replace(staging, path)
+    except BaseException:
+        try:
+            os.unlink(staging)
+        except OSError:
+            pass
+        raise
+    return True
+
+
+def apply_payload_skills(payload_area: Path | None, skills_dir: Path, dry_run: bool,
+                          left: list[tuple[str, str]], removed: list[str]) -> None:
+    """The skills `install-payload` links directly — never through
+    `link-commands` — found the same way `install-payload` itself checks a
+    live path: against what is in the deploy area's own `skills/`."""
+    if payload_area is None:
+        return
+    skills_source = payload_area / "skills"
+    if not skills_source.is_dir():
+        return
+    for src in sorted(skills_source.iterdir()):
+        if not src.is_dir():
+            continue
+        name = src.name
+        live = skills_dir / name
+        if not os.path.lexists(live):
+            continue
+        if live.is_symlink() and Path(os.readlink(live)) == skills_source / name:
+            if dry_run:
+                print(f"  would unlink: {live}")
+            elif unlink_path(live, left):
+                removed.append(str(live))
+        else:
+            left.append((str(live), "holds something install-payload's own link did not put there"))
+
+
+# --------------------------------------------------------------------------
+# MCP registrations.
+# --------------------------------------------------------------------------
+
+
+def apply_mcp_plan(deploy: Path, dry_run: bool, left: list[tuple[str, str]],
+                    removed: list[str]) -> None:
+    items = rm.plan(deploy)
+    present = [item for item in items if item["state"] == "present"]
+    for item in items:
+        if item["state"] == "mismatch":
+            left.append((item["name"], "registered with something this install did not put there"))
+    if not present:
+        return
+    if dry_run:
+        for item in present:
+            print(f"  would remove MCP registration: {item['name']}")
+        return
+    cli = rm.claude_cli()
+    for item in present:
+        done = subprocess.run([cli, "mcp", "remove", item["name"], "-s", "user"],
+                              capture_output=True, text=True, check=False, timeout=120)
+        still = rm.registered_servers().get(item["name"])
+        if still is not None:
+            left.append((item["name"], f"`claude mcp remove` did not clear it "
+                                       f"(exit {done.returncode})"))
+        else:
+            removed.append(f"MCP registration: {item['name']}")
+
+
+# --------------------------------------------------------------------------
+# Main.
+# --------------------------------------------------------------------------
+
+
+def configured_root(home: str) -> str:
+    """The Builder root this machine is configured with, read the way
+    `bin/install-payload`'s own `configured_root()` reads it: the first
+    `CREWS_ROOT=` line in the session agent's config, or the documented
+    default when there is none."""
+    config = Path(home) / ".config" / "convivy" / "session-agent.env"
+    try:
+        text = config.read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("CREWS_ROOT"):
+            continue
+        _, _, value = stripped.partition("=")
+        value = value.strip()
+        if value[:1] in ("'", '"') and value[-1:] == value[:1] and len(value) >= 2:
+            value = value[1:-1]
+        if value == "~":
+            return home
+        if value.startswith("~/"):
+            return f"{home}/{value[2:]}"
+        if value:
+            return value
+    return f"{home}/builder"
+
+
+def main_single_account(args: argparse.Namespace) -> int:
+    platform = args.platform or detect_platform()
+    home = args.home or str(Path.home())
+    # `register-mcp`'s own `config_path()` reads `$HOME` from the
+    # environment rather than from any argument, since it has to agree
+    # with whatever `claude` itself resolves. Setting it here is what
+    # makes `--home` (a test's throwaway one, or the real account's) the
+    # one this process, and anything it execs, actually acts on.
+    os.environ["HOME"] = home
+    deploy = args.deploy or f"{home}/.local/deploy"
+    bin_dir = args.bin_dir or f"{home}/.local/bin"
+    skills_dir = args.skills or f"{home}/.claude/skills"
+    settings = args.settings or f"{home}/.claude/settings.json"
+    state = args.state or f"{home}/.local/state"
+    jobs_dir = args.jobs or (REPO / "jobs")
+    root = configured_root(home)
+
+    print(f"{PROG}: {platform}, {home}")
+
+    left: list[tuple[str, str]] = []
+    removed: list[str] = []
+
+    # DECIDED BEFORE ANYTHING ELSE IS TOUCHED. Asking this only once every
+    # other step had already run would mean a non-interactive refusal left
+    # jobs stopped, deploy areas gone and MCP registrations removed before
+    # it discovered it could not answer the one question it needed to —
+    # the opposite of what a refusal is supposed to mean here.
+    remove_data = decide_data_removal(state, args.dry_run, args.keep_data, default_confirm)
+
+    if declarations_present(jobs_dir):
+        jobs = resolved_jobs(jobs_dir, platform, home, root, deploy, state, bin_dir)
+        templates = raw_jobs(jobs_dir, platform)
+    else:
+        jobs = []
+        templates = []
+        print(f"  no job declarations at {jobs_dir}; nothing to stop or remove for jobs")
+
+    remove_jobs(jobs, platform, home, state, args.dry_run, left, removed)
+
+    apply_link_plan(Path(deploy), Path(bin_dir), Path(skills_dir), Path(settings),
+                    Path(home), args.dry_run, left, removed)
+
+    # The payload skills are unlinked, and the machine-wide instruction file
+    # compared, while the builder-payload deploy area, which they point into
+    # or must be read from, still exists — removing that area first would
+    # leave a dangling symlink behind instead of a clean unlink (see
+    # apply_deploy_plan's own docstring), and leave the machine-wide file
+    # with nothing to compare against.
+    payload_area = Path(deploy) / PAYLOAD_REPOSITORY
+    apply_payload_skills(payload_area, Path(skills_dir), args.dry_run, left, removed)
+    apply_machine_claude_md_plan(payload_area, Path(home), args.dry_run, left, removed)
+    apply_deploy_plan(Path(deploy), Path(home), args.dry_run, left, removed)
+
+    apply_mcp_plan(Path(deploy), args.dry_run, left, removed)
+
+    names, has_orient_control = state_plan(jobs, templates, home, state)
+    apply_state_plan(names, has_orient_control, home, state, args.dry_run, remove_data,
+                     args.keep_data, left, removed)
+
+    apply_knowledge_index_plan(home, args.dry_run, left, removed)
+
+    if args.dry_run:
+        print(f"\n{PROG}: dry run; nothing was changed")
+    else:
+        print(f"\n{PROG}: removed {len(removed)} item(s)")
+    if left:
+        print(f"{PROG}: left {len(left)} item(s) in place:")
+        for path, reason in left:
+            print(f"  {path}: {reason}")
+    else:
+        print(f"{PROG}: nothing was left behind that this install is aware of")
+    print(
+        f"\n{PROG}: never touched: the Builder root (crews, the knowledge repository, "
+        f"the steward's charter), the operator config under ~/.config/convivy, and "
+        f"any secret you supplied yourself, such as the LLM gateway's credentials file. "
+        f"Those are yours, not this install's."
+    )
+    return 0
+
+
+def main_two_account(args: argparse.Namespace, prefix: str,
+                      system: pa.System | None = None, drop=None) -> int:
+    """Remove the two-account shape: root's own half, over `prefix` and the
+    agents account's own system-scope jobs, by the three-account shape's own
+    code for every piece the two shapes share; everything in the agents
+    home, run by a child that has dropped to the `agents` account first;
+    then the account.
+
+    **NEVER PROBES FOR A `reviewers` ACCOUNT, A SUDOERS FILE OR A REVIEW
+    LAUNCHER.** `install-privileged --shape two` places none of the three,
+    so this never looks for them: there is no `sudoers_dir` here to read,
+    and `pa.remove` is called with shape "two", which touches only `agents`.
+
+    **`drop` IS `run_as_agents_account`'s OWN, THREADED THROUGH FOR A TEST
+    THAT CANNOT BECOME `agents`.** A real run never passes it, and gets
+    `bin/install-jobs`'s own `drop_to_account`.
+    """
+    if os.geteuid() != 0:
+        raise Refused(
+            f"removing the two-account shape stops the `{AGENTS}` account's own "
+            f"system-scope jobs, removes the root-owned tree under {prefix}, and "
+            f"removes the `{AGENTS}` account itself — all of which need root. Run "
+            f"this with sudo. Nothing was removed."
+        )
+
+    platform = args.platform or detect_platform()
+    agents_home = args.agents_home or su.agents_home()
+    deploy = args.deploy or f"{agents_home}/.local/deploy"
+    bin_dir = args.bin_dir or f"{agents_home}/.local/bin"
+    skills_dir = args.skills or f"{agents_home}/.claude/skills"
+    settings = args.settings or f"{agents_home}/.claude/settings.json"
+    state = args.state or f"{agents_home}/.local/state"
+    jobs_dir = args.jobs or (REPO / "jobs")
+    log_dir = args.log_dir or f"{prefix}/var/log"
+    root = configured_root(agents_home)
+
+    # The same `System` `pa.remove` uses at the foot of this function, asked
+    # early for the `agents` account's own uid and gids too, the same reason
+    # `main_three_account` asks early: `run_as_agents_account` needs them to
+    # drop to that account before anything below touches a path inside
+    # `agents_home`.
+    account_system = system or pa.system_for_platform()
+    account = account_system.account(AGENTS)
+    if account is None:
+        raise Refused(
+            f"the `{AGENTS}` account no longer exists on this machine. "
+            f"Nothing was removed."
+        )
+    ids = AccountIds(pw_name=account.name, pw_uid=account.uid, pw_gid=account.gid)
+
+    print(f"{PROG}: two-account, {platform}, {AGENTS} home {agents_home}, prefix {prefix}")
+
+    left: list[tuple[str, str]] = []
+    removed: list[str] = []
+
+    # DECIDED BEFORE ANYTHING ELSE IS TOUCHED, for the same reason the
+    # single-account and three-account shapes decide it first.
+    remove_data = decide_data_removal(state, args.dry_run, args.keep_data, default_confirm)
+
+    if declarations_present(jobs_dir):
+        jobs = resolved_agents_jobs(jobs_dir, platform, agents_home, root, log_dir,
+                                     deploy, state, bin_dir)
+        templates = agents_system_jobs(jobs_dir, platform)
+    else:
+        jobs = []
+        templates = []
+        print(f"  no job declarations at {jobs_dir}; nothing to stop or remove for jobs")
+
+    # ROOT'S OWN: the same system-scope jobs the three-account shape stops,
+    # rendered and removed through the same function.
+    remove_system_jobs(jobs, platform, args.system_dir, log_dir, agents_home, state,
+                        args.dry_run, left, removed)
+
+    def agents_home_steps() -> tuple[list[tuple[str, str]], list[str]]:
+        """Everything the single-account shape removes, reused verbatim and
+        pointed at the agents home, the same way `main_three_account`'s own
+        `agents_home_steps` does.
+
+        **`HOME` IS SET HERE, NOT BY THE CALLER.** See
+        `main_three_account.agents_home_steps` for why.
+        """
+        os.environ["HOME"] = agents_home
+        inner_left: list[tuple[str, str]] = []
+        inner_removed: list[str] = []
+        apply_link_plan(Path(deploy), Path(bin_dir), Path(skills_dir), Path(settings),
+                        Path(agents_home), args.dry_run, inner_left, inner_removed)
+        payload_area = Path(deploy) / PAYLOAD_REPOSITORY
+        apply_payload_skills(payload_area, Path(skills_dir), args.dry_run, inner_left, inner_removed)
+        apply_deploy_plan(Path(deploy), Path(agents_home), args.dry_run, inner_left, inner_removed)
+        apply_mcp_plan(Path(deploy), args.dry_run, inner_left, inner_removed)
+        names, has_orient_control = state_plan(jobs, templates, agents_home, state)
+        apply_state_plan(names, has_orient_control, agents_home, state, args.dry_run, remove_data,
+                         args.keep_data, inner_left, inner_removed)
+        apply_knowledge_index_plan(agents_home, args.dry_run, inner_left, inner_removed)
+        return inner_left, inner_removed
+
+    agent_left, agent_removed = run_as_agents_account(ids, agents_home_steps, drop=drop)
+    left.extend(agent_left)
+    removed.extend(agent_removed)
+
+    remove_privileged_tree(prefix, args.dry_run, left, removed)
+
+    if args.dry_run:
+        print(f"  would remove the `{AGENTS}` account through provision-accounts "
+              f"--shape two (pass --purge-homes to also delete a home that still "
+              f"holds something)")
+        print(f"\n{PROG}: dry run; nothing was changed")
+    else:
+        try:
+            removed.extend(pa.remove(account_system, "two", args.purge_homes))
+        except pa.Refused as exc:
+            left.append((f"the `{AGENTS}` account", str(exc)))
+        print(f"\n{PROG}: removed {len(removed)} item(s)")
+    if left:
+        print(f"{PROG}: left {len(left)} item(s) in place:")
+        for path, reason in left:
+            print(f"  {path}: {reason}")
+    else:
+        print(f"{PROG}: nothing was left behind that this install is aware of")
+    print(
+        f"\n{PROG}: never touched: GitHub's own state (the App installation, and the "
+        f"branch rules on main) — removing this machine's install never reaches "
+        f"GitHub, so that stays until you remove it there yourself; and any secret "
+        f"you supplied by hand. Those are yours, not this install's."
+    )
+    return 0
+
+
+def main_three_account(args: argparse.Namespace, prefix: str,
+                        system: pa.System | None = None, drop=None) -> int:
+    """Remove the three-account shape: root's own half, over `prefix` and
+    the agents account's own system-scope jobs; everything the single-account
+    shape removes, reused pointed at the agents home, run by a child that
+    has dropped to the `agents` account first; then the accounts.
+
+    **`drop` IS `run_as_agents_account`'s OWN, THREADED THROUGH FOR A TEST
+    THAT CANNOT BECOME `agents`.** A real run never passes it, and gets
+    `bin/install-jobs`'s own `drop_to_account`.
+    """
+    if os.geteuid() != 0:
+        raise Refused(
+            f"removing the three-account shape stops the `{AGENTS}` account's own "
+            f"system-scope jobs, removes the root-owned tree under {prefix} and its "
+            f"one sudo rule, and removes the `{AGENTS}` and `{REVIEWERS}` accounts "
+            f"themselves — all of which need root. Run this with sudo. Nothing was "
+            f"removed."
+        )
+
+    platform = args.platform or detect_platform()
+    agents_home = args.agents_home or su.agents_home()
+    deploy = args.deploy or f"{agents_home}/.local/deploy"
+    bin_dir = args.bin_dir or f"{agents_home}/.local/bin"
+    skills_dir = args.skills or f"{agents_home}/.claude/skills"
+    settings = args.settings or f"{agents_home}/.claude/settings.json"
+    state = args.state or f"{agents_home}/.local/state"
+    jobs_dir = args.jobs or (REPO / "jobs")
+    sudoers_dir = args.sudoers_dir or DEFAULT_SUDOERS_DIR
+    log_dir = args.log_dir or f"{prefix}/var/log"
+    root = configured_root(agents_home)
+
+    # The same `System` `pa.remove` uses at the foot of this function, asked
+    # early for the `agents` account's own uid and gids too: `run_as_agents_
+    # account` needs them to drop to that account before anything below
+    # touches a path inside `agents_home`, and a `FakeAccountSystem` answers
+    # this the same way it already answers the shape detection above.
+    account_system = system or pa.system_for_platform()
+    account = account_system.account(AGENTS)
+    if account is None:
+        raise Refused(
+            f"the `{AGENTS}` account no longer exists on this machine. "
+            f"Nothing was removed."
+        )
+    ids = AccountIds(pw_name=account.name, pw_uid=account.uid, pw_gid=account.gid)
+
+    print(f"{PROG}: three-account, {platform}, {AGENTS} home {agents_home}, prefix {prefix}")
+
+    left: list[tuple[str, str]] = []
+    removed: list[str] = []
+
+    # DECIDED BEFORE ANYTHING ELSE IS TOUCHED, for the same reason the
+    # single-account shape decides it first (see `main_single_account`).
+    # This asks only whether the Library's store and the backups should go,
+    # never touching a path itself, so it stays root's, the way the system
+    # jobs below stay root's.
+    remove_data = decide_data_removal(state, args.dry_run, args.keep_data, default_confirm)
+
+    if declarations_present(jobs_dir):
+        jobs = resolved_agents_jobs(jobs_dir, platform, agents_home, root, log_dir,
+                                     deploy, state, bin_dir)
+        templates = agents_system_jobs(jobs_dir, platform)
+    else:
+        jobs = []
+        templates = []
+        print(f"  no job declarations at {jobs_dir}; nothing to stop or remove for jobs")
+
+    # ROOT'S OWN: the agents account's system-scope jobs are root's own,
+    # machine-wide units naming `agents` through `UserName=`/`User=`, never
+    # that account's own per-user job — see `stop_system_job`.
+    remove_system_jobs(jobs, platform, args.system_dir, log_dir, agents_home, state,
+                        args.dry_run, left, removed)
+
+    def agents_home_steps() -> tuple[list[tuple[str, str]], list[str]]:
+        """Everything the single-account shape removes, reused verbatim and
+        pointed at the agents home: the three-account shape's `place`,
+        `link` and `register` steps are `agents`' own, the same installers
+        the single-account shape runs for the operator. Run here, inside
+        the child `run_as_agents_account` has already dropped to `agents`,
+        so a path inside its home is only ever read or written by that
+        account, and `claude mcp remove` (through `apply_mcp_plan`) execs
+        with that account's own `HOME`, never root's.
+
+        **`HOME` IS SET HERE, NOT BY THE CALLER.** Setting it before the
+        fork would leave it on root's own environment for the rest of this
+        run; set here, it only ever exists in this one dropped child.
+        """
+        os.environ["HOME"] = agents_home
+        inner_left: list[tuple[str, str]] = []
+        inner_removed: list[str] = []
+        apply_link_plan(Path(deploy), Path(bin_dir), Path(skills_dir), Path(settings),
+                        Path(agents_home), args.dry_run, inner_left, inner_removed)
+        payload_area = Path(deploy) / PAYLOAD_REPOSITORY
+        apply_payload_skills(payload_area, Path(skills_dir), args.dry_run, inner_left, inner_removed)
+        apply_deploy_plan(Path(deploy), Path(agents_home), args.dry_run, inner_left, inner_removed)
+        apply_mcp_plan(Path(deploy), args.dry_run, inner_left, inner_removed)
+        names, has_orient_control = state_plan(jobs, templates, agents_home, state)
+        apply_state_plan(names, has_orient_control, agents_home, state, args.dry_run, remove_data,
+                         args.keep_data, inner_left, inner_removed)
+        apply_knowledge_index_plan(agents_home, args.dry_run, inner_left, inner_removed)
+        return inner_left, inner_removed
+
+    agent_left, agent_removed = run_as_agents_account(ids, agents_home_steps, drop=drop)
+    left.extend(agent_left)
+    removed.extend(agent_removed)
+
+    remove_sudo_rule(prefix, sudoers_dir, args.dry_run, left, removed)
+    remove_privileged_tree(prefix, args.dry_run, left, removed)
+
+    if args.dry_run:
+        print(f"  would remove the `{AGENTS}` and `{REVIEWERS}` accounts through "
+              f"provision-accounts --shape three (pass --purge-homes to also delete "
+              f"a home that still holds something)")
+        print(f"\n{PROG}: dry run; nothing was changed")
+    else:
+        try:
+            removed.extend(pa.remove(account_system, "three", args.purge_homes))
+        except pa.Refused as exc:
+            left.append((f"the `{AGENTS}` and `{REVIEWERS}` accounts", str(exc)))
+        print(f"\n{PROG}: removed {len(removed)} item(s)")
+    if left:
+        print(f"{PROG}: left {len(left)} item(s) in place:")
+        for path, reason in left:
+            print(f"  {path}: {reason}")
+    else:
+        print(f"{PROG}: nothing was left behind that this install is aware of")
+    print(
+        f"\n{PROG}: never touched: GitHub's own state (the App installation, and the "
+        f"branch rules on main) — removing this machine's install never reaches "
+        f"GitHub, so that stays until you remove it there yourself; and any secret "
+        f"you supplied by hand. Those are yours, not this install's."
+    )
+    return 0
+
+
+def main(argv: list[str], system: pa.System | None = None, drop=None) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Remove a Builder install.",
+    )
+    parser.add_argument("--home", help="the operator's home directory, for the "
+                        "single-account shape")
+    parser.add_argument("--agents-home", help="the agents account's home directory, "
+                        "for the two-account and three-account shapes (default: the "
+                        "directory service's)")
+    parser.add_argument("--deploy", help="deploy root (default: {home}/.local/deploy)")
+    parser.add_argument("--bin", dest="bin_dir", help="linked commands directory "
+                        "(default: {home}/.local/bin)")
+    parser.add_argument("--skills", help="skills directory (default: {home}/.claude/skills)")
+    parser.add_argument("--settings", help="Claude Code settings file "
+                        "(default: {home}/.claude/settings.json)")
+    parser.add_argument("--state", help="writable state directory (default: {home}/.local/state)")
+    parser.add_argument("--jobs", type=Path, help="directory of .toml job declarations "
+                        "(default: jobs/ beside this checkout)")
+    parser.add_argument("--platform", choices=("macos", "linux"),
+                        help="act as this platform instead of the one we are on")
+    parser.add_argument("--prefix", help="the two-account or three-account shape's "
+                        "privileged install root (default: /opt/builder)")
+    parser.add_argument("--sudoers-dir", help="where the one sudo rule lives, for the "
+                        "three-account shape alone (default: /etc/sudoers.d)")
+    parser.add_argument("--log-dir", help="the root-owned directory the agents "
+                        "account's system-scope jobs log to (default: {prefix}/var/log)")
+    parser.add_argument("--system-dir", help="where a system-scope job's unit lives, "
+                        "instead of /Library/LaunchDaemons or /etc/systemd/system")
+    parser.add_argument("--purge-homes", action="store_true",
+                        help="with the two-account or three-account shape, also delete "
+                        "a home that still holds something once provision-accounts "
+                        "--remove would otherwise leave it")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="say what would be removed, change nothing")
+    parser.add_argument("--keep-data", action="store_true",
+                        help="keep the Library's store and your backups, without being asked")
+    args = parser.parse_args(argv)
+
+    try:
+        prefix = args.prefix or DEFAULT_PREFIX
+        # An injected `system` answers the shape's own account question too,
+        # so a test's FakeAccountSystem is the one source of truth for both
+        # "does `agents` exist" and "removes the accounts" — never the real
+        # directory service once a test has supplied its own.
+        exists = (lambda name: system.account(name) is not None) if system is not None else None
+        shape = refuse_unsupported_shape(exists=exists, prefix=prefix)
+        if shape == "three":
+            return main_three_account(args, prefix, system=system, drop=drop)
+        if shape == "two":
+            return main_two_account(args, prefix, system=system, drop=drop)
+        return main_single_account(args)
+
+    except (Refused, ij.Refused, lc.Refused, rm.Refused, ib.Refused, pa.Refused) as exc:
+        print(f"{PROG}: refusing — {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
