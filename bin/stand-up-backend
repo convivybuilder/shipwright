@@ -172,6 +172,12 @@ from pathlib import Path
 PROG = "stand-up-backend"
 REPO = Path(__file__).resolve().parent.parent
 
+# Which entities the install's record names, and the account pair each
+# gets: the same reader provision-accounts, install-privileged and
+# uninstall-builder use.
+sys.path.insert(0, str(REPO / "bin"))
+import account_entities as ae  # noqa: E402
+
 
 # `work_left_modes` NAMES THE MODES IN WHICH THAT TOOL'S `1` MEANS PENDING WORK
 # RATHER THAN A CRASH, and it is per-tool because the four disagree. Read off
@@ -328,8 +334,6 @@ def checked_release(value: str | None) -> str | None:
     return f"v{version}"
 
 
-# What the three-account shape needs before anything is installed for it.
-THREE_ACCOUNT_USERS = ("agents", "reviewers")
 PRIVILEGED_INSTALLER = Path("bin", "install-privileged")
 
 # THE BACKEND'S ACCOUNT, AND THE ROOT-OWNED TREE THE PRIVILEGED HALF INSTALLS.
@@ -451,21 +455,31 @@ def root_copy_problem(script: str, owner: int = 0, *, prefix: Path = PRIVILEGED_
 
 
 def three_shape_lacks(repo: Path = REPO, exists=_account_exists,
-                    record: Path = INSTALLED_RECORD) -> list[str]:
+                    record: Path = INSTALLED_RECORD,
+                    install_json: Path = PRIVILEGED_PREFIX / "install.json") -> list[str]:
     """What the three-account shape needs and this machine lacks, one line each.
 
     **THE ACCOUNTS ARE ASKED OF THE DIRECTORY, NOT OF `provision-accounts
     --check`**, because that command needs root for every mode and this runs
     as the operator. Whether an account that exists has the right shape is
     `provision-accounts`' question, which the refusal tells the operator to
-    ask. The privileged half's installer is looked for in this release, which
-    is where a release that cannot install it says so. The privileged half
+    ask. One pair is asked per entity the install's record names
+    (`install_json`, default `/opt/builder/install.json`), the same reader
+    `provision-accounts` and `install-privileged` use, so this never checks
+    for a bare `agents`/`reviewers` pair that was never created. The
+    privileged half's installer is looked for in this release, which is
+    where a release that cannot install it says so. The privileged half
     itself is looked for in the record install-privileged writes, since the
     steps this runs cannot work without the launcher it installs.
     """
+    try:
+        entities = ae.read_entities(str(install_json))
+    except ae.EntitiesInvalid as exc:
+        raise Refused(str(exc))
+    expected = [name for pair in ae.account_pairs(entities) for name in pair]
     lacks = [
         f"the `{name}` account, which `sudo bin/provision-accounts --shape three` creates"
-        for name in THREE_ACCOUNT_USERS if not exists(name)
+        for name in expected if not exists(name)
     ]
     if not (repo / PRIVILEGED_INSTALLER).is_file():
         lacks.append(
@@ -3004,7 +3018,11 @@ def main(argv: list[str]) -> int:
     if args.shape == "three":
         # BEFORE ANY STEP, IN EVERY MODE. A reporting mode would otherwise
         # describe installing pieces the three-account shape cannot use.
-        lacks = three_shape_lacks()
+        try:
+            lacks = three_shape_lacks()
+        except Refused as exc:
+            print(f"{PROG}: {exc}", file=sys.stderr)
+            return 2
         if lacks:
             print(f"{PROG}: {refuse_three_shape(lacks)}", file=sys.stderr)
             return 2

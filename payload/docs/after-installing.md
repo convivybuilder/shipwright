@@ -179,8 +179,8 @@ creates the steward and shows it on the rail, with a note reading "Steward crew 
 meet; tell it what you want to build, in plain language. It asks what it needs to know and then
 creates a crew for the project.
 
-**These steps have not been rehearsed end to end** — see [What works and what does not
-yet](install-status.md).
+**These steps have not been rehearsed end to end**, as [What does not work
+yet](install-status.md) says.
 
 **If Deck cannot reach the server**, meet the steward by hand instead. On the server:
 
@@ -350,5 +350,5 @@ Answer no, or pass `--keep-data`, to keep them without being asked. Neither your
 
 ## Next
 
-[Getting started](getting-started.md) describes a first week with the steward. [What works and what
-does not yet](install-status.md) lists what has been seen working, and what does not yet.
+[Getting started](getting-started.md) describes a first week with the steward. [What does not work
+yet](install-status.md) lists what Builder cannot do yet.

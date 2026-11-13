@@ -279,6 +279,10 @@ pa = _load("builder_uninstall_provision_accounts", REPO / "bin" / "provision-acc
 
 AGENTS = su.AGENTS
 REVIEWERS = next(name for name in pa.SERVICE_ACCOUNTS if name != AGENTS)
+# Which entities the install's record names, and the account pair each gets:
+# `pa`'s own `account_entities`, loaded by `provision-accounts` as its
+# sibling, so this never re-derives the rule from somewhere else.
+ae = pa.ae
 PAYLOAD_REPOSITORY = lc.PAYLOAD_REPOSITORY  # "builder-payload"
 PAYLOAD_STAMP = ".installed"  # bin/install-payload's own STAMP, beside the deploy dir
 
@@ -329,41 +333,70 @@ def read_install_shape(install_json: str) -> str | None:
     return shape if isinstance(shape, str) else None
 
 
+def read_entities_for_prefix(prefix: str) -> list[str]:
+    """The install's entities, read the same way `provision-accounts` and
+    `install-privileged` do: from `install.json` at `prefix`, a single
+    entity named `default` when the file or its `entities` key is absent."""
+    try:
+        return ae.read_entities(os.path.join(prefix, PRIVILEGED_INSTALL_JSON))
+    except ae.EntitiesInvalid as exc:
+        raise Refused(str(exc))
+
+
 def refuse_unsupported_shape(exists=None, prefix: str | None = None) -> str:
     """Returns "single" on a machine none of the multi-account installs ever
     touched, "two" where the two-account install has fully landed, and
-    "three" where the three-account install has fully landed. Refuses
-    outright on anything between.
+    "three" where the three-account install has fully landed — one
+    `agents`/`reviewers` pair per entity the install's record names, every
+    pair present. Refuses outright on anything between.
 
     **NAMED BY THE ACCOUNTS AND THE PRIVILEGED INSTALL'S OWN MARKER, NOT BY
     ASKING WHAT ELSE IS INSTALLED.** A shape's name counts every account on
     the machine, the operator's own included: the two-account install is
     `agents` alone, with no `reviewers` account at all, and
     `install-privileged`'s own `install.json` at the prefix naming shape
-    "two"; the three-account install is `agents` and `reviewers` both, with
-    that same file naming shape "three". `agents` exists only on a machine
+    "two"; the three-account install is every entity's `agents`/`reviewers`
+    pair, with that same file naming shape "three" and, with more than one
+    entity, naming them. `agents` exists only on a machine
     `sudo bin/provision-accounts` ran on.
 
-    `agents` existing with `install.json` naming no readable shape — the
-    file is missing, unreadable, not JSON, or names none — is an unfinished
-    install of either shape: the privileged install has not run yet. A
-    readable shape that the accounts present contradict — "two" named while
-    `reviewers` also exists, or "three" named while `reviewers` is absent —
-    is refused the same way, since an installer never leaves a machine in
-    that state on its own. Neither case is guessed at: both refuse, name
-    what was found, and leave the decision to the operator.
+    No account of either pair existing, with `install.json` naming no
+    readable shape — the file is missing, unreadable, not JSON, or names
+    none — reads as "single": the privileged install has not run yet, and
+    there is nothing yet to call unfinished. Some but not all of a shape's
+    expected accounts existing, or a readable shape the accounts present
+    contradict, is refused the same way, since an installer never leaves a
+    machine in that state on its own. Neither case is guessed at: both
+    refuse, name what was found, and leave the decision to the operator.
     """
     exists = exists or su._account_exists
     prefix = DEFAULT_PREFIX if prefix is None else prefix
+    install_json = os.path.join(prefix, PRIVILEGED_INSTALL_JSON)
+    shape = read_install_shape(install_json)
+
+    if shape == "three":
+        entities = read_entities_for_prefix(prefix)
+        pairs = ae.account_pairs(entities)
+        pair_names = ", ".join(f"`{a}`/`{r}`" for a, r in pairs)
+        expected = [name for pair in pairs for name in pair]
+        present = [name for name in expected if exists(name)]
+        if not present:
+            return "single"
+        if set(present) == set(expected):
+            return "three"
+        missing = ", ".join(f"`{name}`" for name in sorted(set(expected) - set(present)))
+        raise Refused(
+            f"{install_json} names shape \"three\" for {len(entities)} "
+            f"entit{'y' if len(entities) == 1 else 'ies'} ({', '.join(entities)}), expecting "
+            f"the {pair_names} accounts, and {missing} do not exist. This command supports "
+            f"only a fully landed install. Nothing was removed."
+        )
+
     if not exists(AGENTS):
         return "single"
     has_reviewers = exists(REVIEWERS)
-    install_json = os.path.join(prefix, PRIVILEGED_INSTALL_JSON)
-    shape = read_install_shape(install_json)
     if shape == "two" and not has_reviewers:
         return "two"
-    if shape == "three" and has_reviewers:
-        return "three"
     if shape is None:
         state = (f"`{REVIEWERS}` also exists" if has_reviewers
                  else f"no `{REVIEWERS}` account exists")
@@ -372,8 +405,8 @@ def refuse_unsupported_shape(exists=None, prefix: str | None = None) -> str:
             f"not name a readable shape (it is missing, unreadable, not JSON, or "
             f"names none). This command supports only the two-account install "
             f"(`{AGENTS}` alone, with {install_json} naming shape \"two\") and the "
-            f"three-account install (`{AGENTS}` and `{REVIEWERS}` both, with that "
-            f"same file naming shape \"three\"); today this machine is an "
+            f"three-account install (one `agents`/`reviewers` pair per entity, with "
+            f"that same file naming shape \"three\"); today this machine is an "
             f"unfinished install of one or the other — the privileged install has "
             f"not run yet. Nothing was removed."
         )
@@ -381,8 +414,8 @@ def refuse_unsupported_shape(exists=None, prefix: str | None = None) -> str:
         f"{install_json} names shape {shape!r}, but `{REVIEWERS}` "
         f"{'exists' if has_reviewers else 'does not exist'}, which contradicts it. "
         f"This command supports only the two-account install (`{AGENTS}` alone, "
-        f"shape \"two\") and the three-account install (`{AGENTS}` and "
-        f"`{REVIEWERS}` both, shape \"three\"); today this machine matches "
+        f"shape \"two\") and the three-account install (one `agents`/`reviewers` "
+        f"pair per entity, shape \"three\"); today this machine matches "
         f"neither. Nothing was removed."
     )
 
@@ -874,13 +907,16 @@ def run_as_agents_account(ids, action, drop=None) -> tuple[list[tuple[str, str]]
 
 def expected_sudoers_text(prefix: str) -> bytes:
     """The sudoers rule `install-privileged` would write for this prefix:
-    its own template, read from this checkout, with its one placeholder
-    filled in the way `stage_sudo_rule` fills it. Read from this checkout
-    rather than kept as a copy, the same reason every removal above reads
-    off today's sibling installer instead of its own list."""
+    its own template, read from this checkout, rendered one Defaults/rule
+    pair per entity's agents account the way `stage_sudo_rule` renders it.
+    Read from this checkout rather than kept as a copy, the same reason
+    every removal above reads off today's sibling installer instead of its
+    own list."""
     template = (REPO / SUDOERS_TEMPLATE_REL).read_text(encoding="utf-8")
     launcher = os.path.join(prefix, LAUNCHER_REL)
-    return template.replace("@LAUNCHER@", launcher).encode("utf-8")
+    entities = read_entities_for_prefix(prefix)
+    agents_names = [pair[0] for pair in ae.account_pairs(entities)]
+    return ae.render_sudoers(template, agents_names, launcher).encode("utf-8")
 
 
 def remove_sudo_rule(prefix: str, sudoers_dir: str, dry_run: bool,
@@ -1798,25 +1834,46 @@ def main_two_account(args: argparse.Namespace, prefix: str,
 def main_three_account(args: argparse.Namespace, prefix: str,
                         system: pa.System | None = None, drop=None) -> int:
     """Remove the three-account shape: root's own half, over `prefix` and
-    the agents account's own system-scope jobs; everything the single-account
-    shape removes, reused pointed at the agents home, run by a child that
-    has dropped to the `agents` account first; then the accounts.
+    the primary pair's agents account's own system-scope jobs; everything
+    the single-account shape removes, reused pointed at that account's home,
+    run by a child that has dropped to it first; then every entity's pair of
+    accounts.
 
     **`drop` IS `run_as_agents_account`'s OWN, THREADED THROUGH FOR A TEST
     THAT CANNOT BECOME `agents`.** A real run never passes it, and gets
     `bin/install-jobs`'s own `drop_to_account`.
     """
+    entities = read_entities_for_prefix(prefix)
+    pairs = ae.account_pairs(entities)
+    pair_names = ", ".join(f"`{a}`/`{r}`" for a, r in pairs)
+    primary_agents, _primary_reviewers = pairs[0]
+
     if os.geteuid() != 0:
         raise Refused(
-            f"removing the three-account shape stops the `{AGENTS}` account's own "
-            f"system-scope jobs, removes the root-owned tree under {prefix} and its "
-            f"one sudo rule, and removes the `{AGENTS}` and `{REVIEWERS}` accounts "
-            f"themselves — all of which need root. Run this with sudo. Nothing was "
-            f"removed."
+            f"removing the three-account shape stops the `{primary_agents}` account's "
+            f"own system-scope jobs, removes the root-owned tree under {prefix} and its "
+            f"one sudo rule, and removes the {pair_names} accounts themselves — all of "
+            f"which need root. Run this with sudo. Nothing was removed."
         )
 
+    # The same `System` `pa.remove` uses at the foot of this function, asked
+    # early for every pair's accounts: `run_as_agents_account` needs the
+    # primary pair's own uid and gids to drop to it before anything below
+    # touches a path inside its home, and a `FakeAccountSystem` answers this
+    # the same way it already answers the shape detection above.
+    account_system = system or pa.system_for_platform()
+    missing = [name for pair in pairs for name in pair if account_system.account(name) is None]
+    if missing:
+        raise Refused(
+            f"the {', '.join(f'`{n}`' for n in missing)} account(s) no longer exist on "
+            f"this machine. Nothing was removed."
+        )
+    primary_account = account_system.account(primary_agents)
+    ids = AccountIds(pw_name=primary_account.name, pw_uid=primary_account.uid,
+                     pw_gid=primary_account.gid)
+
     platform = args.platform or detect_platform()
-    agents_home = args.agents_home or su.agents_home()
+    agents_home = args.agents_home or primary_account.home
     deploy = args.deploy or f"{agents_home}/.local/deploy"
     bin_dir = args.bin_dir or f"{agents_home}/.local/bin"
     skills_dir = args.skills or f"{agents_home}/.claude/skills"
@@ -1827,93 +1884,94 @@ def main_three_account(args: argparse.Namespace, prefix: str,
     log_dir = args.log_dir or f"{prefix}/var/log"
     root = configured_root(agents_home)
 
-    # The same `System` `pa.remove` uses at the foot of this function, asked
-    # early for the `agents` account's own uid and gids too: `run_as_agents_
-    # account` needs them to drop to that account before anything below
-    # touches a path inside `agents_home`, and a `FakeAccountSystem` answers
-    # this the same way it already answers the shape detection above.
-    account_system = system or pa.system_for_platform()
-    account = account_system.account(AGENTS)
-    if account is None:
-        raise Refused(
-            f"the `{AGENTS}` account no longer exists on this machine. "
-            f"Nothing was removed."
-        )
-    ids = AccountIds(pw_name=account.name, pw_uid=account.uid, pw_gid=account.gid)
-
-    print(f"{PROG}: three-account, {platform}, {AGENTS} home {agents_home}, prefix {prefix}")
+    note = f", entities: {', '.join(entities)}" if len(entities) > 1 else ""
+    print(f"{PROG}: three-account, {platform}, {primary_agents} home {agents_home}, "
+          f"prefix {prefix}{note}")
+    if len(pairs) > 1:
+        print(f"  {pair_names} accounts are all this install created; home-scoped "
+              f"cleanup below runs only for {primary_agents}, the first entity's own "
+              f"pair, since nothing here ever places backend content under another "
+              f"entity's account home")
 
     left: list[tuple[str, str]] = []
     removed: list[str] = []
 
-    # DECIDED BEFORE ANYTHING ELSE IS TOUCHED, for the same reason the
-    # single-account shape decides it first (see `main_single_account`).
-    # This asks only whether the Library's store and the backups should go,
-    # never touching a path itself, so it stays root's, the way the system
-    # jobs below stay root's.
-    remove_data = decide_data_removal(state, args.dry_run, args.keep_data, default_confirm)
+    # The detailed, per-step cleanup below (jobs, deploy areas, linked
+    # commands, MCP registrations, the knowledge index) is the single-entity
+    # shape's own: `place`, `link` and `register` run only as the literal
+    # `agents` account (stand-up-backend's own `AS_AGENTS`), and no job
+    # declaration in `jobs/` names any other account. With more than one
+    # entity there is nothing here to clean up under a different name, so
+    # this runs only for the primary pair, when it is the bare `agents`.
+    if len(pairs) == 1:
+        # DECIDED BEFORE ANYTHING ELSE IS TOUCHED, for the same reason the
+        # single-account shape decides it first (see `main_single_account`).
+        # This asks only whether the Library's store and the backups should go,
+        # never touching a path itself, so it stays root's, the way the system
+        # jobs below stay root's.
+        remove_data = decide_data_removal(state, args.dry_run, args.keep_data, default_confirm)
 
-    if declarations_present(jobs_dir):
-        jobs = resolved_agents_jobs(jobs_dir, platform, agents_home, root, log_dir,
-                                     deploy, state, bin_dir)
-        templates = agents_system_jobs(jobs_dir, platform)
-    else:
-        jobs = []
-        templates = []
-        print(f"  no job declarations at {jobs_dir}; nothing to stop or remove for jobs")
+        if declarations_present(jobs_dir):
+            jobs = resolved_agents_jobs(jobs_dir, platform, agents_home, root, log_dir,
+                                         deploy, state, bin_dir)
+            templates = agents_system_jobs(jobs_dir, platform)
+        else:
+            jobs = []
+            templates = []
+            print(f"  no job declarations at {jobs_dir}; nothing to stop or remove for jobs")
 
-    # ROOT'S OWN: the agents account's system-scope jobs are root's own,
-    # machine-wide units naming `agents` through `UserName=`/`User=`, never
-    # that account's own per-user job — see `stop_system_job`.
-    remove_system_jobs(jobs, platform, args.system_dir, log_dir, agents_home, state,
-                        args.dry_run, left, removed)
+        # ROOT'S OWN: the agents account's system-scope jobs are root's own,
+        # machine-wide units naming `agents` through `UserName=`/`User=`, never
+        # that account's own per-user job — see `stop_system_job`.
+        remove_system_jobs(jobs, platform, args.system_dir, log_dir, agents_home, state,
+                            args.dry_run, left, removed)
 
-    def agents_home_steps() -> tuple[list[tuple[str, str]], list[str]]:
-        """Everything the single-account shape removes, reused verbatim and
-        pointed at the agents home: the three-account shape's `place`,
-        `link` and `register` steps are `agents`' own, the same installers
-        the single-account shape runs for the operator. Run here, inside
-        the child `run_as_agents_account` has already dropped to `agents`,
-        so a path inside its home is only ever read or written by that
-        account, and `claude mcp remove` (through `apply_mcp_plan`) execs
-        with that account's own `HOME`, never root's.
+        def agents_home_steps() -> tuple[list[tuple[str, str]], list[str]]:
+            """Everything the single-account shape removes, reused verbatim and
+            pointed at the agents home: the three-account shape's `place`,
+            `link` and `register` steps are `agents`' own, the same installers
+            the single-account shape runs for the operator. Run here, inside
+            the child `run_as_agents_account` has already dropped to `agents`,
+            so a path inside its home is only ever read or written by that
+            account, and `claude mcp remove` (through `apply_mcp_plan`) execs
+            with that account's own `HOME`, never root's.
 
-        **`HOME` IS SET HERE, NOT BY THE CALLER.** Setting it before the
-        fork would leave it on root's own environment for the rest of this
-        run; set here, it only ever exists in this one dropped child.
-        """
-        os.environ["HOME"] = agents_home
-        inner_left: list[tuple[str, str]] = []
-        inner_removed: list[str] = []
-        apply_link_plan(Path(deploy), Path(bin_dir), Path(skills_dir), Path(settings),
-                        Path(agents_home), args.dry_run, inner_left, inner_removed)
-        payload_area = Path(deploy) / PAYLOAD_REPOSITORY
-        apply_payload_skills(payload_area, Path(skills_dir), args.dry_run, inner_left, inner_removed)
-        apply_deploy_plan(Path(deploy), Path(agents_home), args.dry_run, inner_left, inner_removed)
-        apply_mcp_plan(Path(deploy), args.dry_run, inner_left, inner_removed)
-        names, has_orient_control = state_plan(jobs, templates, agents_home, state)
-        apply_state_plan(names, has_orient_control, agents_home, state, args.dry_run, remove_data,
-                         args.keep_data, inner_left, inner_removed)
-        apply_knowledge_index_plan(agents_home, args.dry_run, inner_left, inner_removed)
-        return inner_left, inner_removed
+            **`HOME` IS SET HERE, NOT BY THE CALLER.** Setting it before the
+            fork would leave it on root's own environment for the rest of this
+            run; set here, it only ever exists in this one dropped child.
+            """
+            os.environ["HOME"] = agents_home
+            inner_left: list[tuple[str, str]] = []
+            inner_removed: list[str] = []
+            apply_link_plan(Path(deploy), Path(bin_dir), Path(skills_dir), Path(settings),
+                            Path(agents_home), args.dry_run, inner_left, inner_removed)
+            payload_area = Path(deploy) / PAYLOAD_REPOSITORY
+            apply_payload_skills(payload_area, Path(skills_dir), args.dry_run, inner_left, inner_removed)
+            apply_deploy_plan(Path(deploy), Path(agents_home), args.dry_run, inner_left, inner_removed)
+            apply_mcp_plan(Path(deploy), args.dry_run, inner_left, inner_removed)
+            names, has_orient_control = state_plan(jobs, templates, agents_home, state)
+            apply_state_plan(names, has_orient_control, agents_home, state, args.dry_run, remove_data,
+                             args.keep_data, inner_left, inner_removed)
+            apply_knowledge_index_plan(agents_home, args.dry_run, inner_left, inner_removed)
+            return inner_left, inner_removed
 
-    agent_left, agent_removed = run_as_agents_account(ids, agents_home_steps, drop=drop)
-    left.extend(agent_left)
-    removed.extend(agent_removed)
+        agent_left, agent_removed = run_as_agents_account(ids, agents_home_steps, drop=drop)
+        left.extend(agent_left)
+        removed.extend(agent_removed)
 
     remove_sudo_rule(prefix, sudoers_dir, args.dry_run, left, removed)
     remove_privileged_tree(prefix, args.dry_run, left, removed)
 
     if args.dry_run:
-        print(f"  would remove the `{AGENTS}` and `{REVIEWERS}` accounts through "
+        print(f"  would remove the {pair_names} accounts through "
               f"provision-accounts --shape three (pass --purge-homes to also delete "
               f"a home that still holds something)")
         print(f"\n{PROG}: dry run; nothing was changed")
     else:
         try:
-            removed.extend(pa.remove(account_system, "three", args.purge_homes))
+            removed.extend(pa.remove(account_system, "three", args.purge_homes, entities))
         except pa.Refused as exc:
-            left.append((f"the `{AGENTS}` and `{REVIEWERS}` accounts", str(exc)))
+            left.append((f"the {pair_names} accounts", str(exc)))
         print(f"\n{PROG}: removed {len(removed)} item(s)")
     if left:
         print(f"{PROG}: left {len(left)} item(s) in place:")

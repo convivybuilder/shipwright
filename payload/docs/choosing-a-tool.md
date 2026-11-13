@@ -141,8 +141,8 @@ Builder asks for more setup than a workbench:
 - **You need a server and a Mac.** The server, a Linux machine or a Mac that stays on, runs Builder's
   backend and every session. Deck, the app you work from, runs on a Mac.
 - **You need some patience.** Builder is early. Its first public release came out in October 2026,
-  and parts of it will change as people use it. [What works and what does not
-  yet](install-status.md) lists what has been seen working.
+  and parts of it will change as people use it. [What does not work
+  yet](install-status.md) lists the gaps.
 
 **Another tool will probably suit you better if:**
 

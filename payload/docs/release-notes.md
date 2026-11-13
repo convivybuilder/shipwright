@@ -4,7 +4,45 @@ This page says what changed in each release of Builder, newest first, for anyone
 install it or move an existing install to a later release. [After the install](after-installing.md#moving-to-a-later-release)
 shows how to move.
 
-## 0.7.0, 2026-11-02
+## 0.8.0, not yet released
+
+### Installing
+
+- **The one command now asks which permission mode crew sessions run in, and whether they start
+  with remote control.** It recommends `auto` for the permission mode and offers
+  `bypassPermissions`, which runs every tool call without asking; remote control defaults to off.
+  `--permission-mode` and `--remote-control` answer either one without a terminal, and a rerun
+  shows each current value as its own default. The answers land in a new root-owned file,
+  `co-launch.env` in `/usr/local/etc/convivy`, which `co` reads; keeping the defaults on a fresh
+  install writes nothing.
+
+### Backend jobs
+
+- **The `orient-github-capture` job is gone.** Orient stopped capturing GitHub activity itself, and
+  the script the job ran is no longer in the Orient release Builder installs, so the job had
+  nothing to run. It was off by default. If you switched it on, the updater and the uninstaller no
+  longer know about it, so remove it yourself. Its label is `com.convivy.orient-github-capture`.
+  - On the single-account install, on a Mac, run `launchctl bootout gui/$(id -u)/com.convivy.orient-github-capture`
+    and delete `~/Library/LaunchAgents/com.convivy.orient-github-capture.plist`. On Linux, run
+    `systemctl --user disable --now com.convivy.orient-github-capture.timer` and delete that timer
+    and its `.service` from `~/.config/systemd/user`.
+  - On the two- and three-account installs it ran as a system job. On a Mac, run
+    `sudo launchctl bootout system/com.convivy.orient-github-capture` and delete
+    `/Library/LaunchDaemons/com.convivy.orient-github-capture.plist`. On Linux, run
+    `sudo systemctl disable --now com.convivy.orient-github-capture.timer` and delete that timer
+    and its `.service` from `/etc/systemd/system`.
+
+## 0.7.1, not yet released
+
+### Installing
+
+- **`builder-install --github-app-port <n>` fixes the port the GitHub App step serves its page on.**
+  Without it the step picks any free port, which a tool driving the install over `ssh` cannot know
+  in time to forward. Deck uses it to forward the port over its own connection and open the page,
+  so creating the App needs only the click on GitHub. A value that is not a port from 1 to 65535
+  refuses before anything is installed.
+
+## 0.7.0, 2026-11-08
 
 ### Installing
 
@@ -31,8 +69,11 @@ shows how to move.
   the manifest's signature against that key, each of the six clones' commit against what the
   manifest names, and the published archive's sha256, fetching the manifest and signature itself
   when you point it at nothing. The one-line install from the site now runs the same check before
-  any installer, including when it installs 0.7.0. The Homebrew copy is the installer packed in the
-  0.7.0 archive, which predates that check, so after a Homebrew install run `--verify` yourself.
+  any installer, including when it installs 0.7.0. The Homebrew copy runs the same check, against
+  the release keys its formula builds in from the archive it pins. The formula first shipped
+  without them, so a Homebrew copy installed before 9 November 2026 stops with `could not check`
+  before any installer runs; `brew update` and then `brew reinstall convivybuilder/tap/builder`
+  replace it.
 - **An install can now add a crew.** The install had no credential that could write the crew
   registry, so `agentctl crew register` and the steward's `new-crew` refused on every install. The
   Library now mints `agent-platform-registry-writer-token`, which can do that and nothing else, on

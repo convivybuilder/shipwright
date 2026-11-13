@@ -95,7 +95,7 @@ recommendation. You can decide some merges in advance: the agent policy,
 request an agent may merge once review passes. Out of the box it names none. `agentctl kb merge`,
 the command the Library merges through, reads the policy and refuses anything it does not permit. A
 merge you start from Deck or Orient takes a separate path, through a merge check in the Library, and
-that check approves every merge it is asked about for now, as [What works and what does not yet](install-status.md)
+that check approves every merge it is asked about for now, as [What does not work yet](install-status.md)
 says. Your knowledge repository holds the Reference Room, Builder's store of what your projects hold
 to be true, which many systems call a knowledge base.
 

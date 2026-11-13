@@ -34,8 +34,8 @@ fifth.
   later release, and how to meet the steward, and covers backups.
 - **[Supported setups](supported-setups.md)** lists the servers, laptops and account shapes Builder
   1.0 supports.
-- **[What works and what does not yet](install-status.md)** lists what release 0.6.0 has been seen
-  doing on each test machine, and what it cannot do yet.
+- **[What does not work yet](install-status.md)** lists what release 0.7.0 cannot do yet,
+  and what to do in the meantime.
 - **[Release notes](release-notes.md)** says what changed in each release, newest first.
 
 ## Guides

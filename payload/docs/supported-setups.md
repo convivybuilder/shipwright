@@ -3,8 +3,8 @@
 This page lists the setups Builder 1.0 supports. A setup is supported when a newcomer holding only
 these pages can go from an empty machine to a crew whose session produces working code, and when the
 updater and the uninstaller have both been run on it. Builder 1.0 does not ship until that is true of
-every setup below. [What works and what does not yet](install-status.md) says how far each one has
-been seen working in the current release.
+every setup below. [What does not work yet](install-status.md) lists what has not
+yet been run on each.
 
 ## The machines
 
@@ -57,5 +57,5 @@ Builder needs with `apt-get`, the package manager Debian and Ubuntu use.
 
 - **[What you need](what-you-need.md)** lists what has to exist before you begin.
 - **[Installing Builder](installing.md)** walks through the install.
-- **[What works and what does not yet](install-status.md)** says which of these setups the current
-  release has been seen working on.
+- **[What does not work yet](install-status.md)** lists what the current release
+  cannot do yet on these setups.

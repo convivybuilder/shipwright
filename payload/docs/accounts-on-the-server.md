@@ -64,8 +64,8 @@ review is one more thing `agents` does rather than something only another accoun
 boundary the three-account install draws between writing a change and reviewing it does not exist
 here.
 
-**This shape is not built yet.** [What works and what does not yet](install-status.md) tracks what
-is.
+**This shape is not built yet.** [What does not work yet](install-status.md) lists what is
+missing.
 
 ## The three-account install
 

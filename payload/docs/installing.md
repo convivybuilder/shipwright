@@ -1,6 +1,6 @@
 # Installing Builder
 
-_Last checked against Builder 0.7.0, on 2026-11-02._
+_Last checked against Builder 0.7.1, on 2026-11-08._
 
 These pages install Builder's current release; the first public release was 0.6.0, and [the release
 notes](release-notes.md) say what each release changed. Builder ships from five public
@@ -19,38 +19,37 @@ checkboxes, if you would rather tick each one off than read the pages in order.
 
 ## The one command
 
-On the machine that will run the sessions, run:
+Sign in to the machine that will run your sessions, as the account Builder will run in, and run:
 
 ```
 curl -fsSL https://convivybuilder.org/install.sh | sh
 ```
 
-It checks for `git`, Python 3.11, Claude Code and, on a Mac, `tmux`, and installs what it can before
-naming what is still missing. On Linux, with an account that can use `sudo`, it installs `git`,
-Python 3.11, `curl` and `ca-certificates` with `apt-get`, asking for your password once. On a Mac
-with Homebrew already there, it installs `git`, Python 3.11 and `tmux` with `brew install`, as your
-own account, never as an administrator. On a Mac with no Homebrew but an administrator account at
-the keyboard, it runs Homebrew's own installer first, which also brings Apple's Command Line Tools,
-then finishes with `brew install`; without a terminal for that installer to ask its password and
-confirmation at, it leaves this to you and says so. Claude Code installs the same way on either
-platform, with `claude.ai`'s own script, never through `sudo`. Two things still need a person
-whatever the platform: an account with no administrator rights and no Homebrew has no route the
-install can take, and signing in to Claude Code by running `claude` once stays something only you
-can do. The install's closing lines ask for that sign-in when they installed Claude Code itself.
+Builder needs `git`, Python 3.11, Claude Code and, on a Mac, `tmux`. The install installs what it
+can of these, depending on your machine and account:
 
-Once it has installed what it can, it names anything still missing along with how to get it. It
-then clones the six repositories below into `~/src` and runs the backend's installers in order:
-`provision-backend`, `install-payload` and `stand-up-backend`. Everything past the prerequisite step
-runs as your own account; on a Mac nothing ever asks for an administrator's password. Running it
-again finishes or repairs an install, and changes nothing that is already there.
+| Your machine and account | What the install does |
+|---|---|
+| Linux, an account that can use `sudo` | It installs `git`, Python 3.11, `curl` and `ca-certificates` with `apt-get`, asking for your password once. |
+| Linux, an account with no `sudo` | It stops and names what an administrator has to install. [Installing on Linux, without administrator access](install-linux-without-sudo.md) shows how to go on. |
+| Linux, signed in as root | It stops before changing anything. Sign in as the account Builder will run in and run it again. |
+| A Mac with Homebrew | It installs `git`, Python 3.11 and `tmux` with `brew`, as your own account. |
+| A Mac with no Homebrew, an administrator account | It runs Homebrew's own installer, which also brings Apple's Command Line Tools, then installs Python 3.11 and `tmux` with `brew`. Homebrew asks for your password and a confirmation at the terminal. With no terminal to ask at, as over `ssh` without `-t`, it stops and says to install Homebrew from https://brew.sh first. |
+| A Mac with no Homebrew, a standard account | It stops and names `git`, Python 3.11 and `tmux` and how to get each. |
+
+On any machine, if Claude Code is missing, the install installs it into your own account with
+Anthropic's script. Once the install finishes, run `claude` once to sign in; only you can do that.
+
+Then it clones Builder's six repositories into `~/src` and installs Builder as your own account.
+Running it again finishes or repairs an install and changes nothing already there.
 
 Before any installer runs, the install checks that the release is one Convivy signed. It fetches the
 release's signed manifest and checks the signature against the release keys this copy trusts: those
-built into the one-line install script, or, for the Homebrew copy, those shipped beside it from the
-same archive. It then checks the commit of each of the six repositories and the sha256 of the
-release archive against what the manifest names, and it runs no installer unless every check
-passes. No option, environment variable or prompt skips the check. The Homebrew copy pinned to
-0.7.0 predates the check, so after a Homebrew install of 0.7.0, check its clones with `--verify`. The install also clones
+built into the one-line install script, or, for the Homebrew copy, those the formula built into it
+from the release archive the formula pins. It then checks the commit of each of the six
+repositories and the sha256 of the release archive against what the manifest names, and it runs no
+installer unless every check passes. No option, environment variable or prompt skips the check.
+The install also clones
 `write-better` at the commit the manifest names, rather than at its `main`, so a later change to
 `write-better` does not stop an older release installing.
 
@@ -67,11 +66,26 @@ manifest names. Do not run Builder from those clones. **3** means the check coul
 the manifest could not be fetched, `ssh-keygen` is missing, or a repository is absent. Fix that and
 run the command again.
 
+On the server role, it also asks two questions once, right before it creates the GitHub App:
+which permission mode crew sessions run in, and whether they start with remote control. It
+recommends `auto` for the permission mode and offers `bypassPermissions`, which runs every tool
+call without asking; remote control defaults to off. Pass `--permission-mode` (`auto`, `default`,
+`acceptEdits` or `bypassPermissions`) or `--remote-control` (`on` or `off`) to answer either one
+without a terminal, or to script the install. Both answers land in `co-launch.env`, in
+`/usr/local/etc/convivy`, the root-owned file `co` reads; a fresh install kept at
+the defaults writes nothing, since an absent file already means `auto` and off. Rerunning the
+install shows each current value as its own default. An account with no `sudo` changes nothing:
+with no file yet, the defaults stay in effect and it prints the commands that create the file; with a
+file already there, its values stay in effect and it prints the two lines to set in it as root.
+
 As its last step, it creates the GitHub App your agents will act through and pauses: open the
 address it prints in a browser and click **Create GitHub App**, and the install finishes once
 GitHub redirects back. Over SSH, where that redirect cannot reach this machine, paste the whole
 address the browser was left at (`http://127.0.0.1:<port>/callback?code=...&state=...`) at the
-terminal instead. Add `--no-github-app` to skip this and create the App later by hand; [Connecting
+terminal instead. Starting with 0.7.1, `--github-app-port <n>` serves that page on port `<n>`
+rather than any free one, so you can forward it first with `ssh -L <n>:127.0.0.1:<n> <server>`
+and open the page on your own computer. Add `--no-github-app` to skip this and create the App
+later by hand; [Connecting
 GitHub](connecting-github.md) covers both the install's own step and the manual command, and the
 rest of what connects the App to your repositories.
 
@@ -81,7 +95,7 @@ lists (Debian 12, Ubuntu 22.04 or macOS 26); the install checks both before chan
 names what is missing. It then creates the `agents` and `reviewers` accounts, the root-owned
 privileged half, and the backend, each as the account that step needs, and running it again
 finishes or repairs the install exactly as the single-account shape does. This shape has not been
-rehearsed end to end on a real machine yet; [What works and what does not yet](install-status.md)
+rehearsed end to end on a real machine yet; [What does not work yet](install-status.md)
 says so.
 
 The `agents` account must not be able to read your home. If your home is readable by other
@@ -116,8 +130,8 @@ installed anyway and the install says which is missing; fixing it and running th
 again is safe.
 
 On a Mac with Homebrew, you can install the same installer through Homebrew instead, and then run
-it. This has not been rehearsed: the formula is published and pins the release archive by its
-sha256, but nobody has yet run `brew install` on a clean Mac.
+it. On a clean Mac, this route has installed 0.7.0 with `--no-github-app` and passed its release
+check.
 
 ```
 brew install convivybuilder/tap/builder
@@ -132,8 +146,8 @@ The rest of this page, and the pages under [Which install is yours](#which-insta
 the manual route: the same steps, one at a time, for anyone who wants to see or do each one
 themselves, or whose machine the one command refuses on. The manual route runs each installer
 directly and does not perform the release check, so check its clones with `--verify` if you want
-that assurance. [What works and what does not yet](install-status.md) says how far the one command
-itself has been rehearsed.
+that assurance. [What does not work yet](install-status.md) lists the one
+command's untested steps.
 
 ## A server, and a laptop to work from
 
@@ -161,7 +175,7 @@ This release needs both machines. [What you need](what-you-need.md) lists them, 
 each one needs.
 
 [After the install](after-installing.md#meet-the-steward) gives the steps that add your server to
-Deck on the laptop. They have not been rehearsed end to end yet; [What works and what does not
+Deck on the laptop. They have not been rehearsed end to end yet; [What does not work
 yet](install-status.md) says so.
 
 ## Which install is yours
@@ -476,5 +490,5 @@ already there.
 - **[How Builder works](how-builder-works.md)** explains the parts the install put in place.
 - **[The glossary](glossary.md)** explains each word Builder uses.
 
-Last, read [What works and what does not yet](install-status.md), which lists what Builder has been
-seen doing on each test machine, and what it cannot do yet.
+Last, read [What does not work yet](install-status.md), which lists what Builder cannot
+do yet.

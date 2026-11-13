@@ -84,6 +84,9 @@ ENTRIES = (
 # Orient's statement key exists only once Orient's account has made it. The Library reads
 # it only to verify an Orient-signed save, so until then its absence is reported, not failed.
 OPTIONAL = "orient-statement-key.json"
+# The ref the Library's person-save route reads as main, and the refspec its own fetch uses.
+ORIGIN_MAIN_REF = "refs/remotes/origin/main"
+MAIN_REFSPEC = "+refs/heads/main:refs/remotes/origin/main"
 REPO_SHAPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+")
 
 
@@ -261,9 +264,20 @@ def git(*args: str, env: dict | None = None) -> subprocess.CompletedProcess:
 
 
 def place_clone(d: Path, repo: str, token: str) -> str:
-    """A bare clone with a plain HTTPS origin. The token reaches git only through
-    environment-only config, so it is in no argument list and no config file."""
+    """A bare clone with a plain HTTPS origin and `refs/remotes/origin/main` present.
+    The token reaches git only through environment-only config, so it is in no argument
+    list and no config file.
+
+    THE LIBRARY READS `refs/remotes/origin/main`, AND `git clone --bare` WRITES NO SUCH REF.
+    A bare clone copies origin's branches to `refs/heads/` and sets no fetch refspec, so the
+    Library's person-save route found no main and refused the first Deck-signed save on a
+    placed install with 503. So the clone gets the route's own refspec,
+    `+refs/heads/main:refs/remotes/origin/main`, and one fetch through it. An existing clone
+    gets the same, which repairs one placed before this fix."""
     clone, url = d / "knowledge.git", f"{GIT_BASE}/{repo}.git"
+    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    env = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": f"http.{GIT_BASE}/.extraheader",
+           "GIT_CONFIG_VALUE_0": f"Authorization: Basic {basic}", "GIT_TERMINAL_PROMPT": "0"}
     if clone.exists() or clone.is_symlink():
         bare = git("-C", str(clone), "rev-parse", "--is-bare-repository")
         origin = git("-C", str(clone), "config", "--get", "remote.origin.url")
@@ -273,17 +287,25 @@ def place_clone(d: Path, repo: str, token: str) -> str:
         if origin.stdout.strip() != url:
             raise Refused(f"{clone}'s origin is {origin.stdout.strip()!r}, not {url}. "
                           f"Nothing further was placed.")
-        return "kept the existing bare clone"
-    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
-    env = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": f"http.{GIT_BASE}/.extraheader",
-           "GIT_CONFIG_VALUE_0": f"Authorization: Basic {basic}", "GIT_TERMINAL_PROMPT": "0"}
-    done = git("clone", "--quiet", "--bare", url, str(clone), env=env)
+        what = "kept the existing bare clone"
+    else:
+        done = git("clone", "--quiet", "--bare", url, str(clone), env=env)
+        if done.returncode != 0:
+            shutil.rmtree(clone, ignore_errors=True)
+            raise Refused(f"git could not clone {url}: {done.stderr.replace(token, '***').strip()}. "
+                          f"Nothing further was placed.")
+        os.chmod(clone, 0o700)
+        what = "cloned"
+    done = git("-C", str(clone), "config", "remote.origin.fetch", MAIN_REFSPEC)
     if done.returncode != 0:
-        shutil.rmtree(clone, ignore_errors=True)
-        raise Refused(f"git could not clone {url}: {done.stderr.replace(token, '***').strip()}. "
+        raise Refused(f"git could not set {clone}'s fetch refspec: {done.stderr.strip()}. "
                       f"Nothing further was placed.")
-    os.chmod(clone, 0o700)
-    return "cloned"
+    done = git("-C", str(clone), "fetch", "--quiet", "origin", env=env)
+    if done.returncode != 0:
+        raise Refused(f"git could not fetch main into {clone}: "
+                      f"{done.stderr.replace(token, '***').strip()}. Nothing further was placed.")
+    head = git("-C", str(clone), "rev-parse", "--verify", "--quiet", ORIGIN_MAIN_REF)
+    return f"{what}, {ORIGIN_MAIN_REF} at {head.stdout.strip()[:12] or 'nothing'}"
 
 
 def check(d: Path) -> list[tuple[str, bool | None, str]]:
@@ -311,6 +333,14 @@ def check(d: Path) -> list[tuple[str, bool | None, str]]:
                  f"{stat.S_IMODE(st.st_mode):04o} uid {st.st_uid}")
         rows.append((name, right_kind and stat.S_IMODE(st.st_mode) == mode and st.st_uid == uid,
                      f"{found}, wanted {kind} {mode:04o} uid {uid}"))
+    clone = d / "knowledge.git"
+    if clone.is_dir() and not clone.is_symlink():
+        head = git("-C", str(clone), "show-ref", "--verify", ORIGIN_MAIN_REF)
+        ok = head.returncode == 0
+        rows.append((f"knowledge.git {ORIGIN_MAIN_REF}", ok,
+                     head.stdout.split(" ", 1)[0][:12] if ok else
+                     "missing, so the Library's person-save route finds no main and refuses every "
+                     "save with 503; run this again without --check to fetch it"))
     return rows
 
 

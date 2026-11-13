@@ -6,6 +6,9 @@
 #     curl -fsSL https://convivybuilder.org/install.sh | sh -s -- --shape three
 #     sh bin/builder-install [--role server|laptop] [--shape single|two|three]
 #         [--src-dir DIR] [--release vX.Y.Z] [--no-github-app]
+#         [--github-app-port N]
+#         [--permission-mode auto|default|acceptEdits|bypassPermissions]
+#         [--remote-control on|off]
 #     sh bin/builder-install --verify vX.Y.Z [--manifest FILE] [--src-dir DIR]
 #
 # WHY POSIX sh. `curl ... | sh` has to work on whatever shell Debian, Ubuntu
@@ -109,6 +112,9 @@ RELEASE=""
 VERIFY_VERSION=""
 MANIFEST_PATH=""
 NO_GITHUB_APP=no
+GITHUB_APP_PORT=""
+PERMISSION_MODE=""
+REMOTE_CONTROL=""
 # The organisation every repository is cloned from, read off REPOS_BASE
 # rather than written a second time, for install-privileged's --org.
 ORG=${REPOS_BASE##*/}
@@ -131,14 +137,24 @@ usage: $PROG [--role server|laptop] [--shape single|two|three] [--src-dir DIR]
   --role laptop     install Deck here, to work from
   --shape single    one account, this one, with no administrator (default)
   --shape two       not built yet in this release
-  --shape three     the agents and reviewers accounts and a root-owned
-                    privileged half; needs administrator rights on a
-                    supported server platform (see supported-setups.md)
+  --shape three     an agents/reviewers account pair per entity and a
+                    root-owned privileged half; needs administrator rights
+                    on a supported server platform (see supported-setups.md)
   --src-dir DIR     clone the six repositories into DIR (default ~/src)
   --release vX.Y.Z  the release to install, when this copy carries none
   --no-github-app   on a server install, skip creating the operator's
                     GitHub App; connecting-github.md shows how to create
                     it by hand later
+  --github-app-port N
+                    serve the GitHub App step's page on 127.0.0.1:N rather
+                    than any free port, so a tool driving this install over
+                    ssh can forward that port before the step starts
+  --permission-mode auto|default|acceptEdits|bypassPermissions
+                    which permission mode crew sessions run in (default
+                    auto); with a terminal and this unset, asks
+  --remote-control on|off
+                    whether crew sessions start with remote control
+                    (default off); with a terminal and this unset, asks
   --verify vX.Y.Z   check a signed release manifest and this machine's
                     clones against it; installs nothing
   --manifest FILE   the release manifest --verify reads, with FILE.sig
@@ -515,6 +531,12 @@ while [ $# -gt 0 ]; do
         --manifest) [ $# -ge 2 ] || { usage >&2; exit 2; }; MANIFEST_PATH=$2; shift 2 ;;
         --manifest=*) MANIFEST_PATH=${1#--manifest=}; shift ;;
         --no-github-app) NO_GITHUB_APP=yes; shift ;;
+        --github-app-port) [ $# -ge 2 ] || { usage >&2; exit 2; }; GITHUB_APP_PORT=$2; shift 2 ;;
+        --github-app-port=*) GITHUB_APP_PORT=${1#--github-app-port=}; shift ;;
+        --permission-mode) [ $# -ge 2 ] || { usage >&2; exit 2; }; PERMISSION_MODE=$2; shift 2 ;;
+        --permission-mode=*) PERMISSION_MODE=${1#--permission-mode=}; shift ;;
+        --remote-control) [ $# -ge 2 ] || { usage >&2; exit 2; }; REMOTE_CONTROL=$2; shift 2 ;;
+        --remote-control=*) REMOTE_CONTROL=${1#--remote-control=}; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "$PROG: unrecognised argument: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -528,6 +550,29 @@ esac
 case "$SHAPE" in
     single|two|three) ;;
     *) die "--shape must be 'single', 'two' or 'three', not '$SHAPE'" ;;
+esac
+
+# Checked here rather than left to create-github-app, which reads it only as the
+# install's last step: a mistyped port would otherwise cost the whole install
+# before anything said so.
+if [ -n "$GITHUB_APP_PORT" ]; then
+    case "$GITHUB_APP_PORT" in
+        *[!0-9]*|??????*) die "--github-app-port must be a port number, not '$GITHUB_APP_PORT'. Nothing was installed or changed." ;;
+    esac
+    if [ "$GITHUB_APP_PORT" -lt 1 ] || [ "$GITHUB_APP_PORT" -gt 65535 ]; then
+        die "--github-app-port must be between 1 and 65535, not $GITHUB_APP_PORT. Nothing was installed or changed."
+    fi
+fi
+# Checked here rather than left to the step that resolves them against
+# co-launch.env, so a mistyped value costs nothing rather than the whole install.
+case "$PERMISSION_MODE" in
+    ""|auto|default|acceptEdits|bypassPermissions) ;;
+    *) die "--permission-mode must be 'auto', 'default', 'acceptEdits' or 'bypassPermissions', not '$PERMISSION_MODE'. Nothing was installed or changed." ;;
+esac
+
+case "$REMOTE_CONTROL" in
+    ""|on|off) ;;
+    *) die "--remote-control must be 'on' or 'off', not '$REMOTE_CONTROL'. Nothing was installed or changed." ;;
 esac
 
 # BEFORE ANYTHING ELSE, IN EVERY MODE: stand-up-backend refuses --shape two
@@ -642,7 +687,7 @@ build_missing() {
     # part of the list is the same on both calls to build_missing.
     if [ "$ROLE" = server ] && [ "$SHAPE" = three ]; then
         if ! can_use_sudo; then
-            note_missing "administrator rights — this account cannot use sudo, and \`--shape three\` needs it to create the \`agents\` and \`reviewers\` accounts and the root-owned privileged half"
+            note_missing "administrator rights — this account cannot use sudo, and \`--shape three\` needs it to create an \`agents\`/\`reviewers\` account pair per entity and the root-owned privileged half"
         fi
         THREE_PLATFORM_OK=no
         OS_ID=""
@@ -683,6 +728,12 @@ build_missing() {
 # the terminal. Overridable so this suite's tests can point it at a file they
 # control, since the machine running them may have no controlling terminal.
 INSTALL_TTY="${BUILDER_INSTALL_TTY:-/dev/tty}"
+
+# Where co reads which permission mode and remote control crew sessions start
+# with. Overridable the same way, so this suite's tests never write under the
+# real /usr/local.
+CO_LAUNCH_DIR="${BUILDER_CO_LAUNCH_DIR:-/usr/local/etc/convivy}"
+CO_LAUNCH_FILE="$CO_LAUNCH_DIR/co-launch.env"
 
 # In a subshell because a failed redirection on `:`, a special builtin, exits the
 # whole script under dash, which is /bin/sh on Debian and Ubuntu.
@@ -1068,6 +1119,244 @@ fi
 SHIPWRIGHT="$SRC_DIR/shipwright"
 
 # ---------------------------------------------------------------------------
+# Which permission mode and remote control crew sessions start with, asked
+# and resolved against co-launch.env. Server role only; co_launch_step below
+# is called once, before the GitHub App step, on both the single-account and
+# the three-account paths.
+# ---------------------------------------------------------------------------
+
+co_launch_get() {
+    # $1: a key (CO_PERMISSION_MODE or CO_REMOTE_CONTROL). Prints its value
+    # from $CO_LAUNCH_FILE and returns 0 when the file holds that key, as co
+    # itself reads it: whitespace stripped, `#` lines ignored, later lines win
+    # over earlier ones. Returns 1, printing nothing, when the file or the
+    # key is absent.
+    CL_KEY=$1
+    CL_GET_FOUND=1
+    [ -f "$CO_LAUNCH_FILE" ] || return 1
+    while IFS= read -r CL_LINE || [ -n "$CL_LINE" ]; do
+        CL_TRIMMED=$(printf '%s' "$CL_LINE" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        case "$CL_TRIMMED" in
+            ''|'#'*) continue ;;
+        esac
+        case "$CL_TRIMMED" in
+            "$CL_KEY"=*)
+                CL_GET_VALUE=$(printf '%s' "${CL_TRIMMED#*=}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                CL_GET_FOUND=0
+                ;;
+        esac
+    done < "$CO_LAUNCH_FILE"
+    [ "$CL_GET_FOUND" -eq 0 ] && printf '%s\n' "$CL_GET_VALUE"
+    return "$CL_GET_FOUND"
+}
+
+# Each sets CO_LAUNCH_ANSWER, never echoes it: a `$(...)` capture would also
+# swallow the prompt text these print, which has to reach the terminal, not
+# this function's caller.
+co_launch_ask_permission_mode() {
+    CL_DEFAULT=$1
+    echo "$PROG: which permission mode do crew sessions run in? auto is recommended,"
+    echo "$PROG: and bypassPermissions is also offered; bypassPermissions runs every"
+    echo "$PROG: tool call without asking."
+    printf '%s: permission mode (auto, default, acceptEdits, bypassPermissions) [%s]: ' "$PROG" "$CL_DEFAULT"
+    IFS= read -r CL_ANSWER <&3 || CL_ANSWER=""
+    CL_ANSWER=$(printf '%s' "$CL_ANSWER" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    if [ -z "$CL_ANSWER" ]; then
+        CO_LAUNCH_ANSWER=$CL_DEFAULT
+    else
+        CO_LAUNCH_ANSWER=$CL_ANSWER
+    fi
+}
+
+co_launch_ask_remote_control() {
+    CL_DEFAULT=$1
+    echo "$PROG: do crew sessions start with remote control on? it defaults to off."
+    printf '%s: remote control (on, off) [%s]: ' "$PROG" "$CL_DEFAULT"
+    IFS= read -r CL_ANSWER <&3 || CL_ANSWER=""
+    CL_ANSWER=$(printf '%s' "$CL_ANSWER" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    if [ -z "$CL_ANSWER" ]; then
+        CO_LAUNCH_ANSWER=$CL_DEFAULT
+    else
+        CO_LAUNCH_ANSWER=$CL_ANSWER
+    fi
+}
+
+co_launch_write() {
+    # $1, $2: the permission mode and remote control to write. $3, $4: yes or
+    # no, whether each actually changed. Rewrites only the line for a changed
+    # key, appends it when the file has no such line yet, and leaves every
+    # other line and comment byte-identical. Through a temp file and a
+    # rename, both made under sudo so the result is root-owned.
+    CL_NEW_MODE=$1
+    CL_NEW_REMOTE=$2
+    CL_MODE_CH=$3
+    CL_REMOTE_CH=$4
+
+    # Composed here, as the operator, into a temp file that already holds
+    # the exact bytes root will place: every line of the existing file,
+    # a changed key's line replaced in and an unwritten one appended.
+    CL_TMP=$(mktemp "${TMPDIR:-/tmp}/.builder-install-co-launch.XXXXXX")
+    : > "$CL_TMP"
+    CL_MODE_WRITTEN=no
+    CL_REMOTE_WRITTEN=no
+    if [ -f "$CO_LAUNCH_FILE" ]; then
+        while IFS= read -r CL_LINE || [ -n "$CL_LINE" ]; do
+            CL_TRIMMED=$(printf '%s' "$CL_LINE" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            case "$CL_TRIMMED" in
+                CO_PERMISSION_MODE=*)
+                    if [ "$CL_MODE_CH" = yes ]; then
+                        CL_LINE="CO_PERMISSION_MODE=$CL_NEW_MODE"
+                        CL_MODE_WRITTEN=yes
+                    fi
+                    ;;
+                CO_REMOTE_CONTROL=*)
+                    if [ "$CL_REMOTE_CH" = yes ]; then
+                        CL_LINE="CO_REMOTE_CONTROL=$CL_NEW_REMOTE"
+                        CL_REMOTE_WRITTEN=yes
+                    fi
+                    ;;
+            esac
+            printf '%s\n' "$CL_LINE" >> "$CL_TMP"
+        done < "$CO_LAUNCH_FILE"
+    fi
+    if [ "$CL_MODE_CH" = yes ] && [ "$CL_MODE_WRITTEN" = no ]; then
+        printf 'CO_PERMISSION_MODE=%s\n' "$CL_NEW_MODE" >> "$CL_TMP"
+    fi
+    if [ "$CL_REMOTE_CH" = yes ] && [ "$CL_REMOTE_WRITTEN" = no ]; then
+        printf 'CO_REMOTE_CONTROL=%s\n' "$CL_NEW_REMOTE" >> "$CL_TMP"
+    fi
+
+    sudo sh -s -- "$CO_LAUNCH_DIR" "$CO_LAUNCH_FILE" "$CL_TMP" <<'CO_LAUNCH_WRITE_SH' \
+        || { rm -f "$CL_TMP"; die "could not write $CO_LAUNCH_FILE as root"; }
+set -eu
+DIR=$1
+FILE=$2
+SRC=$3
+mkdir -p "$DIR"
+chown 0:0 "$DIR"
+chmod 0755 "$DIR"
+TMP="$FILE.tmp.$$"
+cp "$SRC" "$TMP"
+chown 0:0 "$TMP"
+chmod 0644 "$TMP"
+mv "$TMP" "$FILE"
+CO_LAUNCH_WRITE_SH
+    rm -f "$CL_TMP"
+}
+
+co_launch_step() {
+    CL_DEFAULT_MODE=auto
+    CL_DEFAULT_REMOTE=off
+
+    CL_FILE_MODE=""
+    CL_HAD_MODE=1
+    CL_FILE_MODE=$(co_launch_get CO_PERMISSION_MODE) && CL_HAD_MODE=0
+    CL_FILE_REMOTE=""
+    CL_HAD_REMOTE=1
+    CL_FILE_REMOTE=$(co_launch_get CO_REMOTE_CONTROL) && CL_HAD_REMOTE=0
+
+    CL_CURRENT_MODE=$CL_DEFAULT_MODE
+    [ "$CL_HAD_MODE" -eq 0 ] && CL_CURRENT_MODE=$CL_FILE_MODE
+    CL_CURRENT_REMOTE=$CL_DEFAULT_REMOTE
+    [ "$CL_HAD_REMOTE" -eq 0 ] && CL_CURRENT_REMOTE=$CL_FILE_REMOTE
+
+    CL_ASKED=no
+    if [ -z "$PERMISSION_MODE" ] || [ -z "$REMOTE_CONTROL" ]; then
+        if have_tty; then
+            CL_ASKED=yes
+            exec 3< "$INSTALL_TTY"
+        fi
+    fi
+
+    if [ -n "$PERMISSION_MODE" ]; then
+        CL_MODE=$PERMISSION_MODE
+    elif [ "$CL_ASKED" = yes ]; then
+        co_launch_ask_permission_mode "$CL_CURRENT_MODE"
+        CL_MODE=$CO_LAUNCH_ANSWER
+    else
+        CL_MODE=$CL_CURRENT_MODE
+    fi
+    case "$CL_MODE" in
+        auto|default|acceptEdits|bypassPermissions) ;;
+        *) die "--permission-mode must be 'auto', 'default', 'acceptEdits' or 'bypassPermissions', not '$CL_MODE'" ;;
+    esac
+
+    if [ -n "$REMOTE_CONTROL" ]; then
+        CL_REMOTE=$REMOTE_CONTROL
+    elif [ "$CL_ASKED" = yes ]; then
+        co_launch_ask_remote_control "$CL_CURRENT_REMOTE"
+        CL_REMOTE=$CO_LAUNCH_ANSWER
+    else
+        CL_REMOTE=$CL_CURRENT_REMOTE
+    fi
+    case "$CL_REMOTE" in
+        on|off) ;;
+        *) die "--remote-control must be 'on' or 'off', not '$CL_REMOTE'" ;;
+    esac
+
+    [ "$CL_ASKED" = yes ] && exec 3<&-
+
+    CL_MODE_CHANGED=no
+    [ "$CL_MODE" = "$CL_CURRENT_MODE" ] || CL_MODE_CHANGED=yes
+    CL_REMOTE_CHANGED=no
+    [ "$CL_REMOTE" = "$CL_CURRENT_REMOTE" ] || CL_REMOTE_CHANGED=yes
+
+    if [ "$CL_MODE_CHANGED" = no ] && [ "$CL_REMOTE_CHANGED" = no ]; then
+        if [ "$CL_HAD_MODE" -eq 0 ]; then
+            echo "$PROG: permission mode: kept $CL_MODE in $CO_LAUNCH_FILE"
+        else
+            echo "$PROG: permission mode: left at the default ($CL_MODE)"
+        fi
+        if [ "$CL_HAD_REMOTE" -eq 0 ]; then
+            echo "$PROG: remote control: kept $CL_REMOTE in $CO_LAUNCH_FILE"
+        else
+            echo "$PROG: remote control: left at the default ($CL_REMOTE)"
+        fi
+        return 0
+    fi
+
+    if ! can_use_sudo; then
+        if [ -f "$CO_LAUNCH_FILE" ]; then
+            # The file stays as it is, so whatever it already says stays in
+            # effect, not the defaults. Rewriting it from a pasted command
+            # would drop every other line, so this names the lines to set
+            # and leaves the edit to the operator.
+            echo "$PROG: crew sessions: could not write $CO_LAUNCH_FILE without sudo, so it is unchanged and crew sessions keep permission mode $CL_CURRENT_MODE and remote control $CL_CURRENT_REMOTE. To use permission mode $CL_MODE and remote control $CL_REMOTE, edit it as root so that it holds these two lines, keeping it owned by root with mode 0644:"
+            echo "    CO_PERMISSION_MODE=$CL_MODE"
+            echo "    CO_REMOTE_CONTROL=$CL_REMOTE"
+            return 0
+        fi
+        echo "$PROG: crew sessions: could not write $CO_LAUNCH_FILE without sudo; the defaults apply instead. Run these yourself to use permission mode $CL_MODE and remote control $CL_REMOTE:"
+        echo "    sudo mkdir -p $CO_LAUNCH_DIR"
+        echo "    sudo chown 0:0 $CO_LAUNCH_DIR"
+        echo "    sudo chmod 0755 $CO_LAUNCH_DIR"
+        # printf, never echo: dash's own echo expands a backslash escape in
+        # its argument, which would turn this line's \n into a real newline
+        # instead of the two characters the operator's own shell needs to see.
+        printf '    %s\n' "printf 'CO_PERMISSION_MODE=%s\\nCO_REMOTE_CONTROL=%s\\n' '$CL_MODE' '$CL_REMOTE' | sudo tee $CO_LAUNCH_FILE >/dev/null"
+        echo "    sudo chown 0:0 $CO_LAUNCH_FILE"
+        echo "    sudo chmod 0644 $CO_LAUNCH_FILE"
+        return 0
+    fi
+
+    co_launch_write "$CL_MODE" "$CL_REMOTE" "$CL_MODE_CHANGED" "$CL_REMOTE_CHANGED"
+    if [ "$CL_MODE_CHANGED" = yes ]; then
+        echo "$PROG: permission mode: wrote $CL_MODE to $CO_LAUNCH_FILE"
+    elif [ "$CL_HAD_MODE" -eq 0 ]; then
+        echo "$PROG: permission mode: kept $CL_MODE in $CO_LAUNCH_FILE"
+    else
+        echo "$PROG: permission mode: left at the default ($CL_MODE)"
+    fi
+    if [ "$CL_REMOTE_CHANGED" = yes ]; then
+        echo "$PROG: remote control: wrote $CL_REMOTE to $CO_LAUNCH_FILE"
+    elif [ "$CL_HAD_REMOTE" -eq 0 ]; then
+        echo "$PROG: remote control: kept $CL_REMOTE in $CO_LAUNCH_FILE"
+    else
+        echo "$PROG: remote control: left at the default ($CL_REMOTE)"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Running the installers, in the order their own documentation gives them.
 # ---------------------------------------------------------------------------
 
@@ -1087,7 +1376,7 @@ run_step() {
             return 0
         fi
         if [ "$STEP_NAME" = create-github-app ]; then
-            die "the backend is installed; only the GitHub App remains. Finish it with: $PYTHON3 $SHIPWRIGHT/bin/create-github-app (over SSH, where the redirect cannot reach this machine, add --code <code> with the value from the browser's address bar)."
+            die "the backend is installed; only the GitHub App remains. Finish it with: $PYTHON3 $SHIPWRIGHT/bin/create-github-app${GITHUB_APP_PORT:+ --port $GITHUB_APP_PORT} (over SSH, where the redirect cannot reach this machine, add --code <code> with the value from the browser's address bar)."
         fi
         die "$STEP_NAME refused (exit $STATUS). See $SITE_BASE/installing.html#when-something-goes-wrong, or installing.md in this checkout, for what to do next."
     fi
@@ -1221,6 +1510,7 @@ if [ "$ROLE" = server ]; then
             --shape single --seed-registry --activate \
             --commit "write-better=$VERIFIED_WRITE_BETTER_COMMIT"
     fi
+    co_launch_step
     if [ "$NO_GITHUB_APP" != yes ]; then
         # Checked before the step runs, since --if-missing's own exit tells
         # us nothing: it exits 0 whether this run created the key or found
@@ -1228,8 +1518,11 @@ if [ "$ROLE" = server ]; then
         GITHUB_APP_KEY="${BUILDER_CONFIG_DIR:-${HOME:-}/.config/convivy}/github-app/app.pem"
         GITHUB_APP_EXISTED=no
         [ -f "$GITHUB_APP_KEY" ] && GITHUB_APP_EXISTED=yes
+        # --port only when the operator fixed one, so the default stays any
+        # free port. The value is digits only, checked above, so leaving the
+        # expansion unquoted splits it into exactly the two words.
         run_step create-github-app "$PYTHON3" "$SHIPWRIGHT/bin/create-github-app" \
-            --if-missing --code-from-tty
+            --if-missing --code-from-tty ${GITHUB_APP_PORT:+--port "$GITHUB_APP_PORT"}
     fi
     echo
     if [ "${CLAUDE_INSTALLED_NOW:-no}" = yes ]; then

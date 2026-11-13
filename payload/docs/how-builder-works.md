@@ -151,7 +151,7 @@ reviewed documentation, each read the policy and refuse anything it does not per
 single-account install that refusal covers only merges made through those commands; an agent could
 merge another way, and the `~/.claude/CLAUDE.md` instruction above is the rule against it. A merge
 you start from Deck or Orient takes a separate path, through a merge check in the Library, and that
-check approves every merge it is asked about for now, as [What works and what does not yet](install-status.md) says.
+check approves every merge it is asked about for now, as [What does not work yet](install-status.md) says.
 
 ## The Bosun: how an agent is put to work
 

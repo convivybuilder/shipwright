@@ -148,7 +148,7 @@ A separate identity buys two things.
   you own that lists what agents may do without you. `agentctl kb merge`, the command the Library
   merges through, reads the policy and refuses anything it does not permit. A merge you start from
   Deck or Orient takes a separate path, through a merge check in the Library, and that check
-  approves every merge it is asked about for now, as [What works and what does not yet](install-status.md) says. The
+  approves every merge it is asked about for now, as [What does not work yet](install-status.md) says. The
   App's identity is also how `agentctl kb merge` tells a pull request the Library opened from one
   anything else opened.
 

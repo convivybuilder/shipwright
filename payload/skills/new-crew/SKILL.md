@@ -96,10 +96,47 @@ Omit a field you do not have rather than writing `null` or a placeholder.
 
 **A crew that is not in the projects registry cannot file a work item.** The work queue checks a
 work item's `product` against the Library's own registry table, and `/write-bead` files the crew's
-first epics under its id. Register the crew now, before its bead:
+first epics under its id. Register the crew now, before its bead.
+
+**First find which entity the crew belongs to.** An entity is who the work is for, such as a
+company or a household, and registration refuses a crew whose entity this install does not list.
+Read the list from the install's own record:
 
 ```bash
-agentctl crew register '<id>' --display '<displayName>'
+python3 -I -c 'import json, re, sys
+path = "/opt/builder/install.json"
+try:
+    doc = json.load(open(path))
+except FileNotFoundError:
+    doc = {}
+except (OSError, ValueError) as e:
+    sys.exit(f"{path} cannot be read: {e}")
+if not isinstance(doc, dict):
+    sys.exit(f"{path} does not hold a JSON object")
+entities = doc.get("entities", ["default"])
+if not (isinstance(entities, list) and entities
+        and all(isinstance(e, str) and re.fullmatch(r"[a-z][a-z0-9-]*", e) for e in entities)
+        and len(set(entities)) == len(entities)):
+    sys.exit(f"{path} lists entities as {entities!r}, not as distinct lower-case names")
+print("\n".join(entities))'
+```
+
+This applies the same rules registration does, so a name it prints is one registration accepts.
+
+- **It prints `default` alone,** because the file or its `entities` key is absent, or the install
+  lists only `default`. Use `default` and ask nothing.
+- **It prints one other name.** Use that name and ask nothing.
+- **It prints more than one name.** Ask the person which of them the crew belongs to, listing them
+  exactly as printed, and use their answer only if it is one of those names, typed exactly. Never
+  invent an entity, and never pick one for them.
+- **It exits non-zero with a message.** The install's record is unreadable or its `entities` list
+  is malformed. Stop, and tell the person what it printed. Registration refuses on the same file,
+  so retrying will not help, and fixing the file is theirs to do.
+
+Then register, passing that name:
+
+```bash
+agentctl crew register '<id>' --display '<displayName>' --entity '<entity>'
 ```
 
 Add `--home-dir` when the crew's directory is not `$(builder-root)/<id>`. Without it, the row

@@ -8,8 +8,8 @@ An AI agent is an AI model, such as Claude, given a role and the tools it may us
 on a task. The steward is the first one you meet, and it explains each part of Builder when your
 work reaches it, so you can start without having written a program before.
 
-Builder is free and open source, under the Apache 2.0 licence. Its first public release, 0.6.0, is
-out, and [Installing Builder](installing.md) takes you through installing it. The rest of this site
+Builder is free and open source, under the Apache 2.0 licence. Its current release is 0.7.0, the
+first signed one, and [Installing Builder](installing.md) takes you through installing it. The rest of this site
 describes Builder as it is designed to work.
 
 ## Install Builder

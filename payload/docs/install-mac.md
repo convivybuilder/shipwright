@@ -2,8 +2,9 @@
 
 On a Mac, Builder installs into one ordinary account and needs no administrator rights to run.
 Everything runs as that account. These steps were run on macOS 26.4 by a standard account on a Mac
-whose administrator is someone else, except where a step says it was not run. The install has not
-been run on a clean Mac.
+whose administrator is someone else, except where a step says it was not run. The one-command
+install has been run on a clean Mac, with the limits [What does not work yet](install-status.md)
+lists; this page's own steps have not.
 
 **The one-command install does the next two sections' program installs itself, where it can.** If an
 administrator is at the keyboard (or Homebrew is already there) when you run it, skip ahead to [Run

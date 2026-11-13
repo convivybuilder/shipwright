@@ -65,7 +65,10 @@ point moves only when that copy succeeds.
 **Settings persist, and only the settings that name this install do.** The first
 run writes `install.json` beside the slots: the organisation, the repository names
 (shipwright, agent-platform and, on the three-account shape, library) and the shape.
-Test settings never persist. They come from `fixtures.json` under the prefix, and only
+An `entities` list an operator hand-places there carries forward byte-for-byte, on
+either shape; on a multi-entity install, the three-account shape also derives an
+`accounts` map from it fresh on every run, for the review launcher's own use. Test
+settings never persist. They come from `fixtures.json` under the prefix, and only
 where the prefix is not the real install root.
 """
 
@@ -116,7 +119,7 @@ def running_copy() -> tuple[str, str]:
     else:
         prefix = match.group("prefix")
         for path in (prefix, os.path.join(prefix, "src"), str(HERE.parent), str(HERE), str(HERE_FILE),
-                     str(HERE / "github-gate")):
+                     str(HERE / "github-gate"), str(HERE / "account_entities.py")):
             st = os.lstat(path)
             if stat.S_ISLNK(st.st_mode) or st.st_uid != euid or st.st_mode & 0o022:
                 problem = f"{path} is not owned by uid {euid} alone, or another account can write it"
@@ -146,7 +149,12 @@ sys.dont_write_bytecode = True
 gg = _load_sibling("github_gate", "github-gate")
 Refused = gg.Refused
 
-ACCOUNT = "agents"
+# Which entities this install names, and the account pair each gets: the
+# same reader provision-accounts and uninstall-builder use, reused from this
+# commit's own copy so the sudo rule this writes names the accounts
+# provision-accounts actually created.
+ae = _load_sibling("account_entities", "account_entities.py")
+
 ROLES = ("agent-platform", "library", "shipwright")
 MAIN = "refs/heads/main"
 CONFIG = "install.json"
@@ -154,6 +162,7 @@ FIXTURES = "fixtures.json"
 
 # The files placed from each tree. Paths are relative to the tree's root.
 LAUNCHER = "bin/review-launch"
+MODEL_PROVIDER = "sbin/model-provider"
 LIBRARY = "lib/agent-platform"
 REVIEWER_BINS = ("bin/mcp-kb-server", "bin/mcp-ops-server")
 LOCK = "requirements-reviewer.lock.txt"
@@ -162,9 +171,21 @@ SUDOERS_TEMPLATE = "privileged/builder-review.sudoers"
 SUDOERS_NAME = "builder-review"
 INSTRUCTIONS = "payload/knowledge-seed/machine/CLAUDE.md"
 
-# A slot the installer creates empty. github-gate fills the first two.
+# A slot the installer creates empty. github-gate fills the first two. The
+# third is the reviewers' own Claude-token slot: the bare name below on a
+# single entity, whatever its name; one slot per entity, named by
+# claude_slot_rel, once there is more than one.
 CLAUDE_SLOT = "etc/reviewers-claude-token"
-SLOTS = (gg.KEY_SLOT, gg.ID_SLOT, CLAUDE_SLOT)
+
+
+def claude_slot_rel(entity: str, entities: list[str]) -> str:
+    """`entity`'s reviewers Claude-token slot, relative to the prefix."""
+    return CLAUDE_SLOT if len(entities) == 1 else f"etc/{entity}-reviewers-claude-token"
+
+
+def claude_slots(entities: list[str]) -> tuple[str, ...]:
+    """Every reviewers Claude-token slot `entities` names, relative to the prefix."""
+    return tuple(claude_slot_rel(entity, entities) for entity in entities)
 
 DEFAULT_SUDOERS_DIR = "/etc/sudoers.d"
 DEFAULT_VISUDO = "/usr/sbin/visudo"
@@ -225,9 +246,66 @@ PERSISTED = ("org", "agent_platform_repo", "shipwright_repo", "library_repo", "s
 # names neither. The three keys are the organisation, the repository name and
 # the shape, as the plan's Handoff sets out.
 PERSISTED_TWO = ("org", "shipwright_repo", "shape")
+# Shape three's entities, read by account_entities rather than merged into a
+# flag-settable setting: tolerated here so an entities list an operator
+# placed in install.json by hand does not refuse as an unknown key, and
+# carried forward byte-for-byte whenever this rewrites the file, never
+# fabricated when it was never there.
+ENTITIES_KEY = "entities"
+# The review launcher's account map, written only on a multi-entity install:
+# tolerated as an unknown key the same way ENTITIES_KEY is, since this only
+# ever writes it fresh from `entities` and never reads it back into cfg.
+ACCOUNTS_KEY = "accounts"
 # What fixtures.json may name. Honoured only where the prefix is not the real root.
 FIXTURE_KEYS = ("github_base", "download_base", "api_base", "interpreter", "sudoers_dir",
                 "visudo", "pip_args", "homes", "require_root")
+
+
+def carry_entities(stored: dict, persisted: dict) -> None:
+    """Carry `stored`'s `entities` key into `persisted` byte-for-byte, so
+    neither shape's rewrite of install.json ever drops or fabricates it."""
+    if ENTITIES_KEY in stored:
+        persisted[ENTITIES_KEY] = stored[ENTITIES_KEY]
+
+
+def account_map(entities: list[str], prefix: str) -> dict:
+    """The `accounts` key a multi-entity install gets: one entry per entity,
+    naming its agents and reviewers account and the absolute path of its own
+    reviewers Claude-token slot. Empty on a single entity, where the review
+    launcher falls back to the bare `agents`, `reviewers` and CLAUDE_SLOT
+    names."""
+    if len(entities) == 1:
+        return {}
+    return {
+        entity: {
+            "agents": agents,
+            "reviewers": reviewers,
+            "reviewers_claude_token": os.path.join(prefix, claude_slot_rel(entity, entities)),
+        }
+        for entity, (agents, reviewers) in zip(entities, ae.account_pairs(entities))
+    }
+
+
+def persisted_two(stored: dict, cfg: dict) -> dict:
+    """What `install_two` writes back to install.json: PERSISTED_TWO's keys,
+    plus `entities` carried forward exactly as stored, when present."""
+    persisted = {k: cfg[k] for k in PERSISTED_TWO if k in cfg}
+    carry_entities(stored, persisted)
+    return persisted
+
+
+def persisted_three(stored: dict, cfg: dict, prefix: str) -> dict:
+    """What `install_three` writes back to install.json: PERSISTED's keys,
+    `entities` carried forward exactly as stored, and `accounts` recomputed
+    fresh from `cfg["entities"]` on every run, so a stale map, or one left
+    from an install that has since dropped to one entity, never outlives
+    the change."""
+    persisted = {k: cfg[k] for k in PERSISTED}
+    carry_entities(stored, persisted)
+    accounts = account_map(cfg["entities"], prefix)
+    if accounts:
+        persisted[ACCOUNTS_KEY] = accounts
+    return persisted
 
 
 def token() -> str:
@@ -408,7 +486,7 @@ def fixture_settings(prefix: str) -> dict:
 
 
 def merged_config(stored: dict, fixtures: dict, args: argparse.Namespace) -> dict:
-    extra = sorted(set(stored) - set(PERSISTED))
+    extra = sorted(set(stored) - set(PERSISTED) - {ENTITIES_KEY, ACCOUNTS_KEY})
     if extra:
         raise Refused(f"{CONFIG} names {', '.join(extra)}, which is not a persisted setting. "
                       f"Nothing was changed.")
@@ -424,6 +502,9 @@ def merged_config(stored: dict, fixtures: dict, args: argparse.Namespace) -> dic
         raise Refused("name the install shape with --shape two or --shape three.")
     if not str(cfg["download_base"]).startswith(("https://", "http://")):
         raise Refused("the Claude download base must be an http or https URL.")
+    # Recorded before the default fill below, since that is the only other way
+    # cfg["interpreter"] gets a value: install.json never persists "interpreter".
+    cfg["interpreter_from_fixture"] = bool(fixtures.get("interpreter"))
     if not cfg.get("interpreter"):
         system = platform_mod.system()
         if system not in INTERPRETERS:
@@ -751,30 +832,42 @@ def consent(mode: str) -> bool:
 
 
 def stage_instructions(cfg: dict, args, sw_tree: str, rv: str, plan: Plan) -> None:
+    """The reviewers' one instruction file. Each entity's agents account may
+    hold its own edit of the shipped file; each edit that differs is shown in
+    entity order, and the first one accepted is taken. With one entity this
+    is the bare `agents` account alone, as before entities existed."""
     shipped = read_tree_file(sw_tree, INSTRUCTIONS)
-    home = home_of(cfg, ACCOUNT)
-    held = read_beneath(home, (".claude", "CLAUDE.md"), one_name=True)
     chosen = shipped
-    if held is not None and held != shipped:
+    for account, _reviewers in ae.account_pairs(cfg["entities"]):
+        home = home_of(cfg, account)
+        held = read_beneath(home, (".claude", "CLAUDE.md"), one_name=True)
+        if held is None or held == shipped:
+            continue
         held_path = printable(os.path.join(home, ".claude", "CLAUDE.md"))
-        print(f"the {ACCOUNT} account's {held_path} differs from the shipped {INSTRUCTIONS}:")
+        print(f"the {account} account's {held_path} differs from the shipped {INSTRUCTIONS}:")
         sys.stdout.write("".join(difflib.unified_diff(
             printable(shipped.decode("utf-8", "replace")).splitlines(keepends=True),
             printable(held.decode("utf-8", "replace")).splitlines(keepends=True),
             fromfile=f"shipped {INSTRUCTIONS}", tofile=held_path)))
         if consent(args.consent):
             chosen = held
-            print("reviewers/CLAUDE.md takes the account's edit.")
-        else:
-            print(f"reviewers/CLAUDE.md takes the shipped {INSTRUCTIONS}.")
+            print(f"reviewers/CLAUDE.md takes the {account} account's edit.")
+            break
+        print(f"reviewers/CLAUDE.md does not take the {account} account's edit.")
+    if chosen is shipped:
+        print(f"reviewers/CLAUDE.md takes the shipped {INSTRUCTIONS}.")
     stage_file(plan, os.path.join(rv, "CLAUDE.md"), chosen, 0o644)
 
 
 # The launcher, the sudo rule and the reviewers' tools.
 
 def stage_sudo_rule(cfg: dict, sw_tree: str, launcher: str, plan: Plan) -> None:
+    """One Defaults/rule pair per entity's agents account, rendered by
+    `account_entities.render_sudoers` so uninstall-builder's own expected
+    content can never drift from what this writes."""
     template = read_tree_file(sw_tree, SUDOERS_TEMPLATE).decode("utf-8")
-    text = template.replace("@LAUNCHER@", launcher).encode("utf-8")
+    agents_names = [pair[0] for pair in ae.account_pairs(cfg["entities"])]
+    text = ae.render_sudoers(template, agents_names, launcher).encode("utf-8")
     sudoers = cfg["sudoers_dir"]
     staged = os.path.join(sudoers, f".{SUDOERS_NAME}.tmp-{token()}")
     write_atomic(staged, text, 0o440)
@@ -785,11 +878,23 @@ def stage_sudo_rule(cfg: dict, sw_tree: str, launcher: str, plan: Plan) -> None:
         raise Refused(f"visudo refused the sudo rule, so nothing was placed: {tail(done.stderr + done.stdout)}")
 
 
+def venv_interpreter(cfg: dict) -> str:
+    """The interpreter the reviewers' venv is built on. An interpreter named in
+    fixtures.json wins outright. Otherwise, on Darwin, Homebrew's own python3 (the
+    default `cfg["interpreter"]` takes) may be a version with no wheel for the
+    reviewers' locked packages, so the venv is built on the pinned CPython
+    install_pinned_python places at <prefix>/python/<PYTHON_VERSION>/bin/python3
+    instead. Linux keeps `cfg["interpreter"]`."""
+    if not cfg["interpreter_from_fixture"] and platform_mod.system() == "Darwin":
+        return os.path.join(cfg["prefix"], "python", PYTHON_VERSION, "bin", "python3")
+    return cfg["interpreter"]
+
+
 def stage_venv(cfg: dict, ap_tree: str, rv: str, plan: Plan) -> None:
     lock = os.path.join(ap_tree, LOCK)
     staging = os.path.join(rv, f"venv.staging-{token()}")
     plan.stage(staging, os.path.join(rv, "venv"))
-    made = subprocess.run([cfg["interpreter"], "-I", "-m", "venv", staging], env=CLEAN_ENV,
+    made = subprocess.run([venv_interpreter(cfg), "-I", "-m", "venv", staging], env=CLEAN_ENV,
                           cwd="/", capture_output=True, check=False)
     if made.returncode:
         raise Refused(f"could not create the reviewers' venv: {tail(made.stderr)}. "
@@ -802,7 +907,7 @@ def stage_venv(cfg: dict, ap_tree: str, rv: str, plan: Plan) -> None:
         env=pip_env, cwd="/", capture_output=True, check=False)
     if pip.returncode:
         raise Refused(f"pip refused {LOCK} (a hash did not match, or a build failed): "
-                      f"{tail(pip.stderr + pip.stdout)}. Nothing that is live was replaced.")
+                      f"{tail(pip.stdout + pip.stderr)}. Nothing that is live was replaced.")
     own_tree(staging)
 
 
@@ -1035,6 +1140,13 @@ def stage_all(cfg: dict, args, sw_tree: str, ap_tree: str, ap_sha: str, records:
     launcher = os.path.join(libexec, "review-launch")
     stage_file(plan, launcher, read_tree_file(ap_tree, LAUNCHER), 0o755)
     print(f"launcher: agent-platform@{ap_sha} {LAUNCHER} -> libexec/review-launch")
+    # The tool and the directory it writes in, and never the record itself: only
+    # `model-provider enable` or `disable` under sudo can name the operator and
+    # the time, so an install enables no provider.
+    stage_file(plan, os.path.join(libexec, "model-provider"),
+               read_tree_file(ap_tree, MODEL_PROVIDER), 0o755)
+    make_dir(os.path.join(prefix, "config"), 0o755)
+    print(f"model-provider: agent-platform@{ap_sha} {MODEL_PROVIDER} -> libexec/model-provider")
     make_dir(os.path.join(prefix, "lib"), 0o755)
     stage_library(plan, ap_tree, os.path.join(prefix, "lib", "agent-platform"))
     stage_sudo_rule(cfg, sw_tree, launcher, plan)
@@ -1098,7 +1210,16 @@ def install_two(cfg: dict, args: argparse.Namespace) -> int:
     make_dir(prefix, 0o755)
     make_dir(os.path.join(prefix, "src"), 0o755)
     make_dir(os.path.join(prefix, "libexec"), 0o755)
-    persisted = {k: cfg[k] for k in PERSISTED_TWO if k in cfg}
+    # Shape two never acts on entities, but an operator may still have
+    # hand-placed the key; validated the same way shape three validates it,
+    # and carried forward byte-for-byte rather than silently dropped.
+    stored = load_config(prefix)
+    if ENTITIES_KEY in stored:
+        try:
+            ae.read_entities(os.path.join(prefix, CONFIG))
+        except ae.EntitiesInvalid as exc:
+            raise Refused(str(exc))
+    persisted = persisted_two(stored, cfg)
     data = (json.dumps(persisted, indent=2, sort_keys=True) + "\n").encode("utf-8")
     if read_beneath(prefix, (CONFIG,)) != data:
         write_atomic(os.path.join(prefix, CONFIG), data, 0o644)
@@ -1161,7 +1282,15 @@ def install_three(cfg: dict, args: argparse.Namespace) -> int:
     make_dir(prefix, 0o755)
     make_dir(os.path.join(prefix, "etc"), 0o700)
     make_dir(os.path.join(prefix, "src"), 0o755)
-    persisted = {k: cfg[k] for k in PERSISTED}
+    # Validated and carried through `cfg` for `stage_sudo_rule`, and carried
+    # back into install.json byte-for-byte below so a later run reads the
+    # same entities this one did, never a freshly fabricated `["default"]`.
+    stored = load_config(prefix)
+    try:
+        cfg["entities"] = ae.read_entities(os.path.join(prefix, CONFIG))
+    except ae.EntitiesInvalid as exc:
+        raise Refused(str(exc))
+    persisted = persisted_three(stored, cfg, prefix)
     data = (json.dumps(persisted, indent=2, sort_keys=True) + "\n").encode("utf-8")
     if read_beneath(prefix, (CONFIG,)) != data:
         write_atomic(os.path.join(prefix, CONFIG), data, 0o644)
@@ -1183,7 +1312,7 @@ def install_three_anonymous(cfg: dict, args: argparse.Namespace, names: dict[str
     """The three-account root half's anonymous path: each repository fetched over
     HTTPS by `tag`, needing no approver key."""
     prefix = cfg["prefix"]
-    ensure_slots(prefix)
+    ensure_slots(prefix, cfg["entities"])
 
     trees: dict[str, tuple[str, str, str]] = {}
     for role in ROLES:
@@ -1202,7 +1331,7 @@ def install_three_token(cfg: dict, args: argparse.Namespace, names: dict[str, st
     """The three-account root half's token path: each repository fetched as GitHub's
     own `main`, with a read token minted from the approver key."""
     prefix = cfg["prefix"]
-    ensure_slots(prefix)
+    ensure_slots(prefix, cfg["entities"])
     key_path = os.path.join(prefix, gg.KEY_SLOT)
     if not gg.read_slot(key_path):
         raise Refused(f"no approver key is placed at {key_path}. The slots are created. Place "
@@ -1268,9 +1397,10 @@ def finish_three(cfg: dict, args: argparse.Namespace,
     return 0
 
 
-def ensure_slots(prefix: str) -> None:
-    """Each credential slot as an empty root-owned file, with a `.needed` marker beside it."""
-    for rel in SLOTS:
+def ensure_slots(prefix: str, entities: list[str]) -> None:
+    """Each credential slot as an empty root-owned file, with a `.needed` marker beside it.
+    One Claude-token slot per entity in `entities` once there is more than one."""
+    for rel in (gg.KEY_SLOT, gg.ID_SLOT, *claude_slots(entities)):
         path = os.path.join(prefix, rel)
         if gg.read_slot(path) is None:
             write_atomic(path, b"", 0o600)
