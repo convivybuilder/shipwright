@@ -4,7 +4,15 @@ label = "com.convivy.library"
 command = ["/bin/sh", "{deploy}/library/serve.sh"]
 platforms = ["macos", "linux"]
 scope = "system"
-account = "agents"
+account = "library"
+# `_library` on macOS: company decision 0025 point 5 names the convention for
+# a daemon account there. Linux keeps `library`; see FORMAT.md, "account-macos".
+account-macos = "_library"
+# {root} ELSEWHERE IN THIS FILE NAMES THE INSTALL'S OWN ROOT, HELD IN A
+# CONFIG FILE THE AGENTS ACCOUNT WRITES, WHICH THIS ACCOUNT CANNOT READ. Its
+# knowledge snapshot lives in its own state instead (see FORMAT.md,
+# "own-root", and the Library spec's "The knowledge repository").
+own-root = "{state}/library"
 enabled-by-default = true
 working-directory = "{deploy}/library"
 
@@ -61,6 +69,31 @@ stop-timeout-seconds = 60
 # `registrar` named `agent-platform-registry-writer`, which holds
 # `registry.write` alone, at the path `lib/agent-platform/crew_registration.py`
 # reads (`~/.orient-control/agent-platform-registry-writer-token`).
+#
+# NOR ANY CREDENTIAL ORIENT'S OWN DEPLOY STEP COULD POST A deploy_failure
+# SIGNAL WITH, SO A FRESH TWO- OR THREE-ACCOUNT INSTALL'S `bin/orient-deploy`
+# FOUND NO `capture-token` UNDER ORIENT'S ACCOUNT AT ALL. THE LIBRARY MINTS AN
+# EIGHTH, holding `signal.create` alone, named for this one machine, so a
+# later `--revoke` of it is unambiguous. See the mint itself, below, for why
+# its name is computed rather than written here. `--withholds` is every other
+# agent capability, computed at mint time from this account's own identity
+# module (`identity.ROLE_CAPS["agent"]`) rather than written out here, so a
+# capability a later release adds to that role is withheld too rather than
+# silently granted.
+#
+# NOR ANY CREDENTIAL THE DOCUMENT SERVICE COULD PRESENT TO SAVE A PERSON'S
+# DOCUMENT ON ORIENT'S BEHALF, SO EVERY SAVE ON THE TWO- AND THREE-ACCOUNT
+# SHAPES WAS REFUSED BEFORE ITS SIGNATURE WAS EVEN CHECKED. THE LIBRARY MINTS
+# A NINTH, `kb-person-save-token`, holding `reference.person_save` alone
+# (every other agent capability withheld, computed the same way as the
+# eighth's), with no crew. The Library resolves a crew credential's entity
+# through its own project registry, and a crew with no row there makes the
+# Library refuse the credential with "no resolvable identity", so every save
+# would fail on an install whose registry lacks that crew. `agentctl kb apply`
+# presents it from `~/.orient-control/kb-person-save-token` under the
+# account the document service runs as — `agents`, on every shape — so this
+# mints on every shape, not only the two where the Library has its own
+# account.
 #
 # An install may
 # generate a new local credential and never copy or overwrite one, so each mint
@@ -121,6 +154,27 @@ prepare = [
     { run = ["/bin/sh", "-c", "\"$0\" mint_credential.py --file agents --name orient --grants registry.read --out \"$1\" --replace && : > \"$2\"", "{deploy}/library/.venv/bin/python", "{home}/.orient-control/library-token", "{home}/.orient-control/library-token-registry-read-granted"], creates = "{home}/.orient-control/library-token-registry-read-granted" },
     { run = ["{deploy}/library/.venv/bin/python", "mint_credential.py", "--file", "clients", "--name", "orient", "--grants", "signal.post_draft", "--out", "{home}/.orient-control/library-client-token"], creates = "{home}/.orient-control/library-client-token" },
     { run = ["/bin/sh", "-c", "\"$0\" mint_credential.py --file clients --name orient --grants signal.post_draft --out \"$1\" --replace && : > \"$2\"", "{deploy}/library/.venv/bin/python", "{home}/.orient-control/library-client-token", "{home}/.orient-control/library-client-token-post-draft-granted"], creates = "{home}/.orient-control/library-client-token-post-draft-granted" },
+    # ORIENT'S DEPLOY STEP NEEDS A CREDENTIAL TOO, TO POST ITS deploy_failure
+    # SIGNAL — see bin/orient-deploy's own post_signal and CAPTURE_TOKEN. The
+    # old one, under the name github-capture, carried kind system and
+    # products "*", far wider than posting one kind of signal needs; this
+    # mint is its narrow replacement, holding every agent capability but
+    # signal.create (--withholds the rest of the role, computed below). Its
+    # name carries this machine's own hostname, computed at mint time rather
+    # than written once into this shipped file, so a later `--revoke` of this
+    # credential on a given machine names it unambiguously; --kind agent
+    # --products convivy-orient matches orient-deploy's own SIGNAL_PRODUCT
+    # exactly, which the Library's scope check reads as a literal string.
+    # Runs under the Library's own interpreter, never the installer's
+    # `{python}`, because computing --withholds below imports this account's
+    # own identity module, which is not on the installer's own path and may
+    # not import under its interpreter at all.
+    { run = ["{deploy}/library/.venv/bin/python", "-c", "import identity, socket, subprocess, sys; name = \"orient-deploy-signals-\" + socket.gethostname().split(\".\")[0].lower(); withholds = \",\".join(sorted(c for c in identity.ROLE_CAPS[\"agent\"] if c != \"signal.create\")); sys.exit(subprocess.run([sys.executable, \"mint_credential.py\", \"--file\", \"agents\", \"--name\", name, \"--kind\", \"agent\", \"--products\", \"convivy-orient\", \"--withholds\", withholds, \"--hashed\", \"--out\", sys.argv[1]]).returncode)", "{home}/.orient-control/capture-token"], creates = "{home}/.orient-control/capture-token" },
+    # THE DOCUMENT SERVICE PRESENTS THIS ONE TO SAVE A PERSON'S DOCUMENT ON
+    # ORIENT'S BEHALF — see the module comment above, "NOR ANY CREDENTIAL THE
+    # DOCUMENT SERVICE COULD PRESENT". `--withholds` is computed the same way
+    # as capture-token's own, above.
+    { run = ["{deploy}/library/.venv/bin/python", "-c", "import identity, subprocess, sys; withholds = \",\".join(sorted(c for c in identity.ROLE_CAPS[\"agent\"] if c != \"reference.person_save\")); sys.exit(subprocess.run([sys.executable, \"mint_credential.py\", \"--file\", \"agents\", \"--name\", \"kb-person-save\", \"--grants\", \"reference.person_save\", \"--withholds\", withholds, \"--out\", sys.argv[1]]).returncode)", "{home}/.orient-control/kb-person-save-token"], creates = "{home}/.orient-control/kb-person-save-token" },
     { run = ["{deploy}/library/.venv/bin/python", "mint_credential.py", "--file", "agents", "--name", "ops-mcp", "--out", "{home}/.orient-control/ops-mcp-token"], creates = "{home}/.orient-control/ops-mcp-token" },
     { run = ["{deploy}/library/.venv/bin/python", "mint_credential.py", "--file", "agents", "--name", "agent-platform", "--grants", "review_record.create", "--out", "{home}/.orient-control/agent-platform-token"], creates = "{home}/.orient-control/agent-platform-token" },
     { run = ["{deploy}/library/.venv/bin/python", "mint_credential.py", "--file", "clients", "--name", "bosun", "--holds-reserved=", "--out", "{state}/library/bosun-client-token"], creates = "{state}/library/bosun-client-token" },
@@ -131,6 +185,10 @@ prepare = [
     # Touch ID proof for them. An install from before this step can hold a `deck`
     # entry whose file is gone, which `mint_credential.py` refuses. An install never
     # overwrites a credential, so the step fails and says how to replace it.
+    # On the two- and three-account shapes, `account-prepare` below narrows this
+    # same entry to `--holds-reserved=` right after this step runs; the
+    # single-account shape has no such step, so this mint stays exactly as it
+    # renders here and the credential keeps every reserved capability.
     { run = ["/bin/sh", "-c", "\"$0\" mint_credential.py --file clients --name deck --out \"$1\" || { echo \"builder: could not create Deck's credential at $1. If the line above says 'deck' already has a credential, the Library holds one whose file is gone, so Deck cannot present it. To replace it, run this and then run the install or update again: cd \\\"$PWD\\\" && LIBRARY_CLIENT_TOKENS=\\\"$LIBRARY_CLIENT_TOKENS\\\" \\\"$0\\\" mint_credential.py --file clients --name deck --out \\\"$1\\\" --replace\" >&2; exit 1; }", "{deploy}/library/.venv/bin/python", "{home}/.orient-control/deck-library-token"], creates = "{home}/.orient-control/deck-library-token" },
     { run = ["{deploy}/library/.venv/bin/python", "mint_credential.py", "--file", "agents", "--name", "agent-platform-registry-reader", "--grants", "registry.read", "--out", "{home}/.orient-control/agent-platform-registry-reader-token"], creates = "{home}/.orient-control/agent-platform-registry-reader-token" },
     { run = ["{deploy}/library/.venv/bin/python", "mint_credential.py", "--file", "agents", "--name", "agent-platform-registry-writer", "--kind", "registrar", "--out", "{home}/.orient-control/agent-platform-registry-writer-token"], creates = "{home}/.orient-control/agent-platform-registry-writer-token" },
@@ -161,6 +219,40 @@ prepare = [
     ["{bin}/mint-crew-ops-credentials", "--library-db", "{state}/library/library.db",
      "--tokens-file", "{state}/library/api-tokens.json", "--library-dir", "{deploy}/library",
      "--orient-control", "{home}/.orient-control"],
+]
+
+# THE CREDENTIAL `agentctl kb sync` PRESENTS TO THE THREE REFERENCE-SYNC
+# ROUTES BELOW, minted only while the Library's own account is in force (see
+# FORMAT.md, "account-prepare"): unlike `prepare` above, this never runs once
+# `--single-account` has dropped the job's account, so a single-account
+# install mints none of it and the routes answer 403 there, same as before
+# this credential existed. `reference.sync` holds no role and is not
+# human-reserved, reachable only through this entry's own grant.
+# `bin/deliver-library-credentials` copies it out to whichever account runs
+# `agentctl kb sync` — the `agents` account, or each entity's own agents
+# account on a multi-entity install.
+#
+# DECK'S TOKEN IS NARROWED AND GRANTED `item.signed_act` HERE, ON THE TWO
+# SHAPES WHERE THE LIBRARY HAS ITS OWN ACCOUNT. The mint above, in `prepare`,
+# still mints `deck` holding every human-reserved capability, because
+# `prepare` runs unconditionally and the single-account shape's render has to
+# stay byte-identical. Here, reached only while the Library's own account is
+# in force, the step reads the Library's client store and re-mints `deck`
+# with `--grants item.signed_act --holds-reserved=`, the empty form the
+# Bosun's own mint above uses for `--holds-reserved=`, unless every `deck`
+# entry already holds both `"holds_reserved": []` and `item.signed_act` among
+# its `grants`. Without the grant a Touch ID-signed approve, decline or model
+# choice from Deck is refused at the Library's bearer check, since
+# `item.signed_act` is on no role. It checks the store rather than a marker
+# file, so a `deck` token re-minted later at full strength, as the recovery
+# line in `prepare` above tells an operator to do, or one left over from
+# before this grant existed, is narrowed and granted again on the next run,
+# and an already-narrowed, already-granted token is never rotated.
+# `deliver-library-credentials` copies the narrowed token out to `agents`,
+# which is where Deck reads it.
+account-prepare = [
+    { run = ["{deploy}/library/.venv/bin/python", "mint_credential.py", "--file", "agents", "--name", "reference-sync", "--grants", "reference.sync", "--out", "{home}/.orient-control/reference-sync-token"], creates = "{home}/.orient-control/reference-sync-token" },
+    ["/bin/sh", "-c", "\"$0\" -c 'import json, os, sys; e = [m for m in json.load(open(os.environ[\"LIBRARY_CLIENT_TOKENS\"])).values() if isinstance(m, dict) and m.get(\"name\") == \"deck\"]; sys.exit(0 if e and all(m.get(\"holds_reserved\") == [] and \"item.signed_act\" in (m.get(\"grants\") or []) for m in e) else 1)' || \"$0\" mint_credential.py --file clients --name deck --grants item.signed_act --holds-reserved= --out \"$1\" --replace", "{deploy}/library/.venv/bin/python", "{home}/.orient-control/deck-library-token"],
 ]
 
 # THE INDEX THE LIBRARY SERVES AGENTS FROM IS NOT BUILT HERE. `agentctl kb
@@ -217,6 +309,20 @@ LIBRARY_KNOWLEDGE_ROOT = "{root}/knowledge"
 # work item's product against that table directly, over no environment
 # variable at all.
 PATH = "{bin}:/usr/bin:/bin"
+
+# THE REFERENCE ROOM'S INDEX AND THE LIBRARY'S OWN GIT REPOSITORY, set only
+# while the Library's own account is in force (see FORMAT.md,
+# "account-environment"): the single-account install runs the Library as the
+# operator, same as everything else, and keeps the paths it has today, which
+# default under the running account's home when these are unset. `agentctl kb
+# sync` sends the Reference Room's index as rows and the knowledge repository
+# as a git bundle over the Library's listener, and the Library builds its own
+# SQLite file and its own bare repository from them here, never opening
+# either that `agents` wrote.
+[account-environment]
+LIBRARY_KB_INDEX = "{state}/library/reference/index.db"
+LIBRARY_REPOS_ROOT = "{state}/library/repos"
+LIBRARY_KB_REPO = "{state}/library/repos/knowledge"
 
 [schedule]
 at-load = true

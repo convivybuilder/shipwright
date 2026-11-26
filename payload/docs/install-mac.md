@@ -294,6 +294,18 @@ After that one login, Builder's services and the tmux server the desktop login s
 themselves, and a Claude session started inside that server, which is where Deck starts crews, came
 up signed in.
 
+## Updating
+
+Move to a later release with either:
+
+```
+curl -fsSL https://convivybuilder.org/install.sh | sh -s -- --update --shape single
+brew upgrade builder && builder-install --update --shape single
+```
+
+[Moving to a later release](after-installing.md#moving-to-a-later-release) says what that does,
+and what it refuses.
+
 ## Next
 
 Go on to [After the install](after-installing.md), which shows what the install put where and takes

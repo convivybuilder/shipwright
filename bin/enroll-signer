@@ -1,0 +1,579 @@
+#!/usr/bin/env python3
+"""Enroll a Mac's signing certificate, so Deck's approve, decline and set-model
+acts verify against it.
+
+    bin/enroll-signer --root-cert <file> --signer-cert <file>
+    bin/enroll-signer --check [--root-cert <file>] [--signer-cert <file>]
+
+**What this does.** The Library's protocol contract, section 2.2 ("The signing
+certificate" and "Signed item acts"), has Deck sign its approve, decline and
+set-model calls with a Secure Enclave key, under a certificate the `root-ca`
+tool issues straight from the Library's own root — the root certificate at
+`.library/person-save/root-ca.crt`, under the home of the account the
+Library process runs as. The Library checks a signature's certificate
+against that root, and asks its signing-certificate registry whether the
+signer is active. This command is the one place that fills both: it places
+the root certificate, once, and it enrolls one signer's email, machine name,
+fingerprint and expiry in the registry, by running `enroll_signing_cert.py
+issue` from the library repository's own deploy area, as the account the
+Library runs as.
+
+**The certificate checks run first, and change nothing until they pass.**
+Before anything is written, this verifies that `--signer-cert` is signed
+directly by `--root-cert`'s key — no intermediate, because each file may hold
+exactly one certificate — and that it carries every rule section 2.2 states
+for a signing certificate: `extendedKeyUsage` critical with exactly the
+signing purpose, `keyUsage` critical with exactly `digitalSignature`,
+`basicConstraints` `CA:FALSE`, and a `subjectAltName` with exactly one
+`rfc822Name` (the person's email, lower case) and one
+`uniformResourceIdentifier` naming `convivy://signer/<machine>`. The person's
+email and the machine name come from there; the fingerprint (the SHA-256 of
+the certificate's DER) and the expiry come from the certificate itself.
+
+**THE ROOT IS NEVER REPLACED.** A root already placed that differs from
+`--root-cert`, byte for byte, is refused: swapping it would strand every
+certificate the first one signed, with no way for the Library to tell. The
+same root given again is not a refusal — enrolling a second Mac's signer
+under a root already placed is the ordinary case this command runs for
+every time after the first.
+
+**No cryptography beyond what `/usr/bin/openssl` already does.** This never
+imports a Python crypto library: the chain and the signature are checked
+with `openssl verify`, and each extension's value and criticality are read
+from `openssl x509 -text`'s own extensions section, whose output is a
+fixed, English, machine-shaped format rather than prose in a locale this
+does not control. The system `/usr/bin/openssl` on macOS is LibreSSL, whose
+`x509` has no `-ext NAME,...` option at all, which is why this reads the
+one output both it and OpenSSL already share.
+
+**On the two- and three-account shapes, this runs as root and opens nothing
+under the Library account's own home itself.** Whether the Library has its
+own account is read from `/opt/builder/install.json`'s `library_account`,
+the same record `bin/place-person-save` already reads for the same
+question. Named, this refuses unless run as root, and every read or write
+under that account's own home — the root certificate, and
+`enroll_signing_cert.py` itself, which the Library's own deploy area and
+database belong to — happens in a child already dropped to that account's
+own uid and gid, the way `bin/hand-library-inputs` already does it in the
+same direction. Absent, this is the single-account shape (or a two-account
+one that has not migrated the Library to its own account yet): the Library
+runs as the operator, and this refuses instead if run as root, since sudo
+here would place the root certificate under root's own home rather than the
+operator's.
+
+**`--check` reads and changes nothing.** With neither flag it reports only
+whether a root is placed. With `--signer-cert`, it also reports that
+certificate's fingerprint and asks `enroll_signing_cert.py status
+<fingerprint>` whether it is enrolled — one of `active`, `revoked`,
+`expired` or `unknown`, the same four words the Library's own
+`GET /signing-certificates/{fingerprint}` route answers with. It does not
+re-run the certificate checks above, since a placed root may differ from
+one given here and that is not what `--check` exists to report.
+
+Exit codes: 0 placed and enrolled (or, under `--check`, read without
+refusal), 1 refused, 2 usage.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import datetime
+import json
+import os
+import pwd
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+PROG = "enroll-signer"
+
+INSTALL_RECORD = "/opt/builder/install.json"
+OPENSSL = "/usr/bin/openssl"
+
+SUBDIR = (".library", "person-save")
+ROOT_NAME = "root-ca.crt"
+DEPLOY_LIBRARY_REL = Path(".local", "deploy", "library")
+ENROLL_SCRIPT_NAME = "enroll_signing_cert.py"
+
+# The Library protocol, section 2.2, "The signing certificate": the
+# signing purpose, in the UUID arc of ITU-T X.667
+# (fa47bfa2-1f8a-4d3d-8e88-d3cab3caa98d), which needs no registration.
+SIGNING_PURPOSE_OID = "2.25.332679538808142797592760871621889796493"
+SIGNER_URI_PREFIX = "convivy://signer/"
+# "1 to 64 lowercase letters, digits or hyphens, starting with a letter or digit."
+MACHINE_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+
+# Read from `openssl x509 -text`'s own extensions section, never `-ext
+# NAME,...`: the system `/usr/bin/openssl` on macOS is LibreSSL, whose
+# `x509` has no `-ext` option at all, while `-text`'s extension lines are
+# byte-for-byte the same shape on both. Each header below is matched with
+# its leading `X509v3 ` stripped.
+EXT_HEADERS = {
+    "Basic Constraints": "basicConstraints",
+    "Key Usage": "keyUsage",
+    "Extended Key Usage": "extendedKeyUsage",
+    "Subject Alternative Name": "subjectAltName",
+}
+
+
+class Refused(Exception):
+    """Something the operator has to fix. Never a stack trace."""
+
+
+@dataclasses.dataclass(frozen=True)
+class SignerInfo:
+    email: str
+    machine: str
+    fingerprint: str
+    not_after: str
+
+
+# --- reading the certificates, with openssl alone ----------------------------
+
+
+def _single_pem_certificate(path: str, flag: str) -> bytes:
+    """`path`'s bytes, refused unless it is a regular file holding exactly
+    one `BEGIN CERTIFICATE` block.
+
+    **EXACTLY ONE, NEVER A BUNDLE.** `openssl verify` builds a chain out of
+    every certificate in the file it is given, trusted or not, so a signer
+    certificate carrying a second, intermediate certificate in the same PEM
+    file would still "verify" against a root it is not directly signed by.
+    This is what makes "chains directly to the root" a check rather than an
+    assumption about the command's own two-file shape.
+    """
+    p = Path(path)
+    if p.is_symlink():
+        raise Refused(f"{flag} {path} is a symlink, not the certificate itself. Nothing was changed.")
+    try:
+        data = p.read_bytes()
+    except OSError as exc:
+        raise Refused(f"{flag} {path} could not be read: {exc.strerror or exc}. Nothing was changed.")
+    count = data.count(b"-----BEGIN CERTIFICATE-----")
+    if count != 1:
+        raise Refused(f"{flag} {path} holds {count} certificate(s), and exactly one is required "
+                      f"so a bundled intermediate cannot stand in for a direct chain. Nothing was changed.")
+    return data
+
+
+def _openssl(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run([OPENSSL, *args], capture_output=True, text=True,
+                          env={**os.environ, "LC_ALL": "C"}, check=False)
+
+
+def _chains_directly(root_path: str, signer_path: str) -> None:
+    """`-CAfile` alone, with no `-no-CAfile`/`-no-CApath`/`-no_check_time`:
+    those exist only on OpenSSL's `verify`, and the system `/usr/bin/openssl`
+    on macOS is LibreSSL, which refuses an option it does not have outright.
+    A signer whose issuer is not `root_path`'s own subject fails to chain
+    regardless, on both, so the extra flags buy nothing here that the
+    certificates' own names and keys do not already decide."""
+    done = _openssl("verify", "-CAfile", root_path, signer_path)
+    if done.returncode != 0 or not done.stdout.strip().endswith(": OK"):
+        raise Refused(f"{signer_path} does not chain directly to {root_path}'s key: "
+                      f"{(done.stderr or done.stdout).strip() or 'openssl refused'}. Nothing was changed.")
+
+
+def _read_extensions(cert_path: str) -> dict[str, tuple[bool, str]]:
+    done = _openssl("x509", "-in", cert_path, "-noout", "-text")
+    if done.returncode != 0:
+        raise Refused(f"openssl could not read {cert_path}'s extensions: "
+                      f"{done.stderr.strip() or 'refused'}. Nothing was changed.")
+    result: dict[str, tuple[bool, str]] = {}
+    for block in re.split(r"(?m)^[ \t]*X509v3 ", done.stdout):
+        if ":" not in block:
+            continue
+        header, _, rest = block.partition(":")
+        name = EXT_HEADERS.get(header.strip())
+        if name is None:
+            continue
+        crit_part, _, value_part = rest.partition("\n")
+        # Only the FIRST value line: for the last extension in the dump,
+        # `value_part` runs on into the certificate's signature block, which
+        # is not part of any extension's value.
+        value_lines = [line.strip() for line in value_part.splitlines() if line.strip()]
+        result[name] = (crit_part.strip() == "critical", value_lines[0] if value_lines else "")
+    return result
+
+
+def _cert_fingerprint(cert_path: str) -> str:
+    done = _openssl("x509", "-in", cert_path, "-noout", "-fingerprint", "-sha256")
+    if done.returncode != 0:
+        raise Refused(f"openssl could not fingerprint {cert_path}: "
+                      f"{done.stderr.strip() or 'refused'}. Nothing was changed.")
+    _, _, value = done.stdout.strip().partition("=")
+    fingerprint = value.replace(":", "").lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+        raise Refused(f"openssl printed a fingerprint for {cert_path} this cannot read: {value!r}")
+    return fingerprint
+
+
+def _cert_not_after(cert_path: str) -> str:
+    """The certificate's own expiry, as `YYYY-MM-DDTHH:MM:SSZ`."""
+    done = _openssl("x509", "-in", cert_path, "-noout", "-enddate")
+    if done.returncode != 0:
+        raise Refused(f"openssl could not read {cert_path}'s expiry: "
+                      f"{done.stderr.strip() or 'refused'}. Nothing was changed.")
+    _, _, value = done.stdout.strip().partition("=")
+    try:
+        when = datetime.datetime.strptime(value, "%b %d %H:%M:%S %Y %Z")
+    except ValueError:
+        raise Refused(f"openssl printed an expiry for {cert_path} this cannot read: {value!r}")
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def verify_signer_certificate(root_path: str, signer_path: str) -> SignerInfo:
+    """Every rule in the Library protocol's section 2.2, "The signing
+    certificate", checked in the order the contract lists them, refusing on
+    the first failure and changing nothing."""
+    _single_pem_certificate(root_path, "--root-cert")
+    _single_pem_certificate(signer_path, "--signer-cert")
+    _chains_directly(root_path, signer_path)
+
+    exts = _read_extensions(signer_path)
+
+    basic = exts.get("basicConstraints")
+    if basic is None or basic[1] != "CA:FALSE":
+        raise Refused(f"{signer_path}'s basicConstraints must be CA:FALSE, and "
+                      f"{'is missing' if basic is None else f'is {basic[1]!r}'}. Nothing was changed.")
+
+    key_usage = exts.get("keyUsage")
+    if key_usage is None or not key_usage[0] or key_usage[1] != "Digital Signature":
+        raise Refused(f"{signer_path}'s keyUsage must be critical and assert exactly "
+                      f"digitalSignature, and "
+                      f"{'is missing' if key_usage is None else f'is {key_usage!r}'}. Nothing was changed.")
+
+    extended = exts.get("extendedKeyUsage")
+    if extended is None or not extended[0] or extended[1] != SIGNING_PURPOSE_OID:
+        raise Refused(f"{signer_path}'s extendedKeyUsage must be critical and list exactly "
+                      f"the signing purpose ({SIGNING_PURPOSE_OID}), and "
+                      f"{'is missing' if extended is None else f'is {extended!r}'}. Nothing was changed.")
+
+    san = exts.get("subjectAltName")
+    if san is None:
+        raise Refused(f"{signer_path} has no subjectAltName. Nothing was changed.")
+    entries = [e.strip() for e in san[1].split(",") if e.strip()]
+    emails = [e[len("email:"):] for e in entries if e.startswith("email:")]
+    uris = [e[len("URI:"):] for e in entries if e.startswith("URI:")]
+    if len(entries) != 2 or len(emails) != 1 or len(uris) != 1:
+        raise Refused(f"{signer_path}'s subjectAltName must carry exactly one rfc822Name and "
+                      f"one uniformResourceIdentifier, and carries {entries!r}. Nothing was changed.")
+
+    email = emails[0]
+    if "@" not in email or email != email.lower() or any(c.isspace() for c in email):
+        raise Refused(f"{signer_path}'s subjectAltName email {email!r} is not a lower-case "
+                      f"email address. Nothing was changed.")
+
+    uri = uris[0]
+    if not uri.startswith(SIGNER_URI_PREFIX):
+        raise Refused(f"{signer_path}'s subjectAltName URI {uri!r} does not name a signer "
+                      f"({SIGNER_URI_PREFIX}<machine>). Nothing was changed.")
+    machine = uri[len(SIGNER_URI_PREFIX):]
+    if not MACHINE_NAME_RE.fullmatch(machine):
+        raise Refused(f"{signer_path}'s machine name {machine!r} is not 1 to 64 lowercase "
+                      f"letters, digits or hyphens starting with a letter or digit. "
+                      f"Nothing was changed.")
+
+    fingerprint = _cert_fingerprint(signer_path)
+    not_after = _cert_not_after(signer_path)
+    return SignerInfo(email=email, machine=machine, fingerprint=fingerprint, not_after=not_after)
+
+
+# --- the install record, the same question place-person-save already asks ---
+
+
+def library_account_name() -> str | None:
+    """The account the install record says the Library runs as, or `None`
+    when the record is absent or names none — the shapes where the Library
+    runs as the operator. Mirrors `bin/place-person-save`'s own
+    `refuse_separated_install`, read the other way: there it refuses when an
+    account IS named; here that is the branch this command takes instead.
+
+    Reads the module-level `INSTALL_RECORD` rather than taking it as a
+    default argument, so a test that points it elsewhere is read on every
+    call, the same way `bin/place-person-save`'s own check already is."""
+    record_path = INSTALL_RECORD
+    try:
+        text = Path(record_path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise Refused(f"{record_path} exists but cannot be read ({exc}), so this cannot tell "
+                      f"whether the Library has its own account. Nothing was changed.")
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise Refused(f"{record_path} is not JSON. Nothing was changed.")
+    if not isinstance(data, dict):
+        raise Refused(f"{record_path} does not hold a JSON object. Nothing was changed.")
+    name = data.get("library_account")
+    return name if isinstance(name, str) and name else None
+
+
+def resolve_account(name: str) -> tuple[int, int, Path]:
+    try:
+        entry = pwd.getpwnam(name)
+    except KeyError:
+        raise Refused(f"{INSTALL_RECORD} names the Library account {name!r}, but no such "
+                      f"account exists on this machine. Nothing was changed.")
+    return entry.pw_uid, entry.pw_gid, Path(entry.pw_dir)
+
+
+def operator_home() -> Path:
+    """The running account's own home, from the password database rather
+    than `$HOME` — the account `bin/enroll-signer` acts as when the Library
+    runs as the operator."""
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+# --- forking and dropping privileges, duplicated from bin/hand-library-inputs ---
+
+
+def _drop_privileges(uid: int, gid: int) -> None:
+    os.setgroups([])
+    os.setgid(gid)
+    os.setuid(uid)
+
+
+def run_as_account(uid: int, gid: int, action, *, drop=None):
+    """Run `action()` in a child dropped to `(uid, gid)` first, and return
+    what it returns, or raise `Refused` with what it raised. Duplicated from
+    `bin/hand-library-inputs`, which duplicated it from
+    `bin/deliver-library-credentials`: the same protocol each already uses
+    to keep root from opening a destination account's home directly."""
+    if drop is None:
+        drop = _drop_privileges
+    read_fd, write_fd = os.pipe()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            drop(uid, gid)
+            result = action()
+            payload = json.dumps({"ok": True, "result": result}).encode("utf-8")
+        except BaseException as exc:
+            payload = json.dumps({"ok": False, "error": str(exc)}).encode("utf-8")
+        try:
+            with os.fdopen(write_fd, "wb") as out:
+                out.write(len(payload).to_bytes(8, "big"))
+                out.write(payload)
+        finally:
+            os._exit(0)
+    os.close(write_fd)
+    with os.fdopen(read_fd, "rb") as inp:
+        header = inp.read(8)
+        size = int.from_bytes(header, "big") if header else 0
+        data = inp.read(size) if size else b""
+    os.waitpid(pid, 0)
+    decoded = json.loads(data.decode("utf-8")) if data else {"ok": False, "error": "the child reported nothing"}
+    if not decoded.get("ok"):
+        raise Refused(decoded.get("error") or "the child failed silently")
+    return decoded.get("result")
+
+
+# --- placing the root, and running enroll_signing_cert.py, as the target account ---
+
+
+def write_file(path: Path, data: bytes, mode: int) -> None:
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    os.chmod(path, mode)
+
+
+def _person_save_dir(home: Path) -> Path:
+    return home.joinpath(*SUBDIR)
+
+
+def place_root(home: Path, root_bytes: bytes) -> str:
+    """Place the root certificate, once. Runs inside the target account's
+    own uid/gid, whether that is a dropped child or the process itself.
+
+    **NEVER REPLACED.** An existing root that differs, byte for byte, is
+    refused rather than overwritten: replacing it would strand every
+    signing certificate the first root signed, which the Library's own
+    registry has no way to notice. The same bytes given again is the
+    ordinary case of enrolling a second signer under a root already placed,
+    and proceeds.
+    """
+    d = _person_save_dir(home)
+    if d.is_symlink() or (d.exists() and not d.is_dir()):
+        raise Refused(f"{d} exists and is not a directory. Nothing was changed.")
+    d.mkdir(parents=True, exist_ok=True)
+    os.chmod(d, 0o700)
+    root_path = d / ROOT_NAME
+    if root_path.is_symlink():
+        raise Refused(f"{root_path} is a symlink, not the root certificate itself. Nothing was changed.")
+    if root_path.is_file():
+        existing = root_path.read_bytes()
+        if existing == root_bytes:
+            return "already placed, unchanged"
+        raise Refused(f"{root_path} already holds a different root certificate. Replacing it "
+                      f"would strand every signing certificate the first root signed. Nothing "
+                      f"was changed; this root certificate was not placed.")
+    write_file(root_path, root_bytes, 0o644)
+    return "placed"
+
+
+def _library_dir(home: Path) -> Path:
+    return home / DEPLOY_LIBRARY_REL
+
+
+def run_enroll_script(home: Path, *args: str) -> str:
+    """Run `enroll_signing_cert.py` from the library repository's own
+    deploy area, under its own venv, with its own directory as the working
+    directory — the same convention `payload/bin/mint-crew-ops-credentials`
+    already uses for `mint_credential.py`, the sibling script in that same
+    tree."""
+    library_dir = _library_dir(home)
+    script = library_dir / ENROLL_SCRIPT_NAME
+    venv_python = library_dir / ".venv" / "bin" / "python"
+    if not script.is_file():
+        raise Refused(f"{script} does not exist; the library repository's own deploy area is "
+                      f"not in place here. Nothing further was changed.")
+    if not venv_python.is_file():
+        raise Refused(f"{venv_python} does not exist; the library repository's own deploy area "
+                      f"is not in place here. Nothing further was changed.")
+    result = subprocess.run([str(venv_python), str(script), *args],
+                            cwd=str(library_dir), capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise Refused((result.stderr or result.stdout or
+                       f"{ENROLL_SCRIPT_NAME} exited {result.returncode}").strip())
+    return result.stdout.strip()
+
+
+def enroll_in_account(home: Path, root_bytes: bytes, info: SignerInfo) -> list[str]:
+    """Place the root, then enroll the signer. Runs inside the target
+    account's own uid/gid."""
+    root_report = place_root(home, root_bytes)
+    run_enroll_script(home, "issue", info.email, info.machine, info.fingerprint, info.not_after)
+    return [f"root-ca.crt: {root_report}",
+            f"enrolled {info.email} on {info.machine}, fingerprint {info.fingerprint}, "
+            f"expires {info.not_after}"]
+
+
+def check_in_account(home: Path, fingerprint: str | None, root_bytes: bytes | None) -> dict:
+    """Read-only: whether the root is placed, whether it matches
+    `root_bytes` when given, and, with a fingerprint, whether a signer is
+    enrolled. Runs inside the target account's own uid/gid; writes
+    nothing."""
+    root_path = _person_save_dir(home) / ROOT_NAME
+    placed = root_path.is_file() and not root_path.is_symlink()
+    result: dict = {"root_placed": placed}
+    if placed and root_bytes is not None:
+        result["root_matches"] = root_path.read_bytes() == root_bytes
+    if fingerprint is not None:
+        try:
+            status = run_enroll_script(home, "status", fingerprint)
+        except Refused as exc:
+            result["signer_status"] = None
+            result["signer_error"] = str(exc)
+        else:
+            result["signer_status"] = status or "unknown"
+    return result
+
+
+# --- main ---------------------------------------------------------------------
+
+
+def main(argv: list[str], drop=None) -> int:
+    p = argparse.ArgumentParser(
+        prog=PROG,
+        description="Place the Library's root certificate and enroll a Mac's signing "
+                    "certificate in its signing-certificate registry.",
+    )
+    p.add_argument("--root-cert", help="the Library's root certificate, PEM")
+    p.add_argument("--signer-cert", help="the Mac's signing certificate, PEM")
+    p.add_argument("--check", action="store_true",
+                   help="report whether a root is placed and a signer enrolled; change nothing")
+    args = p.parse_args(argv)
+
+    try:
+        if not args.check and not (args.root_cert and args.signer_cert):
+            p.print_usage(sys.stderr)
+            print(f"{PROG}: --root-cert and --signer-cert are required", file=sys.stderr)
+            return 2
+
+        account = library_account_name()
+        if account is None:
+            if os.geteuid() == 0:
+                raise Refused(f"{INSTALL_RECORD} names no separate Library account, so the "
+                              f"Library runs as the operator here. Run this as the operator, "
+                              f"not as root: as root it would place the root certificate under "
+                              f"root's own home rather than the operator's. Nothing was changed.")
+            home = operator_home()
+
+            def run_in_target(action):
+                return action()
+        else:
+            if os.geteuid() != 0:
+                raise Refused(f"{INSTALL_RECORD} names the Library account {account!r}, so this "
+                              f"needs root, to reach that account without opening its home "
+                              f"itself. Nothing was changed. Run this with sudo.")
+            uid, gid, home = resolve_account(account)
+
+            def run_in_target(action):
+                return run_as_account(uid, gid, action, drop=drop)
+
+        if args.check:
+            fingerprint = _cert_fingerprint(args.signer_cert) if args.signer_cert else None
+            root_bytes = _single_pem_certificate(args.root_cert, "--root-cert") if args.root_cert else None
+            result = run_in_target(lambda: check_in_account(home, fingerprint, root_bytes))
+            print(f"{PROG}: root certificate at {home.joinpath(*SUBDIR, ROOT_NAME)}: "
+                  f"{'placed' if result['root_placed'] else 'NOT placed'}")
+            if result["root_placed"] and root_bytes is not None:
+                print(f"{PROG}: --root-cert "
+                      f"{'matches' if result['root_matches'] else 'DIFFERS FROM'} the placed root")
+            if fingerprint is not None:
+                if result.get("signer_status") is None:
+                    print(f"{PROG}: could not read {args.signer_cert}'s enrollment: "
+                          f"{result.get('signer_error')}", file=sys.stderr)
+                    return 1
+                print(f"{PROG}: {args.signer_cert} (fingerprint {fingerprint}): "
+                      f"{result['signer_status']}")
+            return 0
+
+        # **ONE READ OF EACH CERTIFICATE, THEN ONLY THE COPY.** Every check
+        # below runs openssl against a path, and the root's bytes are placed
+        # afterwards. Reading the operator's paths again for each of those
+        # would let a file swapped in between place a root, or enroll a
+        # fingerprint, that no check ever saw. So each certificate is read
+        # once, written into a directory only this process can open, and
+        # every check and the placement use that copy. A refusal still names
+        # the operator's own path rather than the copy's.
+        root_bytes = _single_pem_certificate(args.root_cert, "--root-cert")
+        signer_bytes = _single_pem_certificate(args.signer_cert, "--signer-cert")
+        with tempfile.TemporaryDirectory(prefix="enroll-signer.") as snap:
+            snap_root = os.path.join(snap, "root-cert.pem")
+            snap_signer = os.path.join(snap, "signer-cert.pem")
+            for path, data in ((snap_root, root_bytes), (snap_signer, signer_bytes)):
+                with open(path, "xb") as f:
+                    f.write(data)
+            try:
+                info = verify_signer_certificate(snap_root, snap_signer)
+            except Refused as exc:
+                raise Refused(str(exc).replace(snap_root, args.root_cert)
+                              .replace(snap_signer, args.signer_cert)) from None
+        report = run_in_target(lambda: enroll_in_account(home, root_bytes, info))
+        for line in report:
+            print(f"{PROG}: {line}")
+    except Refused as exc:
+        print(f"{PROG}: refused: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -71,6 +71,10 @@ delay-seconds = 10
 | `programs` | optional list of command names the installer finds on its own PATH; see "Placeholders" |
 | `[macos]` | optional, for a job whose `platforms` is exactly `["macos"]`: `abandon-process-group` |
 | `account` | optional, for a system-scope job: the account it runs as instead of root; see "account" |
+| `own-root` | optional, needs `account`; replaces `{root}` for this job alone; see "own-root" |
+| `[account-environment]` | optional, needs `account`; string to string, added to `[environment]` only while the account is in force; see "account-environment" |
+| `account-prepare` | optional, needs `account` and `working-directory`; steps added to `prepare` only while the account is in force; see "account-prepare" |
+| `account-only` | optional, needs `account`; left out entirely, rather than converted, under `--single-account`; see "account-only" |
 
 ### directories and prepare
 
@@ -159,6 +163,106 @@ A run as root leaves out a user-scope job that names no account. The three-accou
 as root with `--home` set to the agents account's home, so such a job would be written there. `install-jobs`
 names each job it leaves out and installs nothing for it. `--single-account` installs it for the operator.
 
+#### account-macos
+
+```toml
+scope = "system"
+platforms = ["macos", "linux"]
+account = "library"
+account-macos = "_library"
+```
+
+`account-macos` overrides `account` for the launchd side alone, for an account whose real name differs on
+macOS — company decision 0025 point 5 gives the Library's own service account `_library` on macOS, the
+platform's own convention for a daemon account's name, and `library` on Linux, where no such convention
+applies. It is refused without `account` (there is nothing to override) and without `"macos"` in `platforms`
+(it would never take effect). systemd never reads it: a job's `User=`/`Group=` on Linux are always `account`.
+
+`{home}`, `{deploy}`, `{state}` and `{bin}` resolve against whichever name is in force on the platform the
+install is running on — `account-macos` on macOS, `account` on Linux — so a declaration using both never
+needs to say which: `install-jobs` already knows the platform it is installing for.
+
+### own-root
+
+```toml
+scope = "system"
+account = "library"
+own-root = "{state}/library"
+```
+
+`{root}` otherwise carries over from the install unchanged, the same as `{python}`; it names the Builder
+root the operator's account resolved, which an account with no path into that account's home cannot read.
+`own-root` gives a job naming an `account` its own answer instead, resolved against that account's own
+`{home}`, `{deploy}`, `{state}`, `{bin}` and `{python}`, never against `{root}` itself, which is what it
+replaces; a declaration naming `{root}` inside `own-root` is refused. The result must be an absolute
+path, since every other field that names `{root}` is written assuming it is one.
+
+It needs `account`, since it has nothing to replace without one, and it is refused without it.
+`--single-account` drops the account (see "account"), and drops `own-root` with it; a job with no
+account in force has nothing for `own-root` to replace, so `{root}` resolves as it does today.
+
+### account-environment
+
+```toml
+scope = "system"
+account = "library"
+
+[account-environment]
+LIBRARY_KB_INDEX = "{state}/reference/index.db"
+```
+
+`account-environment` adds entries to `[environment]`, resolved against every placeholder the same
+way, only while the job's `account` is in force. It needs `account`, since it has nothing to apply
+without one, and it is refused without it, as is a key it names that `[environment]` also names.
+`--single-account` drops the account (see "account"), and drops `account-environment` with it, so a
+job with no account in force gets none of these variables — the same answer it got before
+`account-environment` existed.
+
+### account-prepare
+
+```toml
+scope = "system"
+account = "library"
+working-directory = "{deploy}/library"
+
+account-prepare = [
+    { run = ["{deploy}/library/.venv/bin/python", "mint.py", "--out", "{home}/.tool/token"], creates = "{home}/.tool/token" },
+]
+```
+
+`account-prepare` adds steps to `prepare`, run the same way and in the same working directory, only
+while the job's `account` is in force. It needs `account`, since it has nothing to apply without one,
+and it is refused without it; like `prepare`, it needs `working-directory` too. `--single-account`
+drops the account (see "account") and drops `account-prepare` with it, so a job with no account in
+force runs none of these steps — not even once, as the plain user-scope job the operator would
+otherwise run them as. This is the one difference from `prepare`, which still runs for a user-scope
+job: `account-prepare` exists for a step that must run only as the account's own, such as minting a
+credential that account alone may hold, where a single-account run would mint it for the operator
+instead, and that is wrong rather than merely redundant.
+
+### account-only
+
+```toml
+scope = "system"
+account = "library"
+
+account-only = true
+```
+
+`account-only` says a job is left out entirely under `--single-account`, rather than converted the
+way `as_invoker` converts every other job that names an account. It needs `account`, since it has
+nothing to drop without one, and it is refused without it.
+
+This is for a job whose task exists only because its account is separate from the one installing
+it. The Library's own backup job is the case this exists for: it backs up the Library's database,
+cold store and blobs into a destination under the Library account's own home, so that `agents`
+never gets a readable copy of them. Under `--single-account` the Library already runs as the
+operator, so `jobs/builder-backup.toml` already backs up everything in one pass; converting the
+Library's own backup job too would run a second, redundant backup of the same files as the same
+account. `own-root`, `account-environment` and `account-prepare` all add to what a job does while
+its account is in force; `account-only` instead decides whether the job exists under
+`--single-account` at all.
+
 ### Calendar times
 
 ```toml
@@ -218,6 +322,9 @@ lists `tmux`. A name must be a bare command in the placeholder's own shape, so a
 one, and it may not reuse a built-in placeholder's name. `programs` is for user-scope jobs only,
 because a system-scope job runs as root and a program found on PATH could be one another account
 placed.
+
+**A job naming an `account` may give `{root}` its own answer with `own-root`,** rather than the
+install's own root; see "own-root".
 
 ## What each renderer does about the two supervisors disagreeing
 

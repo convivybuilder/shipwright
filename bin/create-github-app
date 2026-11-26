@@ -68,6 +68,7 @@ import http.server
 import json
 import os
 import pathlib
+import re
 import secrets
 import select
 import sys
@@ -80,6 +81,10 @@ PROG = "create-github-app"
 API = "https://api.github.com"
 WEB = "https://github.com"
 WAIT_SECONDS = 600
+# Matches only a name this run (or an earlier one) proposed by default, never
+# one the operator typed with --name, so a stored name in any other shape
+# falls back to a fresh random suffix instead of being parsed.
+DEFAULT_NAME_RE = re.compile(r"^Builder agents ([0-9a-f]{6})$")
 
 PERMISSIONS = {
     "write": {"contents": "write", "pull_requests": "write", "checks": "read",
@@ -105,6 +110,28 @@ def tty_path() -> str:
     # Overridable so the tests drive --code-from-tty with a pipe or pty of
     # their own, never the real /dev/tty.
     return os.environ.get("BUILDER_GITHUB_APP_TTY", "/dev/tty")
+
+
+def default_name(read_only: bool, cfg_root: pathlib.Path | None = None) -> str:
+    """The name to propose when --name is not given: "Builder agents
+    <suffix>", or "Builder agents <suffix> (read-only)" for the second App,
+    with a fresh six-hex-character suffix so no two installs propose the
+    same name. The read-only App reuses the write App's own suffix instead,
+    read from `cfg_root` (`config_dir(False)` by default); a stored name in
+    any other shape, or none at all, falls back to a fresh random suffix."""
+    suffix = None
+    if read_only:
+        write_cfg = cfg_root if cfg_root is not None else config_dir(False)
+        try:
+            stored = (write_cfg / "app-name").read_text().strip()
+        except OSError:
+            stored = ""
+        match = DEFAULT_NAME_RE.match(stored)
+        if match:
+            suffix = match.group(1)
+    if suffix is None:
+        suffix = secrets.token_hex(3)
+    return f"Builder agents {suffix} (read-only)" if read_only else f"Builder agents {suffix}"
 
 
 def manifest(kind: str, redirect: str, name: str) -> dict:
@@ -270,6 +297,8 @@ def wait_for_code(kind: str, org: str | None, port: int, name: str,
     try:
         print(f"Open http://127.0.0.1:{bound}/ in a browser on this machine, then create "
               f"the App on GitHub. Waiting up to {int(wait // 60)} minutes.", flush=True)
+        print("If GitHub says the name is taken, edit it on the form before pressing Create, "
+              "or rerun with --name.", flush=True)
         if tty_fd is not None:
             print("Over SSH, the redirect will fail in your browser: copy the whole address it "
                   "was left at (http://127.0.0.1:<port>/callback?code=...&state=...) and paste "
@@ -344,6 +373,11 @@ def store(app: dict, cfg: pathlib.Path) -> None:
     slug = app.get("slug")
     if slug:
         (cfg / "app-slug").write_text(f"{slug}\n")
+    name = app.get("name")
+    if name:
+        # Read back by default_name(), so a read-only App created later on
+        # this machine can reuse this App's suffix.
+        (cfg / "app-name").write_text(f"{name}\n")
     for stale in ("installation-id", "token.json"):
         try:
             (cfg / stale).unlink()
@@ -385,7 +419,7 @@ def main(argv: list[str], opener=urllib.request.urlopen) -> int:
     kind = "read-only" if args.read_only else "write"
     cfg = config_dir(args.read_only)
     key = cfg / "app.pem"
-    name = args.name or ("Builder agents (read-only)" if args.read_only else "Builder agents")
+    name = args.name or default_name(args.read_only)
     if args.if_missing and os.path.lexists(key):
         print(f"{PROG}: the App already exists; its id and key are in {cfg}.")
         print(manage_installations_line(cfg))

@@ -9,11 +9,13 @@ request and no check here watches it. The resolution, settled on 2026-09-16, is 
 ships into a FRESH repository.
 
 WHAT SHIPS, IN THE PRIVATE REPOSITORY'S OWN LAYOUT: `payload/`, the installers
-in `bin/`, Builder's backend job declarations in `jobs/`, and the tools the
-installers read at run time (SHIPPING below), with LICENSE
-and NOTICE at the root. The public repository is laid out like this one so a
-fork of it installs itself exactly as a checkout of this one does, and a change
-digest names each file where it sits in both. The root README is generated
+in `bin/`, Builder's backend job declarations in `jobs/`, the sudoers template
+in `privileged/` that `install-privileged` and `uninstall-builder` read from
+their own extracted tree, and the tools the installers read at run time
+(SHIPPING below), with LICENSE and NOTICE at the root. The public repository
+is laid out like this one so a fork of it installs itself exactly as a
+checkout of this one does, and a change digest names each file where it sits
+in both. The root README is generated
 from `payload/README.md`, since this repository's own root README is written
 for its private readers. A root CONTRIBUTING.md, if this repository has one at
 the ref being built, ships alongside LICENSE and NOTICE; an older ref that
@@ -106,6 +108,7 @@ SHIPPING = (
     "payload",
     "bin",
     "jobs",
+    "privileged",
     "release-signers",
     "tools/check-shipping-licences.py",
     "tools/stale_holders.py",

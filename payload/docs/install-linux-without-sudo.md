@@ -31,10 +31,11 @@ apt-get install git zsh lsof tmux curl python3-venv acl bubblewrap socat
 
 Run both as root. The Debian test machine had `git` already and installed the rest with that
 `apt-get install` command. `provision-backend`, which the account runs later, names the venv package
-as `python3.11-venv`; Debian 12's `python3-venv` depends on it and installs it, and on the test
-machine `apt-cache depends python3-venv` listed it. `bubblewrap` and `socat` are what a dispatched
-session's sandbox needs; without them a session refuses to start with `sandbox required but
-unavailable`, naming whichever of the two is still missing.
+as `python3-venv`, since Debian 12's own `python3` is 3.11 or later already; on the test machine
+`apt-cache depends python3-venv` listed `python3.11-venv`, which it depends on and installs.
+`bubblewrap` and `socat` are what a dispatched session's sandbox needs; without them a session
+refuses to start with `sandbox required but unavailable`, naming whichever of the two is still
+missing.
 
 So that the account's services keep running after it logs out, the administrator also runs this as
 root, with the account name checked first:

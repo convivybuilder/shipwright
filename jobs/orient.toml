@@ -4,7 +4,11 @@ label = "com.convivy.orient"
 command = ["/bin/sh", "{deploy}/convivy-orient/serve.sh"]
 platforms = ["macos", "linux"]
 scope = "system"
-account = "agents"
+account = "orient"
+# `_orient` on macOS: see jobs/library.toml's own account-macos comment —
+# Orient's own service account follows the same daemon-account convention
+# there, and `orient` on Linux, where no such convention applies.
+account-macos = "_orient"
 enabled-by-default = true
 working-directory = "{deploy}/convivy-orient"
 
@@ -26,6 +30,30 @@ HOME = "{home}"
 ORIENT_CONFIG_ROOT = "{state}/orient"
 ORIENT_STATE_ROOT = "{state}/orient"
 PATH = "{bin}:/usr/bin:/bin"
+
+# THE CLOUDFLARE TUNNEL REACHES ORIENT OVER A UNIX SOCKET ON THESE SHAPES,
+# never 127.0.0.1:8099, so that an account other than Orient's own can never
+# bind the loopback port and receive a person's Cloudflare Access token while
+# Orient is down. `ORIENT_LISTEN_SOCKET` set, convivy-orient's own
+# `_listener_binds`/`_serve` bind the socket at this path instead of the
+# loopback address; set only while Orient's own account is in force (FORMAT.md,
+# "account-environment"), the same way jobs/library.toml's own
+# LIBRARY_KB_INDEX is. `--single-account` drops this entry with the account,
+# so that shape keeps the loopback bind unchanged, exactly as it renders today.
+#
+# ORIENT_KB_DOCUMENT_SOCKET NAMES THE DOCUMENT SERVICE'S OWN SOCKET, the one
+# `bin/migrate-orient-account`'s `install_document_service()` installs with
+# Orient's own group as `--client-group`. convivy-orient's own
+# `kb_commit.py` reads this variable fresh on each call
+# (`_SERVICE_SOCKET_ENV`) to reach that service instead of the in-process
+# `agentctl kb apply` route, which stops working the moment Orient moves off
+# `agents`. Set only while Orient's own account is in force, the same as
+# `ORIENT_LISTEN_SOCKET` above; `--single-account` drops it with the
+# account, where Orient still runs as `agents` and the in-process route
+# still works.
+[account-environment]
+ORIENT_LISTEN_SOCKET = "/opt/builder/run/orient/orient.sock"
+ORIENT_KB_DOCUMENT_SOCKET = "/var/db/convivy-kb-documents/kb-documents.sock"
 
 [schedule]
 at-load = true

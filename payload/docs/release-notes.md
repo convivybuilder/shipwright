@@ -8,6 +8,13 @@ shows how to move.
 
 ### Installing
 
+- **Builder supports Ubuntu 24.04 in place of Ubuntu 22.04.** 22.04's own Python is 3.10, older
+  than the 3.11 Builder needs, and apt's `python3.11` package there is a release candidate the
+  pinned libraries refuse; 24.04 ships Python 3.12, which works. The Linux installers now accept a
+  machine's own `python3` once it is 3.11 or later, and install a separate `python3.11` only when
+  it is not — so on Debian 12 and Ubuntu 24.04, where the stock interpreter already qualifies,
+  nothing extra is installed. Ubuntu 22.04 still installs, unsupported, by the same route as any
+  platform not on the list.
 - **The one command now asks which permission mode crew sessions run in, and whether they start
   with remote control.** It recommends `auto` for the permission mode and offers
   `bypassPermissions`, which runs every tool call without asking; remote control defaults to off.
@@ -15,6 +22,183 @@ shows how to move.
   shows each current value as its own default. The answers land in a new root-owned file,
   `co-launch.env` in `/usr/local/etc/convivy`, which `co` reads; keeping the defaults on a fresh
   install writes nothing.
+- **Creating your GitHub App now proposes a name unique to this install**, rather than the same
+  fixed name every install tried first. GitHub App names are unique across all of GitHub, so a
+  second install, or a reinstall, used to collide with the first and force you to edit the name on
+  the form; the command now starts from a name that is already free.
+
+### Updating
+
+- **`builder-update --shape two` and `--shape three` now move a two- or three-account install to a
+  later release**, the same as `--shape single` already did. `builder-install --update` is the one
+  front door for all three shapes; it refuses to guess which one a machine runs, so you always name
+  it with `--shape`.
+- **`builder-install` now leaves write-better's clone on its local `main` at the pinned commit**,
+  rather than a detached `HEAD`. `builder-update` moves write-better by fast-forwarding `main` and
+  refuses a clone that is not on it, so the first update of every install made by an older installer
+  stopped in its preflight; see "Upgrading from 0.7.0 or 0.7.1" below for the one command that fixes
+  an install already made that way.
+- **The update's own verify step now passes on a real install**, instead of rolling back on every
+  run. It reads the Library's migration state with the database path the Library's own job uses,
+  checks the release it is moving to by name rather than always comparing against the newest, and
+  waits for a job that is still mid-restart instead of reading it as down. See "Upgrading from 0.7.0
+  or 0.7.1" below.
+
+### The three-account install
+
+- **The three-account install finishes on a real machine.** Through 0.7.1 it was tested only against
+  throwaway roots and stub account tools; a fresh three-account install, the operator plus an
+  `agents`/`reviewers` account pair for each entity you register, ran end to end on a stock Debian 12
+  machine for this release.
+- **The three-account install's merge rule now refuses auto-merge, a merge-queue rule and a
+  person-owned account**, so none of those three can stand in for the two GitHub rulesets
+  `github-gate` has you import.
+
+### The Bosun
+
+- **A dispatched run now checks out and holds a library card for the work item it runs on**, which
+  carries its own identity rather than a shared one. See "Known limits of this release" below for
+  what a crashed harness leaves active.
+- **Crossing a project's hard spending limit now revokes every library card active on that
+  project**, on top of ending each agent already running there.
+- **A dispatch with no work item named now honours its project's spending limits too**, closing a
+  gap where only a dispatch tied to a work item was checked.
+- **The model gateway can cap what each caller spends**, declared per consumer at mint time, rather
+  than only a whole project's limit.
+
+### Agents
+
+- **Interactive sessions now read GitHub through `agentctl git` and commit as their crew**, on a
+  minted token, the route a dispatched run already used. A GitHub login of your own that is still on
+  the machine stays usable by anything running as your account, so sign it out where sessions run.
+- **The `bin/` commands run under any Python 3.11 or later already on the machine**, re-executing
+  themselves onto it instead of refusing when the interpreter isn't named exactly `python3.11`.
+- **A pull request a reviewer is still working on is held**, so nothing, an automatic merge
+  included, reads it as ready until the hold clears.
+- **`agentctl gateway-rotate-master` rotates the model gateway's master key.**
+
+### The Library
+
+- **Deck's Approve, Decline and model-choice buttons can now carry a proof signed by a Touch ID
+  press on your Mac**, which the Library checks before accepting one of those three acts.
+  [After the install](after-installing.md#approving-from-deck-with-a-touch-id-press) walks through
+  making a signing root once and enrolling each Mac's own certificate. The proof is required, not
+  optional, wherever Deck's own Library credential has been narrowed; see "Known limits of this
+  release" below for where that is.
+- **Each project now has a theme, matching the colour Deck already shows for its crew.** Deck sets
+  it, the Library stores it, and Orient draws each project's page in it.
+- **A crew's knowledge reads can be scoped to part of the Reference Room**, with `sudo
+  agentctl crew-scope`, and the Library enforces that scope itself on every Reference Room read.
+- **Each project's ledger can carry its own subscription spending cap**, apart from its gateway
+  cap.
+- **A knowledge-document save you sign is verified, committed and pushed by the Library itself.**
+  Orient's editor sends your save through a new document service, which the two- and three-account
+  installs place and start; the single-account install still saves in Orient's own process, where
+  Orient already runs as you.
+- **The Archives now back themselves up to a separate device on a schedule**, with a monthly check
+  that the backup is readable.
+
+### Orient
+
+- **An existing two- or three-account install can move Orient onto its own account.** Through
+  0.7.1, Orient ran as the `agents` account, with its control database, both of its Library
+  credentials and its own configuration root sitting under `agents`' own home. `sudo
+  migrate-orient-account --shape two|three --deploy-signals-bound` moves Orient to its own account,
+  created if it is not already there, rotates both Library credentials rather than carrying them
+  over, and turns on Orient's signed document saves. A fresh two- or three-account install puts
+  Orient on its own account from the start.
+- **Every registered project now has its own page on Orient, drawn in its crew's Deck theme**,
+  showing what it is running now, its recent spend, its CI duration by repository, its weekly
+  velocity, its changelog and release notes, and the marketing documents it has. A Projects index
+  lists every one, each opening its own site.
+- **A pull request is marked ready only once both reviewers have approved its current head
+  commit**, rather than any earlier commit either one saw.
+- **The security, spending, velocity, cost-performance, activity and knowledge-base pages now read
+  their reports from the Library**, instead of a local file Orient wrote itself; the Chart House
+  now says plainly when a project has no finished runs yet, rather than reading as empty.
+
+### Deck
+
+- **The cockpit can merge and close a pull request directly**, each confirmed with a dialog, and the
+  row updates at once rather than waiting for the next poll. It offers Merge on a repository with no
+  CI once reviews pass, reads GitHub's own merge-conflict refusal as a conflict rather than a generic
+  failure, and merges with whichever of your linked GitHub accounts can actually push to that
+  repository.
+- **A pull request a reviewer put on hold shows as Held in the cockpit, with no Merge button**, and
+  the ladder reads each reviewer's latest verdict at the current head, the same commit the merge
+  gate itself checks.
+- **Deck's setup pane can create your GitHub App itself**, forwarding the step's page over Deck's
+  own connection and opening it in your browser, so creating the App needs only the click on GitHub.
+- **A successful setup creates the steward on that host.**
+- **Deck now holds one connection open per Library host, kept alive by a heartbeat**, rather than
+  opening a new one for each request.
+
+### Upgrading from 0.7.0 or 0.7.1
+
+- An install made by the 0.7.0 or 0.7.1 installer has write-better checked out at a detached commit,
+  and `builder-update`'s preflight refuses a write-better clone that isn't on `main`. Before
+  updating, run this once:
+
+  ```bash
+  git -C ~/src/write-better checkout -B main
+  ```
+
+  On a three-account install, run the same command again in the `agents` account's own clone.
+- Updating to 0.7.1 itself always rolled back, from the bugs in the verify step fixed above (see
+  "Updating"). A 0.7.0 install should update straight to 0.8.0 rather than stopping at 0.7.1.
+
+### Known limits of this release
+
+1. A dispatched run cannot read or present a library card or a crew's ops credential once the card
+   work ships, with one limit at stage one: the `agentctl` command the harness executes is a
+   symbolic link into a working tree that an agent running under the same account could change, so
+   an agent that altered that tree could change what the harness does on a later dispatch. Pinning
+   `agentctl` to a tree agents cannot write is its own epic.
+2. The library-card guarantee covers only a crew that runs under its own account. A crew that does
+   not yet have one keeps its current credential.
+3. Enabling a model provider beyond Anthropic and OpenAI needs sudo, and the definition files for
+   DeepSeek, Moonshot, Xiaomi and Z.ai ship switched off. The command is `sudo
+   /opt/builder/libexec/model-provider enable <provider>`, with `disable <provider>` and `list`. It
+   writes a root-owned record at `/opt/builder/config/model-providers`, one line per provider naming
+   the operator and the UTC time, then restarts the model gateway. The two- and three-account
+   installs place the tool; the single-account install does not, so it alone cannot yet enable a
+   provider beyond Anthropic and OpenAI.
+4. A harness that crashes or is killed by a signal leaves its library card active until the
+   Individuator daemon next restarts, and leaves its work-item lease active until that lease
+   expires. Anything running as Orient's account can sign for any allowlisted person, and can read
+   every knowledge document through the document service with no person's token. Knowledge-base
+   query text is recorded in the Archives at internal class, readable by ordinary agent credentials
+   scoped to that product, after caller-typed text passes the credential sanitiser.
+5. On an install made with `--no-github-app`, `agentctl crew register` registers the crew with no CI
+   workflows and prints one line on stderr; through 0.7.1 it refused outright. Connecting the GitHub
+   App later does not fill them in: the Library answers a second registration with 409, and its crew
+   update refuses `ci_workflows`. They stay empty until someone sets them in the install's registry
+   file and loads it with `load_project_registry.py --replace`. Compare that file with the Library's
+   live table before any step that uses `--replace`, since a stale file overwrites live rows.
+6. On 0.8.0, Deck's approve, decline and model-change actions are verified whenever Deck sends a
+   signed proof, and a proof is required only where Deck's Library credential has been narrowed. The
+   two- and three-account installs narrow it; the single-account install's credential keeps every
+   reserved capability, so those three acts work there without a Touch ID press.
+
+## 0.7.1, 2026-11-13
+
+### Installing
+
+- **`builder-install --github-app-port <n>` fixes the port the GitHub App step serves its page on.**
+  Without it the step picks any free port, which a tool driving the install over `ssh` cannot know
+  in time to forward. Deck uses it to forward the port over its own connection and open the page,
+  so creating the App needs only the click on GitHub. A value that is not a port from 1 to 65535
+  refuses before anything is installed.
+- **The two- and three-account installs can enable a model provider beyond Anthropic and OpenAI.**
+  The model gateway ships with DeepSeek, Moonshot, Xiaomi and Z.ai switched off; `sudo
+  /opt/builder/libexec/model-provider enable <provider>` turns one on, `disable <provider>` turns
+  it back off, and `list` shows the state of each. The install places the tool and enables nothing
+  itself. The single-account install does not place it.
+
+### The three-account install
+
+- **Each entity gets its own `agents` and `reviewers` account**, created as part of the install,
+  rather than one shared pair for everyone the install registers.
 
 ### Backend jobs
 
@@ -31,16 +215,6 @@ shows how to move.
     `/Library/LaunchDaemons/com.convivy.orient-github-capture.plist`. On Linux, run
     `sudo systemctl disable --now com.convivy.orient-github-capture.timer` and delete that timer
     and its `.service` from `/etc/systemd/system`.
-
-## 0.7.1, not yet released
-
-### Installing
-
-- **`builder-install --github-app-port <n>` fixes the port the GitHub App step serves its page on.**
-  Without it the step picks any free port, which a tool driving the install over `ssh` cannot know
-  in time to forward. Deck uses it to forward the port over its own connection and open the page,
-  so creating the App needs only the click on GitHub. A value that is not a port from 1 to 65535
-  refuses before anything is installed.
 
 ## 0.7.0, 2026-11-08
 
@@ -109,8 +283,16 @@ shows how to move.
   release again, as the `agents` account into its own home, and re-verifies that clone against the
   same signed manifest before anything reads it: `install-payload` and `stand-up-backend --shape
   three`'s own placement step both need a real git checkout to resolve their source from, which the
-  root-owned tree does not carry, so both run from the `agents` clone instead. `--shape two` still
-  refuses.
+  root-owned tree does not carry, so both run from the `agents` clone instead.
+- **`builder-install --shape two` runs the same steps, minus every piece the three-account shape's
+  review draws on**: no `reviewers` account, no review launcher, no approver key. `provision-accounts`
+  and `install-privileged` run with `--shape two`, which fetches convivy-orient by a minted Orient
+  read token when the organisation keeps it private; tested the same way shape three is, nobody has
+  yet run it on a real machine either. This shape's merge rule, two GitHub rulesets that would
+  refuse every update except a pull request the operator merges, is not in this release:
+  `github-gate --shape two` does not exist, so neither this install nor `connect-github` points the
+  operator at a ruleset to import. Merge each pull request yourself, from another device, through
+  GitHub's own web page, until it ships.
 - **The one-command server install creates your GitHub App itself**, as its last step, rather than
   leaving that for afterward: open the address it prints and click **Create GitHub App**, or paste
   the redirect's address at the terminal over SSH. `--no-github-app` skips it.

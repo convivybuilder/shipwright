@@ -13,7 +13,17 @@ pair per entity the install's record names (`--install-json`, default
 a single entity, and the pair for a single entity, whatever its name, is the
 bare `agents` and `reviewers` every install used before entities existed; with
 more than one, each entity's pair is `<entity>-agents`/`<entity>-reviewers`.
-No run without `--shape` is accepted.
+No run without `--shape` is accepted. Both shapes also create the Library's
+own service account and Orient's (company decision 0025 point 5): a service
+account with no login does not count toward an install's shape, so each is
+created and removed alongside the shape's accounts without being one of them,
+and counts toward no entity. The Library's name is `_library` on macOS, the
+platform's own convention for a daemon account, and `library` on Linux, where
+no such convention applies; Orient's is `_orient` and `orient` the same way.
+Orient also gets the `orient-tunnel` group, holding only the operator (who
+runs `cloudflared` on these shapes), and `/opt/builder/run/orient`, the
+socket's directory, owned by Orient's account with group `orient-tunnel` and
+mode 750, under a root-owned `/opt/builder/run`.
 
 **Builder runs as `agents`, and on the three-account shape its reviews run as
 `reviewers`.** None of an entity's accounts may hold anything of the
@@ -23,14 +33,23 @@ every service account's group, which is how they read session output without
 sudo, and each entity's agents account joins the group that macOS's Remote
 Login admits, which is how the operator reaches its sessions over ssh.
 
+**The Library's account is not a login service account, and gets none of that.** It owns
+the Library's database, credentials and state directory, and nothing reaches
+it but the Library's own network listener — never ssh, never sudo, never the
+operator's own session. So it gets no shell, no password anyone knows, no
+ssh group membership, and the operator never joins its group: joining it
+would be exactly the filesystem access this account exists to deny. Its home
+is mode 700, tighter than a login service account's 750.
+
 **The isolation check runs before any grant that would let an agents account
 in.** After the accounts and their homes exist, this command signs in as each
 entity's agents account and tries to list every other created account's home,
-and the operator's — across entities as well as within one. A refusal is
-required before the operator is added to an account's group or an agents
-account is admitted to the ssh group. When the check fails, the run stops with
-a refusal that names the home that let the reader in and its mode, and no
-account involved is left with a new group membership or ssh access.
+the Library's included, and the operator's — across entities as well as
+within one. A refusal is required before the operator is added to an
+account's group or an agents account is admitted to the ssh group. When the
+check fails, the run stops with a refusal that names the home that let the
+reader in and its mode, and no account involved is left with a new group
+membership or ssh access.
 
 **An account of the wrong shape is refused, never corrected.** A primary group
 of `staff`, an admin membership, or a home readable by others means something
@@ -46,9 +65,11 @@ this command did is what is being checked.
 
 **On macOS the accounts are not role accounts.** `sysadminctl -roleAccount`
 requires a name starting with `_` and a user ID from 450 to 499, which its own
-help text says. The accounts keep the names the rest of Builder uses and take
-an ID from 401 to 449 instead, and the hidden flag keeps them off the login
-window.
+help text says. Every account here, the Library's own `_library` included,
+takes an ID from 401 to 449 instead and is created without `-roleAccount`, and
+the hidden flag keeps it off the login window — the leading underscore on
+`_library` is the macOS naming convention for a daemon account, not a role
+account's own marker.
 
 Needs root, so the administrator password is asked once, by sudo.
 """
@@ -116,6 +137,87 @@ def ssh_accounts(accounts: tuple[str, ...]) -> tuple[str, ...]:
     shape."""
     return tuple(name for name in accounts if name == "agents" or name.endswith("-agents"))
 
+# THE NO-LOGIN SERVICE ACCOUNTS, company decision 0025 point 5: the Library's
+# own, which owns its database, credentials and state directory, and
+# Orient's, which owns its own.
+# Nothing reaches either but its own account's network listener, so unlike
+# `agents` and `reviewers` neither gets a shell, a known password, sudo, ssh
+# access or the operator's own membership in its group. A service account
+# with no login does not count toward an install's shape, so neither is ever
+# returned by accounts_for_shape or added to SERVICE_ACCOUNTS: those two
+# answer "which accounts does this shape count", and a no-login account
+# answers no. Both exist on the same two shapes that have a second account at
+# all (`LIBRARY_SHAPES`); the single-account install runs everything as the
+# operator and creates neither, and neither counts toward any entity.
+#
+# A SESSIONS-ONLY HOST, NOT YET BUILT, RUNS NEITHER: it reaches a remote Keel
+# instead of its own, so it has nothing for either account to own. When that
+# role is built it should create neither, the same way the single-account
+# shape does not.
+#
+# EACH NAME DIFFERS BY PLATFORM. `_library` and `_orient` on macOS, where a
+# name starting with `_` is the convention for a daemon account; `library`
+# and `orient` on Linux, where no such convention applies. Keyed by a name
+# used only within this table, so a reader never hardcodes the one copy of
+# the code that creates a no-login account for each new one that needs it.
+LIBRARY_ACCOUNT_NAMES = {"macos": "_library", "linux": "library"}
+ORIENT_ACCOUNT_NAMES = {"macos": "_orient", "linux": "orient"}
+NO_LOGIN_ACCOUNTS = {"library": LIBRARY_ACCOUNT_NAMES, "orient": ORIENT_ACCOUNT_NAMES}
+LIBRARY_SHAPES = ("two", "three")
+# Tighter than HOME_MODE: nothing but the account itself reads this, where a
+# login service account's home is group-readable so the operator can join
+# that group. Shared by every no-login account in NO_LOGIN_ACCOUNTS.
+LIBRARY_HOME_MODE = 0o700
+# No shell Builder gives a login service account: a no-login account is
+# reached over its own network listener, never by a login or an interactive
+# `su`.
+NO_LOGIN_SHELL = "/usr/bin/false"
+
+# ORIENT'S TUNNEL GROUP AND SOCKET DIRECTORY. `cloudflared` forwards
+# to a Unix socket at ORIENT_SOCKET_DIR so that no account but Orient's can
+# bind the path or connect to it, except the account that runs `cloudflared`
+# (the operator, on these shapes), which is why it alone joins
+# ORIENT_TUNNEL_GROUP. RUN_ROOT is root-owned and holds that directory; a
+# root-run deploy step not yet built makes another directory there.
+ORIENT_TUNNEL_GROUP = "orient-tunnel"
+RUN_ROOT = "/opt/builder/run"
+RUN_ROOT_MODE = 0o755
+ORIENT_SOCKET_DIR = f"{RUN_ROOT}/orient"
+ORIENT_SOCKET_DIR_MODE = 0o750
+ROOT_UID = 0
+ROOT_GID = 0
+
+
+def library_account_name(platform: str) -> str:
+    """The Library's own account name on `platform`."""
+    return LIBRARY_ACCOUNT_NAMES[platform]
+
+
+def orient_account_name(platform: str) -> str:
+    """Orient's own account name on `platform`."""
+    return ORIENT_ACCOUNT_NAMES[platform]
+
+
+def no_login_account_names(platform: str) -> set[str]:
+    """Every no-login service account's real name on `platform`: never
+    joined by the operator, never one of a shape's own accounts
+    (`accounts_for_shape`), and always created with `create_service_account`."""
+    return {names[platform] for names in NO_LOGIN_ACCOUNTS.values()}
+
+
+def home_mode_for(name: str, platform: str) -> int:
+    return LIBRARY_HOME_MODE if name in no_login_account_names(platform) else HOME_MODE
+
+
+def accounts_for(shape: str, platform: str, entities: list[str]) -> tuple[str, ...]:
+    """The accounts this command provisions or removes for `shape` on
+    `platform` with `entities`: `accounts_for_shape(shape, entities)`, plus
+    every no-login service account where this shape has one."""
+    accounts = accounts_for_shape(shape, entities)
+    if shape in LIBRARY_SHAPES:
+        accounts = (*accounts, *(names[platform] for names in NO_LOGIN_ACCOUNTS.values()))
+    return accounts
+
 
 class Refused(Exception):
     """Something the operator has to decide about. Never a stack trace."""
@@ -155,6 +257,28 @@ class Report:
     @property
     def to_add(self) -> list[Row]:
         return [r for r in self.rows if not r.ok and r.addable]
+
+
+def add_dir_rows(report: Report, system: System, path: str, uid: int, gid: int,
+                 mode: int, owned_by: str) -> None:
+    """Rows for a directory this command owns outright, with no account of
+    its own: it must exist as a plain directory, owned `uid:gid`, at exactly
+    `mode`. Mirrors the home rows `inspect` adds for each account. An
+    existing one of the wrong shape fails the same way an account of the
+    wrong shape does: refused, never corrected."""
+    st = system.home_stat(path)
+    if st is None:
+        report.add(f"{path} exists", False, "this command creates it", addable=True)
+        return
+    report.add(f"{path} is a directory", stat.S_ISDIR(st.st_mode),
+               f"move aside whatever is at {path}")
+    report.add(f"{path} is owned by {owned_by}",
+               st.st_uid == uid and st.st_gid == gid,
+               f"chown {owned_by} {path}")
+    report.add(
+        f"{path} reads {stat.filemode(stat.S_IFDIR | mode)} (it reads {stat.filemode(st.st_mode)})",
+        stat.S_IMODE(st.st_mode) == mode,
+        f"chmod {mode:o} {path}")
 
 
 def user_record(name: str) -> str:
@@ -205,6 +329,23 @@ class System:
         except KeyError:
             return False
         return True
+
+    def group_gid(self, name: str) -> int | None:
+        try:
+            return grp.getgrnam(name).gr_gid
+        except KeyError:
+            return None
+
+    def group_members(self, name: str) -> set[str]:
+        """Every account that holds `name`, by its own primary group or as
+        a supplementary member. Asked of the directory service directly,
+        the same one `group_exists` and `group_gid` ask, rather than
+        assembled from what this command did."""
+        try:
+            group = grp.getgrnam(name)
+        except KeyError:
+            return set()
+        return set(group.gr_mem) | {e.pw_name for e in pwd.getpwall() if e.pw_gid == group.gr_gid}
 
     def groups_of(self, user: str) -> set[str]:
         done = self.run(["/usr/bin/id", "-Gn", user])
@@ -268,27 +409,29 @@ class System:
         """
         return None
 
-    def make_home(self, account: Account) -> None:
-        # Not a mkdir -p: the parent is the platform's home root, and a missing
-        # one is not this command's to create.
-        if self.home_stat(account.home) is None:
-            os.mkdir(account.home, HOME_MODE)
+    def make_dir(self, path: str, uid: int, gid: int, mode: int) -> None:
+        # Not a mkdir -p: the parent (an account's home root, or RUN_ROOT) is
+        # not this command's to create.
+        if self.home_stat(path) is None:
+            os.mkdir(path, mode)
         # Owner and mode are set through a descriptor opened without following
-        # a symlink. Set by path, a symlink planted where the home goes would
-        # hand its target to the new account (security review).
+        # a symlink. Set by path, a symlink planted where the directory goes
+        # would hand its target to `uid` (security review).
         try:
-            fd = os.open(account.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         except OSError:
             raise Refused(
-                f"{account.home} is not a plain directory (a symlink or a file is "
-                f"there), so it cannot be {account.name}'s home. Move it aside and "
-                f"run this again."
+                f"{path} is not a plain directory (a symlink or a file is "
+                f"there). Move it aside and run this again."
             )
         try:
-            os.fchown(fd, account.uid, account.gid)
-            os.fchmod(fd, HOME_MODE)
+            os.fchown(fd, uid, gid)
+            os.fchmod(fd, mode)
         finally:
             os.close(fd)
+
+    def make_home(self, account: Account, mode: int = HOME_MODE) -> None:
+        self.make_dir(account.home, account.uid, account.gid, mode)
 
     def remove_home(self, path: str) -> None:
         """Delete a removed account's home, never what a symlink points at."""
@@ -311,6 +454,19 @@ class System:
 
     # Platform commands, overridden below.
     def create_account(self, name: str) -> None:
+        raise NotImplementedError
+
+    def create_service_account(self, name: str) -> None:
+        """Create `name` as a no-login system account: no shell, no password
+        anyone knows, no sudo. Unlike `create_account`, nothing here joins it
+        to the ssh group or gives it a shell to join one with."""
+        raise NotImplementedError
+
+    def create_group(self, name: str) -> None:
+        """Create `name` as a bare group, with no account of the same name."""
+        raise NotImplementedError
+
+    def remove_group(self, name: str) -> None:
         raise NotImplementedError
 
     def add_member(self, user: str, group: str) -> None:
@@ -397,6 +553,23 @@ class MacSystem(System):
         ], stdin=f"{secrets.token_urlsafe(32)}\n")
         self.close_empty_password(name)
 
+    def create_service_account(self, name: str) -> None:
+        # Shares the pool `create_account` draws from (`free_id`, the same ID
+        # range), but gets NO_LOGIN_SHELL rather than a shell to ssh in with.
+        # The password is still a random one nobody is told, the same reason
+        # `create_account` gives: created with none, the account would accept
+        # an empty password for that window.
+        ident = self.free_id()
+        self.call(["/usr/sbin/dseditgroup", "-o", "create", "-i", str(ident), name])
+        self.call([
+            "/usr/sbin/sysadminctl", "-addUser", name,
+            "-fullName", f"Builder {name}",
+            "-UID", str(ident), "-GID", str(ident),
+            "-shell", NO_LOGIN_SHELL,
+            "-password", "-",
+        ], stdin=f"{secrets.token_urlsafe(32)}\n")
+        self.close_empty_password(name)
+
     def close_empty_password(self, name: str) -> None:
         """Leave `name` refusing an empty password, with none on a command line.
 
@@ -417,6 +590,13 @@ class MacSystem(System):
                 f"did not take. Run: sudo passwd {name} (it prompts), then run this again."
             )
 
+    def create_group(self, name: str) -> None:
+        ident = self.free_id()
+        self.call(["/usr/sbin/dseditgroup", "-o", "create", "-i", str(ident), name])
+
+    def remove_group(self, name: str) -> None:
+        self.call(["/usr/sbin/dseditgroup", "-o", "delete", name])
+
     def add_member(self, user: str, group: str) -> None:
         self.call(["/usr/sbin/dseditgroup", "-o", "edit", "-a", user, "-t", "user", group])
 
@@ -429,7 +609,7 @@ class MacSystem(System):
     def remove_account(self, name: str) -> None:
         self.call(["/usr/sbin/sysadminctl", "-deleteUser", name])
         if self.group_exists(name):
-            self.call(["/usr/sbin/dseditgroup", "-o", "delete", name])
+            self.remove_group(name)
 
 
 class LinuxSystem(System):
@@ -442,6 +622,20 @@ class LinuxSystem(System):
             "--shell", "/bin/bash", name,
         ])
 
+    def create_service_account(self, name: str) -> None:
+        # useradd with no `-p` leaves the password locked in /etc/shadow, so
+        # no password is set at all rather than merely an unknown one.
+        self.call([
+            "/usr/sbin/useradd", "--system", "--create-home", "--user-group",
+            "--shell", NO_LOGIN_SHELL, name,
+        ])
+
+    def create_group(self, name: str) -> None:
+        self.call(["/usr/sbin/groupadd", "--system", name])
+
+    def remove_group(self, name: str) -> None:
+        self.call(["/usr/sbin/groupdel", name])
+
     def add_member(self, user: str, group: str) -> None:
         self.call(["/usr/sbin/usermod", "-aG", group, user])
 
@@ -451,7 +645,7 @@ class LinuxSystem(System):
     def remove_account(self, name: str) -> None:
         self.call(["/usr/sbin/userdel", "--remove", name])
         if self.group_exists(name):
-            self.call(["/usr/sbin/groupdel", name])
+            self.remove_group(name)
 
 
 def system_for_platform() -> System:
@@ -471,7 +665,8 @@ def inspect(system: System, operator: str, shape: str,
     `entities` names the three-account shape's entities; it is ignored on
     shape two.
     """
-    accounts = accounts_for_shape(shape, list(entities))
+    accounts = accounts_for(shape, system.platform, list(entities))
+    no_login_names = no_login_account_names(system.platform)
     ssh_names = ssh_accounts(accounts)
     report = Report()
     missing: list[str] = []
@@ -513,6 +708,7 @@ def inspect(system: System, operator: str, shape: str,
                        "this command creates it", addable=True)
         else:
             mode = stat.S_IMODE(st.st_mode)
+            wanted_mode = home_mode_for(name, system.platform)
             report.add(
                 f"{name}'s home {account.home} is a directory",
                 stat.S_ISDIR(st.st_mode),
@@ -524,12 +720,19 @@ def inspect(system: System, operator: str, shape: str,
                 f"chown {name}:{name} {account.home}",
             )
             report.add(
-                f"{name}'s home reads drwxr-x--- (it reads {stat.filemode(st.st_mode)})",
-                mode == HOME_MODE,
-                f"chmod 750 {account.home}",
+                f"{name}'s home reads {stat.filemode(stat.S_IFDIR | wanted_mode)} "
+                f"(it reads {stat.filemode(st.st_mode)})",
+                mode == wanted_mode,
+                f"chmod {wanted_mode:o} {account.home}",
             )
 
-        if system.group_exists(name):
+        # THE OPERATOR NEVER JOINS A NO-LOGIN ACCOUNT'S GROUP. Agents and
+        # reviewers give the operator their group so session output can be
+        # read without sudo; the Library and Orient are each reached over
+        # their own network listener alone, and joining either's group would
+        # be exactly the filesystem access company decision 0025 point 5
+        # creates these accounts to deny.
+        if name not in no_login_names and system.group_exists(name):
             report.add(
                 f"{operator} is a member of {name}",
                 system.is_member(operator, name),
@@ -545,6 +748,50 @@ def inspect(system: System, operator: str, shape: str,
             if refuses is not None:
                 report.add(f"{name} refuses an empty password", refuses,
                            f"sudo passwd {name} (it prompts), then run this again")
+
+    # Orient's tunnel group and the socket's directory, on the same shapes as
+    # Orient's own account (LIBRARY_SHAPES): neither is an account, so
+    # neither is in `accounts`.
+    if shape in LIBRARY_SHAPES:
+        if not system.group_exists(ORIENT_TUNNEL_GROUP):
+            report.add(f"{ORIENT_TUNNEL_GROUP} exists", False,
+                       "this command creates it", addable=True)
+        else:
+            report.add(f"{ORIENT_TUNNEL_GROUP} exists", True)
+            report.add(
+                f"{operator} is a member of {ORIENT_TUNNEL_GROUP}",
+                system.is_member(operator, ORIENT_TUNNEL_GROUP),
+                "this command adds it", addable=True,
+            )
+            # THE GROUP IS THE SOCKET'S ACCESS BOUNDARY (the spec: "The group
+            # orient-tunnel holds only the account that runs cloudflared"), so
+            # an existing group that holds anyone else is the wrong shape,
+            # refused rather than corrected, the same as every account here.
+            extra = sorted(system.group_members(ORIENT_TUNNEL_GROUP) - {operator})
+            report.add(
+                f"{ORIENT_TUNNEL_GROUP} holds only {operator}"
+                + (f" (it also holds {', '.join(extra)})" if extra else ""),
+                not extra,
+                f"remove {', '.join(extra)} from {ORIENT_TUNNEL_GROUP}",
+            )
+        add_dir_rows(report, system, RUN_ROOT, ROOT_UID, ROOT_GID, RUN_ROOT_MODE, "root:root")
+        orient_name = orient_account_name(system.platform)
+        orient_account = present.get(orient_name)
+        tunnel_gid = system.group_gid(ORIENT_TUNNEL_GROUP)
+        if orient_account is not None and tunnel_gid is not None:
+            add_dir_rows(report, system, ORIENT_SOCKET_DIR, orient_account.uid, tunnel_gid,
+                        ORIENT_SOCKET_DIR_MODE, f"{orient_name}:{ORIENT_TUNNEL_GROUP}")
+        elif system.home_stat(ORIENT_SOCKET_DIR) is not None:
+            # A directory already sits there and neither the orient account
+            # nor orient-tunnel exists yet to verify it against (a leftover
+            # from an earlier run, or one made by hand). Refused, never
+            # corrected, rather than left unverified until both exist.
+            report.add(
+                f"{ORIENT_SOCKET_DIR} exists before {orient_name} and "
+                f"{ORIENT_TUNNEL_GROUP} are both ready to own it",
+                False,
+                f"move aside whatever is at {ORIENT_SOCKET_DIR}, then run this again",
+            )
 
     if system.ssh_group is not None:
         if not system.group_exists(system.ssh_group):
@@ -567,8 +814,12 @@ def inspect(system: System, operator: str, shape: str,
     # Isolation, asked by running `ls` as the account, so the row is about what
     # the account can do rather than what the modes say it should. Run once per
     # agents-type account present, against every other created account's home
-    # and the operator's — across entities as well as within one.
+    # and the operator's — across entities as well as within one. Orient's
+    # socket directory gets the same live probe once it exists, rather than
+    # resting on its static mode bits alone, which is what the home rows
+    # above already distrust on macOS (security review).
     operator_account = system.account(operator)
+    socket_dir_exists = shape in LIBRARY_SHAPES and system.home_stat(ORIENT_SOCKET_DIR) is not None
     for ssh_name in ssh_names:
         if ssh_name not in present:
             continue
@@ -583,6 +834,13 @@ def inspect(system: System, operator: str, shape: str,
                 not system.can_list(ssh_name, path),
                 f"{other}'s home {path} lets {ssh_name} in; nothing here changes "
                 f"another account's home",
+            )
+        if socket_dir_exists:
+            report.add(
+                f"as {ssh_name}, listing {ORIENT_SOCKET_DIR} is refused",
+                not system.can_list(ssh_name, ORIENT_SOCKET_DIR),
+                f"the orient socket directory {ORIENT_SOCKET_DIR} lets {ssh_name} in; "
+                f"nothing here changes it",
             )
 
     return report, missing
@@ -663,7 +921,8 @@ def isolation_failure(system: System, operator: str,
 def provision(system: System, operator: str, shape: str,
               entities: tuple[str, ...] = ("default",)) -> list[str]:
     """Create what is missing and add what is addable. Returns what changed."""
-    accounts = accounts_for_shape(shape, list(entities))
+    accounts = accounts_for(shape, system.platform, list(entities))
+    no_login_names = no_login_account_names(system.platform)
     report, missing = inspect(system, operator, shape, entities)
     refuse_wrong(report)
 
@@ -676,19 +935,24 @@ def provision(system: System, operator: str, shape: str,
 
     changed: list[str] = []
 
-    # Step 1: the account, its own primary group, a home with mode 750, and the
-    # hidden flag.
+    # Step 1: the account, its own primary group, a home, and the hidden flag.
+    # Every no-login account gets create_service_account and a tighter home
+    # mode; every other account in this shape is a login service account.
     for name in accounts:
         if name in missing:
-            system.create_account(name)
+            if name in no_login_names:
+                system.create_service_account(name)
+            else:
+                system.create_account(name)
             changed.append(f"created {name}")
         account = system.account(name)
         if account is None:
             raise Refused(f"{name} was created and the directory service does not have it.")
         st = system.home_stat(account.home)
         if name in missing or st is None:
-            system.make_home(account)
-            changed.append(f"set {name}'s home {account.home} to drwxr-x---")
+            mode = home_mode_for(name, system.platform)
+            system.make_home(account, mode=mode)
+            changed.append(f"set {name}'s home {account.home} to {stat.filemode(stat.S_IFDIR | mode)}")
         if system.hidden(name) is False:
             system.hide(name)
             changed.append(f"hid {name}")
@@ -706,8 +970,11 @@ def provision(system: System, operator: str, shape: str,
             f"Nothing was changed."
         )
 
-    # Step 3: the operator added to each account's group.
+    # Step 3: the operator added to each account's group, every no-login
+    # account excepted — see the matching row in inspect().
     for name in accounts:
+        if name in no_login_names:
+            continue
         if not system.is_member(operator, name):
             system.add_member(operator, name)
             changed.append(f"added {operator} to {name}")
@@ -727,12 +994,32 @@ def provision(system: System, operator: str, shape: str,
             system.add_member(ssh_name, system.ssh_group)
             changed.append(f"added {ssh_name} to {system.ssh_group}")
 
+    # Step 5: Orient's tunnel group, holding only the operator (who runs
+    # cloudflared on these shapes), and the socket's directory, on the same
+    # shapes Orient's own account is (LIBRARY_SHAPES). Neither is an account,
+    # so neither goes through steps 1 to 4.
+    if shape in LIBRARY_SHAPES:
+        if not system.group_exists(ORIENT_TUNNEL_GROUP):
+            system.create_group(ORIENT_TUNNEL_GROUP)
+            changed.append(f"created the {ORIENT_TUNNEL_GROUP} group")
+        if not system.is_member(operator, ORIENT_TUNNEL_GROUP):
+            system.add_member(operator, ORIENT_TUNNEL_GROUP)
+            changed.append(f"added {operator} to {ORIENT_TUNNEL_GROUP}")
+        if system.home_stat(RUN_ROOT) is None:
+            system.make_dir(RUN_ROOT, ROOT_UID, ROOT_GID, RUN_ROOT_MODE)
+            changed.append(f"created {RUN_ROOT}")
+        orient_account = system.account(orient_account_name(system.platform))
+        if orient_account is not None and system.home_stat(ORIENT_SOCKET_DIR) is None:
+            tunnel_gid = system.group_gid(ORIENT_TUNNEL_GROUP)
+            system.make_dir(ORIENT_SOCKET_DIR, orient_account.uid, tunnel_gid, ORIENT_SOCKET_DIR_MODE)
+            changed.append(f"created {ORIENT_SOCKET_DIR}")
+
     return changed
 
 
 def remove(system: System, shape: str, purge_homes: bool,
           entities: tuple[str, ...] = ("default",)) -> list[str]:
-    accounts = accounts_for_shape(shape, list(entities))
+    accounts = accounts_for(shape, system.platform, list(entities))
     changed: list[str] = []
     present = [n for n in accounts if system.account(n) is not None]
     # A home the account does not own is not this command's to delete: an
@@ -745,6 +1032,15 @@ def remove(system: System, shape: str, purge_homes: bool,
         st = system.home_stat(account.home)
         if st is not None and st.st_uid != account.uid:
             foreign.append(f"{account.home} (home of {name}, owned by uid {st.st_uid})")
+    # Orient's socket directory gets the same test, since --remove deletes
+    # it as root too: one Orient's account does not own, or one left with no
+    # Orient account to own it, is not this command's to delete.
+    if shape in LIBRARY_SHAPES:
+        st = system.home_stat(ORIENT_SOCKET_DIR)
+        orient = system.account(orient_account_name(system.platform))
+        if st is not None and (orient is None or st.st_uid != orient.uid):
+            foreign.append(f"{ORIENT_SOCKET_DIR} (Orient's socket directory, owned by uid "
+                           f"{st.st_uid})")
     if foreign:
         raise Refused(
             f"these homes are not owned by their accounts, so something else made "
@@ -753,10 +1049,13 @@ def remove(system: System, shape: str, purge_homes: bool,
             f"was removed."
         )
     full = [n for n in present if not system.home_is_empty(system.account(n).home)]
-    if full and not purge_homes:
+    orient_dir_full = (shape in LIBRARY_SHAPES and system.home_stat(ORIENT_SOCKET_DIR) is not None
+                      and not system.home_is_empty(ORIENT_SOCKET_DIR))
+    if (full or orient_dir_full) and not purge_homes:
+        not_empty = [system.account(n).home for n in full] + ([ORIENT_SOCKET_DIR] if orient_dir_full else [])
         raise Refused(
             f"these homes are not empty: "
-            f"{', '.join(system.account(n).home for n in full)}. Pass --purge-homes "
+            f"{', '.join(not_empty)}. Pass --purge-homes "
             f"to delete them with their accounts. Nothing was removed."
         )
     for name in present:
@@ -770,6 +1069,17 @@ def remove(system: System, shape: str, purge_homes: bool,
         # the home is gone and a later provision starts from nothing.
         system.remove_home(home)
         changed.append(f"removed {name} and its home {home}")
+
+    # Orient's tunnel group and socket directory, removed alongside its
+    # account. RUN_ROOT itself is left: a root-owned directory other steps
+    # not yet built also use.
+    if shape in LIBRARY_SHAPES:
+        if system.home_stat(ORIENT_SOCKET_DIR) is not None:
+            system.remove_home(ORIENT_SOCKET_DIR)
+            changed.append(f"removed {ORIENT_SOCKET_DIR}")
+        if system.group_exists(ORIENT_TUNNEL_GROUP):
+            system.remove_group(ORIENT_TUNNEL_GROUP)
+            changed.append(f"removed the {ORIENT_TUNNEL_GROUP} group")
     return changed
 
 
@@ -825,7 +1135,7 @@ def main(argv: list[str], system: System | None = None) -> int:
                 entities = ae.read_entities(args.install_json)
             except ae.EntitiesInvalid as exc:
                 raise Refused(str(exc))
-        accounts = accounts_for_shape(args.shape, entities)
+        accounts = accounts_for(args.shape, system.platform, entities)
         ssh_names = ssh_accounts(accounts)
 
         if args.remove:

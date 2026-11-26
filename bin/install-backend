@@ -264,6 +264,17 @@ def lockfile_for(name: str) -> str:
     return LOCKFILES.get(name, DEFAULT_LOCKFILE)
 
 
+# **HASH-PINNED SETUPTOOLS, FOR THE ONE CASE A `--no-binary` LOCKFILE LINE
+# NEEDS A BUILD TOOL THE VENV MAY NOT CARRY.** See the comment on the
+# `--no-build-isolation` pip call in `_fill_venv`: a package a lockfile
+# exempts from `--only-binary` builds from sdist with the venv's OWN
+# setuptools, which `ensurepip` puts in a 3.11 venv and leaves out of a 3.12
+# one. Ships beside this file, so it resolves the same way from an operator
+# clone and from the root-owned tree `install-privileged` extracts with
+# `git archive` — both lay `bin/` out identically.
+BUILD_TOOLS_LOCK = Path(__file__).resolve().parent / "install-backend-build-tools.lock.txt"
+
+
 class Refused(Exception):
     """Something a person has to decide about. Never a stack trace."""
 
@@ -501,9 +512,12 @@ def escapes(path: str) -> bool:
 def checked_members(members: list[tarfile.TarInfo]) -> list[tarfile.TarInfo]:
     """Every archive entry, or a refusal naming the first one that is wrong.
 
-    **This exists because `filter="data"` is unavailable on the platform this
-    installer targets** — Ubuntu 22.04's `python3.11` package is 3.11.0rc1 and
-    the filter landed in 3.11.4, so passing it raises `TypeError` there.
+    **This exists because `filter="data"` is unavailable on a supported
+    platform's own interpreter.** Debian 12's root steps run under its stock
+    `/usr/bin/python3`, 3.11.2, and the filter landed in 3.11.4, so passing it
+    there raises `TypeError`; Ubuntu 22.04's `python3.11` package, still
+    reachable through the explicit-interpreter fallback on an unsupported
+    machine, is the same release predating it (3.11.0rc1).
 
     **IT IS NOT THE WHOLE OF WHAT `data` DOES, AND AN EARLIER VERSION CLAIMED IT
     WAS.** A reviewer took that claim apart, and the useful part is that
@@ -718,10 +732,13 @@ def extract_checked(archive: Path, into: Path) -> int:
     root = os.path.realpath(into)
     with tarfile.open(archive) as tar:
         members = checked_members(tar.getmembers())
-        # `filter="data"` IS NOT AVAILABLE ON THE PLATFORM THIS TARGETS.
-        # Ubuntu 22.04's `python3.11` package is 3.11.0rc1 — measured in a
-        # container — and the filter was backported in 3.11.4, so passing
-        # it there raises `TypeError`. It is applied where it exists, as a
+        # `filter="data"` IS NOT AVAILABLE ON A SUPPORTED PLATFORM'S OWN
+        # INTERPRETER. Debian 12's stock `/usr/bin/python3` is 3.11.2 —
+        # measured in a container — and the filter was backported in 3.11.4,
+        # so passing it there raises `TypeError`; Ubuntu 22.04's `python3.11`
+        # package, still reachable through the explicit-interpreter fallback
+        # on an unsupported machine, is the same release predating it
+        # (3.11.0rc1). It is applied where it exists, as a
         # bonus rather than as the control.
         supports_filter = "filter" in inspect.signature(tarfile.TarFile.extract).parameters
         for member in members:
@@ -1388,6 +1405,25 @@ def build_venv(tree: Path, python: str, name: str, venv: Path | None = None,
     return f"{len(frozen.splitlines())} package(s) from {lockfile_name}"
 
 
+def _lockfile_needs_no_binary(lockfile: Path) -> bool:
+    """Whether `lockfile` exempts a package from `--only-binary` with its own
+    `--no-binary <name>` line (convivy-orient's lock has one, for `http_ece`,
+    which ships no wheel)."""
+    return re.search(r"(?m)^\s*--no-binary\b", lockfile.read_text(encoding="utf-8")) is not None
+
+
+def _venv_has_setuptools(venv: Path) -> bool:
+    """Whether the venv at `venv` can import setuptools, asked of ITS OWN
+    interpreter rather than the one that built it: a venv does not inherit
+    the outer interpreter's packages, so what `ensurepip` bootstrapped in is
+    what decides this, and that is a 3.11 venv but not a 3.12 one."""
+    try:
+        run(str(venv / "bin" / "python"), "-c", "import setuptools")
+    except Refused:
+        return False
+    return True
+
+
 def _fill_venv(tree: Path, venv: Path, python: str, program: Path | None,
                lockfile: Path, out_of_tree: bool) -> None:
     """Create the venv at `venv` and install `lockfile` into it, hash-checked.
@@ -1430,12 +1466,14 @@ def _fill_venv(tree: Path, venv: Path, python: str, program: Path | None,
     # development checkout into the deploy venv, which is precisely the
     # rule 4 failure this whole file exists to prevent.
     #
-    # **`--require-hashes`, AND NO OTHER `pip` CALL PRECEDES IT.** Every
+    # **`--require-hashes`, AND NO UNHASHED `pip` CALL PRECEDES IT.** Every
     # package this installs, `pip` included by `ensurepip` inside `python -m
     # venv`, has to come from something this venv already trusted before the
     # install ran — never a `pip install --upgrade pip` or a setuptools/wheel
     # bootstrap run unpinned ahead of the lockfile, which would be exactly the
     # unhashed install this whole change exists to remove, one step earlier.
+    # The hash-pinned setuptools install below, when it runs, is `--require-
+    # hashes` itself, so it does not reopen this.
     #
     # **`--only-binary :all:` AND `--no-build-isolation` BESIDE IT**, because
     # `--require-hashes` checks only what the lockfile names. When a wheel's
@@ -1445,8 +1483,10 @@ def _fill_venv(tree: Path, venv: Path, python: str, program: Path | None,
     # the fallback. A package that ships no wheel is exempted in its own
     # lockfile with a `--no-binary <name>` line (convivy-orient's `http_ece`),
     # and `--no-build-isolation` then builds it with the venv's own setuptools,
-    # which a Python 3.11 venv carries and a 3.12 one does not; on 3.12 that
-    # build fails here rather than reaching the index.
+    # which a Python 3.11 venv carries and a 3.12 one does not. **HANDLED
+    # BELOW**: on a venv with no setuptools, a hash-pinned wheel of it is
+    # installed first, with the same `--require-hashes --only-binary :all:`
+    # safety, from `BUILD_TOOLS_LOCK` rather than the index.
     #
     # **`--no-deps`, BECAUSE A LOCKFILE ALREADY NAMES EVERY PACKAGE AND THE
     # RESOLVER CAN ONLY MISREAD IT.** The pip 23.0.1 that Debian 12's Python 3.11
@@ -1455,6 +1495,10 @@ def _fill_venv(tree: Path, venv: Path, python: str, program: Path | None,
     # separately, and that pip's hash mode treats the extra as an unpinned
     # requirement. Skipping resolution also skips what caught a package missing
     # from the lockfile, so `pip check` below takes that job.
+    if _lockfile_needs_no_binary(lockfile) and not _venv_has_setuptools(venv):
+        run(str(pip), "install", "--quiet", "--disable-pip-version-check",
+            "--require-hashes", "--no-deps", "--only-binary", ":all:",
+            "-r", str(BUILD_TOOLS_LOCK), cwd=tree)
     run(str(pip), "install", "--quiet", "--disable-pip-version-check",
         "--require-hashes", "--no-deps", "--only-binary", ":all:",
         "--no-build-isolation", "-r", str(lockfile), cwd=tree)
@@ -1497,11 +1541,13 @@ def read_stamp(area: Path) -> dict | None:
         # **`RecursionError` IS A `RuntimeError`, NOT A `ValueError`**, so the
         # tuple above missed it and deeply nested JSON — `[` two hundred
         # thousand times — came out of `json.loads` as a traceback. Measured on
-        # 3.9.6 (stock macOS), 3.10.12 and 3.11.0rc1 (Ubuntu 22.04's two),
-        # 3.10.21, 3.11.16, 3.12.13, 3.13.15, 3.14.5 and 3.14.7: EVERY ONE
-        # raises it. **THE FIRST THREE ARE THE INTERPRETERS THIS FILE NAMES AS
-        # TARGETS ELSEWHERE, so a list that omits them cannot support a claim
-        # about what this command supports** — which is the shape a version
+        # 3.9.6 (stock macOS), 3.10.12 and 3.11.0rc1 (an old Ubuntu's stock
+        # `python3` and its `python3.11` package, the latter still reachable
+        # through the explicit-interpreter fallback on an unsupported
+        # machine), 3.10.21, 3.11.16, 3.12.13, 3.13.15, 3.14.5 and 3.14.7:
+        # EVERY ONE raises it. **THE FIRST THREE ARE INTERPRETERS THIS FILE
+        # MEASURES ELSEWHERE TOO, so a list that omits them cannot support a
+        # claim about what this command supports** — which is the shape a version
         # number takes when it is repeated from a message rather than run. Each
         # was measured, because a wrong one here would invite a later reader to
         # drop this handler as interpreter-specific.
@@ -2023,12 +2069,12 @@ def install_one(name: str, source: Path, area: Path, ref: str,
                 "source": str(source),
                 # `datetime.timezone.utc` RATHER THAN `datetime.UTC`, and it is
                 # not a style preference. `datetime.UTC` arrived in 3.11, and
-                # Ubuntu 22.04's stock `python3` is 3.10 — measured in a
-                # container, where this file would not even IMPORT:
+                # an old Ubuntu's stock `python3` is 3.10 — measured in a
+                # 22.04 container, where this file would not even IMPORT:
                 # `cannot import name 'UTC' from 'datetime'`. Every shebang
-                # here is `#!/usr/bin/env python3`, so on the platform this
-                # installer exists to support, that import decided the command
-                # could not run at all.
+                # here is `#!/usr/bin/env python3`, which resolves to whatever
+                # `python3` a machine has, so that import would decide the
+                # command could not run at all on one old enough.
                 "installed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "files": files,
             }, indent=2) + "\n",

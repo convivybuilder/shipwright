@@ -1,0 +1,961 @@
+#!/usr/bin/env python3
+"""hand-library-inputs — give the Library its code from root's trees and its
+data from agents, as copies.
+
+    sudo bin/hand-library-inputs               carry what is missing
+    sudo bin/hand-library-inputs --dry-run     say what would happen, change nothing
+    sudo bin/hand-library-inputs --check       report only; 1 if anything is still uncarried
+    sudo bin/hand-library-inputs --status      the same report, changing nothing
+
+**THE PROBLEM THIS CLOSES.** On the two- and three-account shapes the Library
+runs as its own service account, with a home no other account can read
+(company decision 0025 point 5). Its own job declaration, `jobs/library.toml`,
+names four inputs nothing has ever put where that account can see them: the
+script its `prepare` runs to mint a crew's ops credentials, the roster
+source its first load reads, the seed that stocks the projects registry the
+first time the Library's own database is empty, and the operator config
+file every backend service reads before it will start. Before this existed,
+each of those was agents' own copy or part of agents' own deploy area, which
+the Library's account can no longer reach at all. `jobs/library-backup.toml`
+names a fifth: `builder-backup` itself, which that job runs with
+`--library-only` to back up the Library's own database, cold store and blobs,
+and which — like the mint script — is not part of `agent-platform`'s own
+code, so nothing else ever places it under the Library account's home either.
+
+**WHAT IT CARRIES, AND FROM WHERE.**
+
+1. The mint script and `builder-backup`. Both ship in this tool's own tree —
+   the same root-owned copy `stand-up-backend` already runs the mint script
+   from — so each is read there directly and written into the Library
+   account's own `~/.local/bin`, where `jobs/library.toml`'s own `prepare`
+   and `jobs/library-backup.toml`'s own `command` look for them respectively.
+2. The roster source, a plain Python file read as data and never imported,
+   from the root-owned `agent-platform` tree root's own record names, into
+   the Library account's own deploy area, at the exact path its job
+   declaration's roster-load step already names. Only where that tree
+   exists: the three-account shape fetches it, and the two-account shape
+   does not yet, so this carries nothing for that input there rather than
+   guessing at a substitute.
+3. The projects registry seed and the operator config file, each read from
+   agents' own copy and written into the Library account's own state and
+   config directories, create-only — a file already there, from an earlier
+   run or from any other source, is left alone, byte for byte.
+4. The knowledge snapshot. A child running as agents resolves
+   `origin/main` to one commit, archives `projects/` out of that exact
+   commit, and lists that same commit first to refuse anything a symlink
+   or a submodule could smuggle in — a ref agents moves in between cannot
+   change what is extracted. A child running as the Library account
+   extracts that archive beside its own knowledge snapshot directory,
+   refuses the whole thing if tar actually wrote anything other than a
+   plain file or directory under it, and otherwise swaps it in whole by
+   rename, replacing whatever snapshot was there. This refreshes on every
+   run, not once: the Library's own listener later refreshes the git
+   bundle and the index, never this snapshot, so this is the only thing
+   that does.
+
+**WHY THIS RUNS AS ROOT, AND WHY IT NEVER READS OR WRITES A DESTINATION BY
+PATH AS ROOT.** Neither account's home is reachable from the other: the
+Library's is unreadable to everyone else, and agents' is not writable by the
+Library's account. Root is the only account that can reach both sides, but
+reading or writing a destination directly by path as root trusts whatever
+that account's own directory and file names actually are — a name root
+opened could be a symlink either account planted. So every read of agents'
+own files, and every read or write under the Library account's own home,
+happens in a process already dropped to that account's own uid and gid,
+with no supplementary group carried over, the same way
+`bin/deliver-library-credentials` already does it in the other direction.
+Only the root-owned trees under `/opt/builder/src` are ever read directly by
+this process while still root, because those are root's own. The mint
+script's and `builder-backup`'s shared shipwright tree, and the roster
+source's agent-platform tree, are the ones root's record names, and every
+component down to each file is checked as root's own here before anything
+is read from it.
+
+**ONLY ON THE SHAPES WHERE THE LIBRARY HAS ITS OWN ACCOUNT.** The
+single-account shape runs the Library as the operator, so `place` already
+puts every one of these where that account's job declaration looks; there is
+nothing here for it to carry, and no other account to carry it to. An
+install that has not yet provisioned the Library's own account gets the same
+answer, for the same reason.
+
+**REFUSES BEFORE READING OR WRITING ANYTHING**, naming the command that
+fixes it, when the mint script's own tree is missing (`install-privileged`),
+the roster source's tree exists in root's record but is missing the file
+that record promised, or a destination — the Library account's own home,
+agents' own home, or any single file or directory this writes under either
+— is a symlink or owned by the wrong account.
+
+**WHAT IT NEVER DOES.** It never reads the mint script, `builder-backup` or
+the roster source from agents' own clones — only from a root-owned tree, or
+not at all. It
+never overwrites the projects seed or the operator config once something is
+already there under those names; both are left alone, byte for byte. The
+knowledge snapshot is the one input this refreshes every run, swapped in
+whole rather than ever written into in place. It never mints anything, and
+the only thing it ever deletes is the old knowledge snapshot it just
+replaced.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+PROG = "hand-library-inputs"
+
+# BY ABSOLUTE PATH, the same rule `stand-up-backend` and `install-privileged`
+# already hold every root-run program to: a bare name resolves through PATH,
+# and an earlier PATH directory an account other than root can write would
+# supply the program root runs.
+GIT = "/usr/bin/git"
+TAR = "/usr/bin/tar"
+
+# Duplicated from `bin/provision-accounts`' own `LIBRARY_ACCOUNT_NAMES`
+# rather than imported, the same way `bin/deliver-library-credentials`
+# already duplicates it.
+AGENTS = "agents"
+LIBRARY_ACCOUNT_NAMES = {"macos": "_library", "linux": "library"}
+
+# Duplicated from `bin/stand-up-backend`'s own constants of the same name:
+# the root-owned prefix and root's own record of what is installed there,
+# `name sha` per line.
+PRIVILEGED_PREFIX = Path("/opt/builder")
+INSTALLED_RECORD = PRIVILEGED_PREFIX / "src" / "installed"
+ROOT_UID = 0
+SHA = re.compile(r"[0-9a-f]{40}")
+
+# Where each item lands under the Library account's own home.
+MINT_DEST = Path(".local", "bin", "mint-crew-ops-credentials")
+BACKUP_DEST = Path(".local", "bin", "builder-backup")
+ROSTER_DEST = Path(".local", "deploy", "agent-platform", "lib", "knowledge", "knowledge.py")
+SEED_DEST = Path(".local", "state", "library", "projects-registry-seed.json")
+OPERATOR_DEST = Path(".config", "convivy", "operator.json")
+KNOWLEDGE_SNAPSHOT_DEST = Path(".local", "state", "library", "knowledge")
+
+# Where the roster source lives inside the root-owned agent-platform tree,
+# and where agents' own copies of the data items live under its home.
+ROSTER_SOURCE_REL = Path("lib", "knowledge", "knowledge.py")
+AGENTS_SEED_REL = Path(".local", "state", "library", "projects-registry-seed.json")
+AGENTS_OPERATOR_REL = Path(".config", "convivy", "operator.json")
+AGENTS_SESSION_ENV_REL = Path(".config", "convivy", "session-agent.env")
+
+# `git ls-tree`'s own mode strings for a symbolic link and a submodule
+# (gitlink) — mirrors `install-privileged`'s own `LINK_MODES`, the check that
+# already keeps either out of a root-owned tree.
+LINK_MODES = {b"120000", b"160000"}
+KNOWLEDGE_ARCHIVE_PATH = "projects/"
+KNOWLEDGE_REF = "origin/main"
+
+CREWS_ROOT_RE = re.compile(r"^[ \t]*CREWS_ROOT[ \t]*=[ \t]*(.*)$")
+
+
+class Refused(Exception):
+    """Something the operator has to decide about. Never a stack trace."""
+
+
+class _Unreadable:
+    """Returned by `_read_guarded` for a path that exists but could not be
+    trusted as a regular file's content — a symlink, a FIFO, or anything
+    else that is not a plain file. Never equal to any bytes, including
+    another `_Unreadable` instance's, since the content behind it is
+    unknown."""
+
+    def __eq__(self, other):
+        return False
+
+    def __ne__(self, other):
+        return True
+
+
+UNREADABLE = _Unreadable()
+
+
+# --- accounts, duplicated from bin/deliver-library-credentials ---------------
+
+
+def library_account_name(platform: str | None = None) -> str:
+    platform = platform or ("macos" if sys.platform == "darwin" else "linux")
+    return LIBRARY_ACCOUNT_NAMES[platform]
+
+
+def account_home(name: str) -> str | None:
+    try:
+        return pwd.getpwnam(name).pw_dir
+    except KeyError:
+        return None
+
+
+def account_ids(name: str) -> tuple[int, int] | None:
+    try:
+        entry = pwd.getpwnam(name)
+    except KeyError:
+        return None
+    return entry.pw_uid, entry.pw_gid
+
+
+def owned_by(path: str, uid: int) -> bool:
+    """Whether `path` exists, is a real directory and is owned by `uid`.
+
+    Never follows a symlink: a symlink at an account's home would otherwise
+    read or write through it to wherever it points.
+    """
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return True  # nothing there yet is not foreign; it just does not exist
+    if stat.S_ISLNK(info.st_mode):
+        return False
+    return info.st_uid == uid
+
+
+# --- root's own record, duplicated from bin/stand-up-backend -----------------
+
+
+def installed_sha(record_text: str | None, name: str) -> str | None:
+    if record_text is None:
+        return None
+    for line in record_text.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0] == name and SHA.fullmatch(fields[1]):
+            return fields[1]
+    return None
+
+
+def _read_record(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _owned_by_root(path: Path) -> str | None:
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return f"{path} is missing"
+    if stat.S_ISLNK(info.st_mode) or info.st_uid != ROOT_UID or info.st_mode & 0o022:
+        return f"{path} is not owned by root alone, or another account can write it"
+    return None
+
+
+def root_tree_file_problem(path: Path) -> str | None:
+    """Why `path`, somewhere under a root-owned tree beneath
+    `PRIVILEGED_PREFIX`, must not be trusted, or None when every component
+    from it up to that prefix is.
+
+    Lighter than `stand-up-backend`'s own `tree_problem`: this reads one file
+    out of the tree and never executes anything in it, so only the path down
+    to that file needs checking, not everything beside it.
+    """
+    top = PRIVILEGED_PREFIX
+    for part in [path, *path.parents]:
+        if part == top or top in part.parents:
+            problem = _owned_by_root(part)
+            if problem:
+                return problem
+    return None
+
+
+# --- forking and dropping privileges, duplicated from the same tool ----------
+
+
+def _drop_privileges(uid: int, gid: int) -> None:
+    """Become `(uid, gid)` in THIS process, with no supplementary groups
+    carried over. Called only in a child that is about to do nothing else
+    but read or write into that account's own home."""
+    os.setgroups([])
+    os.setgid(gid)
+    os.setuid(uid)
+
+
+def run_as_account(uid: int, gid: int, action, *, drop=None):
+    """Run `action()` — a zero-argument callable returning a JSON-able value
+    — in a child that has dropped to `(uid, gid)` first, and return what it
+    returns, or raise `Refused` with what it raised.
+
+    `drop` is injected so a test that cannot become another account can stub
+    it, the same way `bin/deliver-library-credentials`'s own version of this
+    function already does.
+    """
+    if drop is None:
+        drop = _drop_privileges
+    read_fd, write_fd = os.pipe()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            drop(uid, gid)
+            result = action()
+            payload = json.dumps({"ok": True, "result": result}).encode("utf-8")
+        except BaseException as exc:
+            payload = json.dumps({"ok": False, "error": str(exc)}).encode("utf-8")
+        try:
+            with os.fdopen(write_fd, "wb") as out:
+                out.write(len(payload).to_bytes(8, "big"))
+                out.write(payload)
+        finally:
+            os._exit(0)
+    os.close(write_fd)
+    with os.fdopen(read_fd, "rb") as inp:
+        header = inp.read(8)
+        size = int.from_bytes(header, "big") if header else 0
+        data = inp.read(size) if size else b""
+    os.waitpid(pid, 0)
+    decoded = json.loads(data.decode("utf-8")) if data else {"ok": False, "error": "the child reported nothing"}
+    if not decoded.get("ok"):
+        raise Refused(decoded.get("error") or "the child failed silently")
+    return decoded.get("result")
+
+
+# --- reading and writing, guarded against a symlink or a FIFO ----------------
+
+
+def _read_guarded(path: Path) -> bytes | None | _Unreadable:
+    """`path`'s bytes if it is a regular file, reached without following a
+    symlink at its own name and without blocking on a FIFO with no writer.
+    `None` for missing; `UNREADABLE` for a symlink, a FIFO, or anything else
+    that is not a plain regular file — never trusted as content either way.
+    """
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return UNREADABLE
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return UNREADABLE
+        with os.fdopen(fd, "rb") as handle:
+            return handle.read()
+    except OSError:
+        return UNREADABLE
+
+
+def _read_root_owned(path: Path) -> bytes:
+    """`path`'s bytes, trusted because it lives in a root-owned tree whose
+    ownership the caller already verified. Refuses to follow a symlink at
+    the file's own name regardless, as a last line of defence against a
+    tree that changed underneath this process."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise Refused(f"could not read {path}: {exc.strerror or exc}. Nothing was carried.") from exc
+    with os.fdopen(fd, "rb") as handle:
+        return handle.read()
+
+
+def _ensure_dirs(path: Path) -> None:
+    """Create every missing component of `path`, refusing at the first
+    symlink or non-directory found along the way. Runs only inside a child
+    already dropped to the destination account's own uid and gid, so every
+    directory created here is owned by that account."""
+    if path.is_symlink() or (path.exists() and not path.is_dir()):
+        raise Refused(f"refusing to use {path}: it is not a plain directory. Nothing was carried.")
+    if path.exists():
+        return
+    _ensure_dirs(path.parent)
+    try:
+        path.mkdir(0o700)
+    except FileExistsError:
+        pass
+
+
+def _create_only(dest: Path, data: bytes, perm: int) -> bool:
+    """Write `data` to `dest` only if nothing is there yet. Returns whether
+    it wrote. A symlink or any non-regular node already at the name is
+    refused, never silently left or written through; a regular file already
+    there, whatever its content, is left alone byte for byte — the
+    create-only rule the design states for data agents already holds a copy
+    of."""
+    try:
+        info = os.lstat(dest)
+    except FileNotFoundError:
+        pass
+    else:
+        if stat.S_ISLNK(info.st_mode):
+            raise Refused(f"refusing to use {dest}: it is a symlink, not the file itself. Nothing was carried.")
+        if not stat.S_ISREG(info.st_mode):
+            raise Refused(f"refusing to use {dest}: something other than a regular file is there. "
+                          f"Nothing was carried.")
+        return False
+    # Written whole under a temporary name, then linked into place. A write
+    # that fails part way (a full disk, which agents can cause, since every
+    # home shares one filesystem) leaves only the temporary file, which is
+    # removed, so the next run still sees the name free. Writing straight to
+    # `dest` would leave a truncated file the create-only rule never retries.
+    # `os.link` fails if `dest` appeared meanwhile, keeping the rule.
+    tmp = dest.parent / (dest.name + ".carrying")
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    fd = os.open(str(tmp), os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, perm)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        os.link(tmp, dest, follow_symlinks=False)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+    return True
+
+
+def _write_if_different(dest: Path, data: bytes, perm: int) -> bool:
+    """Write `data` to `dest`, atomically, only if it is not already there.
+    A symlink or any non-regular node already at the name is refused, never
+    written through."""
+    try:
+        info = os.lstat(dest)
+    except FileNotFoundError:
+        info = None
+    if info is not None:
+        if stat.S_ISLNK(info.st_mode):
+            raise Refused(f"refusing to use {dest}: it is a symlink, not the file itself. Nothing was carried.")
+        if not stat.S_ISREG(info.st_mode):
+            raise Refused(f"refusing to use {dest}: something other than a regular file is there. "
+                          f"Nothing was carried.")
+    existing = _read_guarded(dest)
+    if existing == data:
+        return False
+    tmp = dest.parent / (dest.name + ".carrying")
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    fd = os.open(str(tmp), os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, perm)
+    with os.fdopen(fd, "wb") as out:
+        out.write(data)
+    os.replace(tmp, dest)
+    return True
+
+
+# --- the code items: the mint script, and the roster source on shape three ---
+
+
+def default_mint_script(record_text: str | None) -> Path:
+    """`payload/bin/mint-crew-ops-credentials` in the root-owned shipwright
+    tree root's record names. Never resolved from this file's own location:
+    a copy run from a checkout another account can edit would otherwise
+    hand the Library that account's code."""
+    sha = installed_sha(record_text, "shipwright")
+    if sha is None:
+        raise Refused(f"{INSTALLED_RECORD} names no shipwright commit, so there is no root-owned "
+                      f"mint script to carry. Re-run install-privileged. Nothing was carried.")
+    return PRIVILEGED_PREFIX / "src" / f"shipwright@{sha}" / "payload" / "bin" / "mint-crew-ops-credentials"
+
+
+def default_backup_script(record_text: str | None) -> Path:
+    """`payload/bin/builder-backup` in the same root-owned shipwright tree
+    `default_mint_script` reads from — `jobs/library-backup.toml`'s own copy,
+    never `{deploy}/builder-payload`'s, which the Library account cannot
+    reach at all."""
+    sha = installed_sha(record_text, "shipwright")
+    if sha is None:
+        raise Refused(f"{INSTALLED_RECORD} names no shipwright commit, so there is no root-owned "
+                      f"builder-backup to carry. Re-run install-privileged. Nothing was carried.")
+    return PRIVILEGED_PREFIX / "src" / f"shipwright@{sha}" / "payload" / "bin" / "builder-backup"
+
+
+def load_mint_script(script: Path | None = None, record_text: str | None = None) -> bytes:
+    """The mint script's bytes. With no `script`, it is the copy in root's
+    shipwright tree, and every component down to it must be root's own."""
+    if script is None:
+        script = default_mint_script(record_text)
+        problem = root_tree_file_problem(script)
+        if problem:
+            raise Refused(f"{problem}. Re-run install-privileged. Nothing was carried.")
+    if not script.is_file():
+        raise Refused(f"{script} does not exist; this release's own copy is missing. Nothing was carried.")
+    return _read_root_owned(script)
+
+
+def load_backup_script(script: Path | None = None, record_text: str | None = None) -> bytes:
+    """`builder-backup`'s bytes, the same way `load_mint_script` reads the
+    mint script: from root's shipwright tree alone, with no `script` given."""
+    if script is None:
+        script = default_backup_script(record_text)
+        problem = root_tree_file_problem(script)
+        if problem:
+            raise Refused(f"{problem}. Re-run install-privileged. Nothing was carried.")
+    if not script.is_file():
+        raise Refused(f"{script} does not exist; this release's own copy is missing. Nothing was carried.")
+    return _read_root_owned(script)
+
+
+def agent_platform_tree(record_text: str | None) -> Path | None:
+    """The root-owned `agent-platform` tree root's record names, or None
+    when the record names none — the ordinary case on the two-account
+    shape, which does not fetch that repository yet."""
+    sha = installed_sha(record_text, "agent-platform")
+    if sha is None:
+        return None
+    return PRIVILEGED_PREFIX / "src" / f"agent-platform@{sha}"
+
+
+def load_roster_source(record_text: str | None) -> bytes | None:
+    """The roster source's bytes, or None when the tree that would hold it
+    is not fetched on this shape at all. A tree that IS recorded but does
+    not hold the file, or is not root's own, is a refusal — that is a
+    broken or tampered install, never an ordinary absence."""
+    tree = agent_platform_tree(record_text)
+    if tree is None:
+        return None
+    source = tree / ROSTER_SOURCE_REL
+    problem = root_tree_file_problem(source)
+    if problem:
+        raise Refused(f"{problem}. Re-run install-privileged. Nothing was carried.")
+    if not source.is_file():
+        raise Refused(f"{source} is missing, so there is no roster source to carry. "
+                      f"Re-run install-privileged. Nothing was carried.")
+    return _read_root_owned(source)
+
+
+# --- the data items: the projects seed and the operator config file ----------
+
+
+def _read_agents_side(agents_home: Path) -> dict:
+    """Everything this reads FROM agents — called only inside a child
+    already dropped to agents' own uid and gid. Each file's bytes cross back
+    to root as base64, inside the JSON `run_as_account` already carries;
+    `None` for a missing, symlinked, or otherwise untrusted source — a
+    planted link on agents' side never supplies fake content, it simply
+    leaves the Library's own side with nothing to carry for that item."""
+    seed = _read_guarded(agents_home / AGENTS_SEED_REL)
+    operator = _read_guarded(agents_home / AGENTS_OPERATOR_REL)
+    return {
+        "projects_seed": base64.b64encode(seed).decode("ascii") if isinstance(seed, bytes) else None,
+        "operator_config": base64.b64encode(operator).decode("ascii") if isinstance(operator, bytes) else None,
+    }
+
+
+def _b64_decode(value: str | None) -> bytes | None:
+    return base64.b64decode(value) if value is not None else None
+
+
+def library_items(mint_bytes: bytes, backup_bytes: bytes, roster_bytes: bytes | None,
+                  seed_bytes: bytes | None, operator_bytes: bytes | None) -> list[tuple]:
+    """`(name, dest, data, kind, perm)` for every item this hands to the
+    Library account. `kind` is `"diff"` (write when the destination
+    differs — code, which a later release may replace) or `"create"` (write
+    only when the destination is absent — data agents already holds a copy
+    of, per the design's create-only rule)."""
+    items = [
+        ("mint-crew-ops-credentials", MINT_DEST, mint_bytes, "diff", 0o700),
+        ("builder-backup", BACKUP_DEST, backup_bytes, "diff", 0o700),
+    ]
+    if roster_bytes is not None:
+        items.append(("knowledge.py", ROSTER_DEST, roster_bytes, "diff", 0o644))
+    if seed_bytes is not None:
+        items.append(("projects-registry-seed.json", SEED_DEST, seed_bytes, "create", 0o600))
+    if operator_bytes is not None:
+        items.append(("operator.json", OPERATOR_DEST, operator_bytes, "create", 0o600))
+    return items
+
+
+def plan_in_library(library_home: Path, items: list[tuple]) -> list[str]:
+    """Which of `items` the Library account does not yet hold as given.
+    Called only inside a child already dropped to the Library account's own
+    uid and gid. Writes nothing."""
+    pending = []
+    for name, dest, data, kind, _perm in items:
+        existing = _read_guarded(library_home / dest)
+        if kind == "create":
+            if existing is None or existing is UNREADABLE:
+                pending.append(name)
+        elif existing != data:
+            pending.append(name)
+    return pending
+
+
+def do_in_library(library_home: Path, items: list[tuple]) -> list[str]:
+    """Write every pending item in `items`, and return the names actually
+    written. Called only inside a child already dropped to the Library
+    account's own uid and gid."""
+    written = []
+    for name, dest, data, kind, perm in items:
+        full = library_home / dest
+        _ensure_dirs(full.parent)
+        wrote = _create_only(full, data, perm) if kind == "create" else _write_if_different(full, data, perm)
+        if wrote:
+            written.append(name)
+    return written
+
+
+# --- the knowledge snapshot ---------------------------------------------------
+
+
+def _crews_root(agents_home: Path) -> str | None:
+    """The Builder root agents' own `root()` resolves to — read the same
+    way it does: the first `CREWS_ROOT=` line of agents' own
+    `session-agent.env`, not through the linked `builder-root` command,
+    which is not placed yet when this step runs (`link` runs after it)."""
+    content = _read_guarded(agents_home / AGENTS_SESSION_ENV_REL)
+    if not isinstance(content, bytes):
+        return None
+    for line in content.decode("utf-8", "replace").splitlines():
+        match = CREWS_ROOT_RE.match(line)
+        if match:
+            value = match.group(1).rstrip(" \t")
+            return value or None
+    return None
+
+
+def knowledge_repo_path(agents_home: Path) -> str | None:
+    """The knowledge repository agents already holds, or None when agents
+    has no recorded Builder root yet, or no repository under it — both
+    ordinary on a machine where this step runs before that repository
+    exists."""
+    root = _crews_root(agents_home)
+    if root is None or not os.path.isabs(root):
+        return None
+    repo = Path(root) / "knowledge"
+    if not (repo / ".git").is_dir():
+        return None
+    return str(repo)
+
+
+def refused_knowledge_entries(listing: bytes) -> str | None:
+    """Why the knowledge archive must be refused whole, or None when every
+    entry under `projects/` is a plain file or directory at a path that
+    stays under it. Mirrors `install-privileged`'s own `extract()`: a
+    symlink or a submodule (gitlink) entry is refused outright, and so is a
+    path carrying a `..` component, which a crafted tree object could still
+    hold even though an ordinary commit never produces one."""
+    for entry in listing.split(b"\0"):
+        if not entry:
+            continue
+        meta, _, path = entry.partition(b"\t")
+        mode = meta.split(b" ")[0]
+        text = path.decode("utf-8", "replace")
+        if mode in LINK_MODES:
+            kind = "a symbolic link" if mode == b"120000" else "a submodule (gitlink)"
+            return f"the knowledge archive holds {text!r} as {kind}"
+        if text.startswith("/") or any(part == ".." for part in Path(text).parts):
+            return f"the knowledge archive holds {text!r}, which escapes its own directory"
+    return None
+
+
+def resolve_knowledge_commit(repo: str) -> str:
+    """The commit `origin/main` names in `repo` at this instant, resolved
+    once so the same commit is both checked and archived — a ref agents
+    moves between those two steps can no longer change what is extracted.
+    Refuses anything git reports that is not exactly 40 lowercase hex
+    characters. Called only inside a child already dropped to agents' own
+    uid and gid."""
+    done = subprocess.run(
+        [GIT, "-C", repo, "rev-parse", "--verify", f"{KNOWLEDGE_REF}^{{commit}}"],
+        capture_output=True, check=False,
+    )
+    if done.returncode != 0:
+        raise Refused(f"git could not resolve {KNOWLEDGE_REF} in the knowledge repository: "
+                      f"{done.stderr.decode('utf-8', 'replace').strip()}. Nothing was carried.")
+    commit = done.stdout.decode("ascii", "replace").strip()
+    if not SHA.fullmatch(commit):
+        raise Refused(f"git reported {commit!r} for {KNOWLEDGE_REF}, not a 40-character lowercase hex "
+                      f"commit. Nothing was carried.")
+    return commit
+
+
+def refused_knowledge_entries_for(repo: str, commit: str) -> str | None:
+    """`refused_knowledge_entries`, fed by listing `commit` under
+    `projects/` — the same commit `resolve_knowledge_commit` already
+    resolved `origin/main` to, never the ref again, so a ref agents moves
+    after that point cannot change what this lists. Called only inside a
+    child already dropped to agents' own uid and gid."""
+    done = subprocess.run(
+        [GIT, "-C", repo, "ls-tree", "-r", "-z", "--full-tree", commit, "--", KNOWLEDGE_ARCHIVE_PATH],
+        capture_output=True, check=False,
+    )
+    if done.returncode != 0:
+        return (f"git could not list {KNOWLEDGE_ARCHIVE_PATH} at {commit} in the knowledge repository: "
+                f"{done.stderr.decode('utf-8', 'replace').strip()}")
+    return refused_knowledge_entries(done.stdout)
+
+
+def refused_extracted_entries(staged: Path) -> str | None:
+    """Why the tree tar just extracted under `staged` must be refused
+    whole, or None when every entry inside it is a plain file or directory
+    at a path that stays under it. Checks what tar actually wrote rather
+    than only what `refused_knowledge_entries_for` listed beforehand — the
+    check that holds whatever tar was fed, however that differs from the
+    stream the listing looked at. Called only inside a child already
+    dropped to the Library account's own uid and gid."""
+    root = staged.resolve()
+    for dirpath, dirnames, filenames in os.walk(staged, followlinks=False):
+        for name in dirnames + filenames:
+            path = Path(dirpath) / name
+            info = os.lstat(path)
+            if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                return f"the extracted knowledge snapshot holds {path}, which is not a plain file or directory"
+            real = path.resolve()
+            if real != root and root not in real.parents:
+                return f"the extracted knowledge snapshot holds {path}, which escapes its own directory"
+    return None
+
+
+def _swap_in_knowledge_snapshot(staged: Path, dest: Path) -> None:
+    """Put `staged` at `dest`, whole. When nothing is there yet, a plain
+    rename does it. When a previous snapshot already is — the ordinary
+    case on a rerun — rename it aside first, rename `staged` into `dest`,
+    then remove the one set aside; if that second rename fails, rename the
+    old one back so `dest` is never left missing. Runs only inside a child
+    already dropped to the Library account's own uid and gid, after
+    `refused_extracted_entries` has already passed."""
+    if not dest.exists():
+        os.rename(staged, dest)
+        return
+    old = dest.parent / f".{dest.name}.old-{os.getpid()}"
+    os.rename(dest, old)
+    try:
+        os.rename(staged, dest)
+    except OSError:
+        os.rename(old, dest)
+        raise
+    shutil.rmtree(old, ignore_errors=True)
+
+
+def _knowledge_state(dest: Path) -> str:
+    """`"absent"`, `"present"` (a plain directory already there — due for
+    a refresh, not left alone), or `"occupied"` (something else is there —
+    refused). Called only inside a child already dropped to the Library
+    account's own uid and gid."""
+    try:
+        info = os.lstat(dest)
+    except FileNotFoundError:
+        return "absent"
+    if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+        return "present"
+    return "occupied"
+
+
+def _run_archive_pipeline(agents_uid: int, agents_gid: int, repo: str, commit: str,
+                          library_uid: int, library_gid: int, dest: Path, drop, verb: str) -> str:
+    """Fork a child as agents that archives `commit` under `projects/` to a
+    pipe — the same commit `refused_knowledge_entries_for` already
+    checked, never `origin/main` again, so a ref agents moves in between
+    cannot change what is extracted — and a child as the Library account
+    that extracts that pipe beside `dest`, refuses the whole thing unless
+    every entry tar actually wrote is a plain file or directory that stays
+    under it, and otherwise swaps it in whole by rename. Root only forks
+    the two children and waits on them — it never opens either end of the
+    pipe itself, and never reads or writes `dest` directly."""
+    read_fd, write_fd = os.pipe()
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    archive_pid = os.fork()
+    if archive_pid == 0:
+        os.close(read_fd)
+        try:
+            drop(agents_uid, agents_gid)
+            os.dup2(write_fd, 1)
+        except BaseException:
+            os._exit(1)
+        os.close(write_fd)
+        try:
+            os.execv(GIT, [GIT, "-C", repo, "archive", "--format=tar", commit, "--", KNOWLEDGE_ARCHIVE_PATH])
+        except OSError:
+            pass
+        os._exit(1)
+    os.close(write_fd)
+
+    staged = dest.parent / f".{dest.name}.new-{archive_pid}"
+    sys.stdout.flush()
+    sys.stderr.flush()
+    extract_pid = os.fork()
+    if extract_pid == 0:
+        try:
+            drop(library_uid, library_gid)
+            _ensure_dirs(dest.parent)
+            staged.mkdir(mode=0o700)
+            os.dup2(read_fd, 0)
+            os.close(read_fd)
+            done = subprocess.run([TAR, "-x", "-f", "-", "-C", str(staged)], cwd="/", check=False)
+            if done.returncode != 0:
+                raise RuntimeError(f"tar exited {done.returncode} while extracting the knowledge archive")
+            problem = refused_extracted_entries(staged)
+            if problem:
+                raise RuntimeError(problem)
+            _swap_in_knowledge_snapshot(staged, dest)
+        except BaseException as exc:
+            print(f"{PROG}: could not seed the knowledge snapshot: {exc}", file=sys.stderr)
+            shutil.rmtree(staged, ignore_errors=True)
+            os._exit(1)
+        os._exit(0)
+    os.close(read_fd)
+
+    _, archive_status = os.waitpid(archive_pid, 0)
+    _, extract_status = os.waitpid(extract_pid, 0)
+    if extract_status != 0 or archive_status != 0:
+        raise Refused(f"could not seed the Library's own knowledge snapshot from {repo}; "
+                      f"see the error above. Nothing was carried.")
+    return f"{verb} {dest} from {repo}@{commit}"
+
+
+def carry_knowledge_snapshot(agents_uid: int, agents_gid: int, agents_home: Path,
+                             library_uid: int, library_gid: int, library_home: Path,
+                             *, dry_run: bool, drop=None) -> str:
+    """Refresh the Library's own knowledge snapshot from agents' own
+    knowledge repository — a one-line report of what happened or would
+    happen. Runs every time the operator reruns this step, replacing
+    whatever plain directory is already there whole, by rename, never
+    leaving a partial tree visible: the profile load that reads this
+    directory deletes a project's rows when its directory is missing, so a
+    half-written one must never be seen.
+    """
+    drop = drop or _drop_privileges
+    dest = library_home / KNOWLEDGE_SNAPSHOT_DEST
+    state = run_as_account(library_uid, library_gid, lambda: _knowledge_state(dest), drop=drop)
+    if state == "occupied":
+        raise Refused(f"refusing to use {dest}: something other than a plain directory is there. "
+                      f"Nothing was carried.")
+    repo = run_as_account(agents_uid, agents_gid, lambda: knowledge_repo_path(agents_home), drop=drop)
+    if repo is None:
+        return "agents has no knowledge repository yet (or no recorded Builder root); nothing to seed"
+    if dry_run:
+        verb = "would refresh" if state == "present" else "would seed"
+        return f"{verb} {dest} from {repo}"
+    commit = run_as_account(agents_uid, agents_gid, lambda: resolve_knowledge_commit(repo), drop=drop)
+    problem = run_as_account(agents_uid, agents_gid, lambda: refused_knowledge_entries_for(repo, commit), drop=drop)
+    if problem:
+        raise Refused(f"{problem}. Nothing was carried.")
+    verb = "refreshed" if state == "present" else "seeded"
+    return _run_archive_pipeline(agents_uid, agents_gid, repo, commit, library_uid, library_gid, dest, drop, verb)
+
+
+def knowledge_pending(agents_uid: int, agents_gid: int, agents_home: Path,
+                      library_uid: int, library_gid: int, library_home: Path, drop=None) -> bool:
+    drop = drop or _drop_privileges
+    dest = library_home / KNOWLEDGE_SNAPSHOT_DEST
+    state = run_as_account(library_uid, library_gid, lambda: _knowledge_state(dest), drop=drop)
+    if state != "absent":
+        return False
+    repo = run_as_account(agents_uid, agents_gid, lambda: knowledge_repo_path(agents_home), drop=drop)
+    return repo is not None
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Give the Library its own code from root's trees and its own data from agents, as copies.",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="say what would happen, change nothing")
+    mode.add_argument("--check", action="store_true", help="report only; 1 if anything is still uncarried")
+    mode.add_argument("--status", action="store_true", help="the same report, changing nothing")
+    args = parser.parse_args(argv)
+
+    if os.geteuid() != 0:
+        print(f"{PROG}: refusing — this needs root, to read root's own trees and reach both "
+              f"the Library's account and agents'. Nothing was carried.", file=sys.stderr)
+        return 2
+
+    library_name = library_account_name()
+    library_home_str = account_home(library_name)
+    if library_home_str is None:
+        print(f"{PROG}: no {library_name} account on this machine — nothing to carry. Either "
+              f"this is the single-account shape, where the Library runs as the operator, or "
+              f"the Library's own account has not been provisioned yet.")
+        return 0
+
+    agents_home_str = account_home(AGENTS)
+    if agents_home_str is None:
+        print(f"{PROG}: refusing — {library_name} exists but {AGENTS} does not. Run "
+              f"provision-accounts with this shape first. Nothing was carried.", file=sys.stderr)
+        return 2
+
+    library_ids = account_ids(library_name)
+    agents_ids = account_ids(AGENTS)
+    assert library_ids is not None and agents_ids is not None  # just resolved by name above
+
+    if not owned_by(library_home_str, library_ids[0]):
+        owner = os.lstat(library_home_str).st_uid
+        print(f"{PROG}: refusing — {library_home_str} (home of {library_name}) is owned by uid "
+              f"{owner}, not its own account. Something else made it; this will not read from "
+              f"it or write into it. Nothing was carried.", file=sys.stderr)
+        return 2
+    if not owned_by(agents_home_str, agents_ids[0]):
+        owner = os.lstat(agents_home_str).st_uid
+        print(f"{PROG}: refusing — {agents_home_str} (home of {AGENTS}) is owned by uid "
+              f"{owner}, not its own account. Something else made it; this will not read from "
+              f"it. Nothing was carried.", file=sys.stderr)
+        return 2
+
+    library_home = Path(library_home_str)
+    agents_home = Path(agents_home_str)
+    library_uid, library_gid = library_ids
+    agents_uid, agents_gid = agents_ids
+
+    try:
+        record_text = _read_record(INSTALLED_RECORD)
+        mint_bytes = load_mint_script(record_text=record_text)
+        backup_bytes = load_backup_script(record_text=record_text)
+        roster_bytes = load_roster_source(record_text)
+        agents_data = run_as_account(agents_uid, agents_gid, lambda: _read_agents_side(agents_home))
+    except Refused as exc:
+        print(f"{PROG}: refusing — {exc}", file=sys.stderr)
+        return 2
+
+    seed_bytes = _b64_decode(agents_data.get("projects_seed"))
+    operator_bytes = _b64_decode(agents_data.get("operator_config"))
+    items = library_items(mint_bytes, backup_bytes, roster_bytes, seed_bytes, operator_bytes)
+
+    try:
+        if args.check or args.status:
+            pending = run_as_account(library_uid, library_gid, lambda: plan_in_library(library_home, items))
+            snap_pending = knowledge_pending(agents_uid, agents_gid, agents_home,
+                                             library_uid, library_gid, library_home)
+            if pending:
+                print(f"{PROG}: {len(pending)} input(s) not yet carried: {', '.join(pending)}")
+            else:
+                print(f"{PROG}: every code and data input this hands the Library is carried")
+            # A present snapshot is carried, so `--check` passes on it, but it is
+            # not final: every run replaces it whole from the current commit.
+            print(f"{PROG}: the knowledge snapshot is "
+                  f"{'not yet seeded' if snap_pending else 'present; every run refreshes it whole'}")
+            return 1 if (args.check and (pending or snap_pending)) else 0
+
+        if args.dry_run:
+            pending = run_as_account(library_uid, library_gid, lambda: plan_in_library(library_home, items))
+            for name, _dest, _data, _kind, _perm in items:
+                verb = "would carry" if name in pending else "already carries"
+                print(f"{PROG}: {verb} {name}")
+            snapshot_report = carry_knowledge_snapshot(
+                agents_uid, agents_gid, agents_home, library_uid, library_gid, library_home, dry_run=True)
+            print(f"{PROG}: {snapshot_report}")
+            return 0
+
+        written = run_as_account(library_uid, library_gid, lambda: do_in_library(library_home, items))
+        if written:
+            for name in written:
+                print(f"{PROG}: carried {name}")
+        else:
+            print(f"{PROG}: nothing to carry — the Library already has every code and data "
+                  f"input this hands it")
+        snapshot_report = carry_knowledge_snapshot(
+            agents_uid, agents_gid, agents_home, library_uid, library_gid, library_home, dry_run=False)
+        print(f"{PROG}: {snapshot_report}")
+    except Refused as exc:
+        print(f"{PROG}: refusing — {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

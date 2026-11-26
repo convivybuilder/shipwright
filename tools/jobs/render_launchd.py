@@ -16,7 +16,7 @@ from __future__ import annotations
 import plistlib
 
 from . import accounts
-from .declaration import MONTHS, WEEKDAYS, CalendarTime, Job
+from .declaration import MONTHS, WEEKDAYS, CalendarTime, Job, effective_account
 
 # launchd numbers Sunday 0. The declaration writes the name, so this table is
 # the only place the number appears, and it is read in one direction only.
@@ -53,7 +53,8 @@ def to_plist_dict(job: Job, directory: accounts.Directory | None = None) -> dict
     """The property list as a dictionary, for rendering or for comparison.
 
     A job with an `account` reads that account from `directory` and refuses
-    if it is missing.
+    if it is missing — `account-macos` in its place when the job names one,
+    since this is always the launchd side.
     """
     if not job.runs_on("macos"):
         raise ValueError(
@@ -66,7 +67,8 @@ def to_plist_dict(job: Job, directory: accounts.Directory | None = None) -> dict
     }
     environment = dict(job.environment)
     if job.account is not None:
-        account = accounts.require(job.account, job.source, directory or accounts.lookup)
+        name = effective_account(job, "macos")
+        account = accounts.require(name, job.source, directory or accounts.lookup)
         plist["UserName"] = account.name
         plist["GroupName"] = account.group
         plist["Umask"] = ACCOUNT_UMASK

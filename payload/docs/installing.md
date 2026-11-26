@@ -1,6 +1,6 @@
 # Installing Builder
 
-_Last checked against Builder 0.7.1, on 2026-11-08._
+_Last checked against Builder 0.8.0, on 2026-11-26._
 
 These pages install Builder's current release; the first public release was 0.6.0, and [the release
 notes](release-notes.md) say what each release changed. Builder ships from five public
@@ -89,14 +89,21 @@ later by hand; [Connecting
 GitHub](connecting-github.md) covers both the install's own step and the manual command, and the
 rest of what connects the App to your repositories.
 
-To install the three-account shape instead of the default single account, add `--shape three`. It
-needs administrator rights and one of the server platforms [Supported setups](supported-setups.md)
-lists (Debian 12, Ubuntu 22.04 or macOS 26); the install checks both before changing anything and
-names what is missing. It then creates the `agents` and `reviewers` accounts, the root-owned
-privileged half, and the backend, each as the account that step needs, and running it again
-finishes or repairs the install exactly as the single-account shape does. This shape has not been
-rehearsed end to end on a real machine yet; [What does not work yet](install-status.md)
-says so.
+To install the two-account shape instead of the default single account, add `--shape two`. It runs
+Builder as one account of its own, `agents`, with reviews also running as `agents` rather than a
+separate account, so one account both writes a change and reviews it; that shape's review findings
+are called advice, in those words, because a coder can steer what the reviewer sees. It needs
+administrator rights and one of the server platforms [Supported setups](supported-setups.md) lists
+(Debian 12, Ubuntu 24.04 or macOS 26); the install checks both before changing anything and names
+what is missing. It then creates the `agents` account, the root-owned privileged half pinned to the
+release's commits, and the backend, and running it again finishes or repairs the install exactly as
+the single-account shape does. This shape has not been rehearsed end to end on a real machine yet;
+[What does not work yet](install-status.md) says so.
+
+This shape's merge rule is not in this release either. It needs two GitHub rulesets on `main`, one
+that refuses every update except a pull request you merge, and the command that would print and
+check them, `github-gate --shape two`, is not built. Merge each pull request yourself, from another
+device, through GitHub's own web page, rather than from a command this install prints.
 
 The `agents` account must not be able to read your home. If your home is readable by other
 accounts, as it can be on a stock Debian 12, the install refuses and says so. Close it first:
@@ -104,6 +111,17 @@ accounts, as it can be on a stock Debian 12, the install refuses and says so. Cl
 ```
 chmod 750 ~
 ```
+
+```
+curl -fsSL https://convivybuilder.org/install.sh | sh -s -- --shape two
+```
+
+To install the three-account shape instead, add `--shape three`. It needs the same administrator
+rights and supported platform, and the same closed home. It then creates the `agents` and
+`reviewers` accounts, the root-owned privileged half, and the backend, each as the account that
+step needs, and running it again finishes or repairs the install exactly as the single-account
+shape does. This shape has been rehearsed end to end on Debian 12 and macOS 26 test machines;
+[What does not work yet](install-status.md) lists what has not.
 
 ```
 curl -fsSL https://convivybuilder.org/install.sh | sh -s -- --shape three
@@ -472,6 +490,45 @@ copy of a working token.
 already holding a credential of that name and no file to show for it.** Run `mint-crew-ops-credentials`
 again rather than minting by hand: it reports every pair this way and prints the exact `--replace`
 command for each one it cannot complete, naming the crew, the file and the grant.
+
+### A crew registered after the install has no ops credentials
+
+This is specific to an install where the Library runs as its own account (`sudo
+bin/provision-accounts --shape two` or `--shape three`). There, `new-crew`'s own `mint-crew-ops-credentials` call
+fails right after registering the crew, refusing on the database not existing or not opening: that
+database belongs to the Library's own account, and a crew's session, which is what runs
+`mint-crew-ops-credentials` there, is a different account and cannot open it.
+
+Run this instead, as root, from the root-owned tree `install-privileged` extracted — never the
+operator's own checkout. Each commit installed is extracted into its own tree, named
+`/opt/builder/src/shipwright@<that commit>`, and an update that has run `install-privileged`
+again can leave more than one such tree in place, so find the one root actually runs by reading
+`/opt/builder/src/installed`, which names the commit, rather than listing the directory:
+
+```bash
+grep '^shipwright ' /opt/builder/src/installed
+```
+
+It prints one line, `shipwright <commit>`. Then run `deliver-library-credentials` from the tree at
+that commit, with the absolute interpreter root runs it with, `/opt/homebrew/bin/python3.11` on a
+Mac and `/usr/bin/python3` on Linux:
+
+```bash
+sudo /opt/homebrew/bin/python3.11 -I /opt/builder/src/shipwright@<the commit named above>/bin/deliver-library-credentials
+```
+
+It mints the new crew's ops-credential pair as the Library's own account — where the crew's
+session cannot — and delivers it to `agents` in the same step. To confirm, as the crew's own
+session, check the pair directly rather than running `mint-crew-ops-credentials` again: its
+`main()` reads the Library's own database before it looks at any file, so it refuses again for
+the same reason it did the first time.
+
+```bash
+test -s ~/.orient-control/ops-co-<crew>-token && echo present || echo missing
+```
+
+The operator can confirm the same thing, still as root, by adding `--check` to the command
+above; it reports what is still undelivered and changes nothing.
 
 ### `claude mcp list` shows `kb` and `ops` as connected, and their tools fail
 

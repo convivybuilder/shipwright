@@ -1,0 +1,38 @@
+name = "library-backup"
+description = "Backs up the Library's own database, cold store and blobs every six hours, verified, into a destination under the Library account's own home, on the shapes where the Library has its own account. agents' own backup job never gets a readable copy of these."
+label = "com.convivy.library-backup"
+command = [
+  "{python}",
+  "{bin}/builder-backup",
+  "--library-only",
+  "--library-state", "{state}/library",
+  "--dest", "{state}/builder-backup",
+]
+platforms = ["macos", "linux"]
+scope = "system"
+account = "library"
+# `_library` on macOS: see jobs/library.toml's own account-macos comment.
+account-macos = "_library"
+# THE SINGLE-ACCOUNT SHAPE ALREADY BACKS UP THE LIBRARY, in the same pass
+# jobs/builder-backup.toml runs as the operator; converting this job to run
+# as the operator too would back up the same three files a second time. See
+# tools/jobs/FORMAT.md, "account-only".
+account-only = true
+enabled-by-default = true
+
+[log]
+stdout = "{state}/library-backup.log"
+stderr = "{state}/library-backup.log"
+
+# `{bin}/builder-backup` IS CARRIED HERE BY `bin/hand-library-inputs`, the same
+# way it carries `mint-crew-ops-credentials` into this account's own
+# `.local/bin` — the Library's own account cannot read `agents`' deploy area,
+# so this is never `{deploy}/builder-payload/bin/builder-backup`, which is
+# where jobs/builder-backup.toml finds its own copy.
+[environment]
+HOME = "{home}"
+PATH = "{bin}:/usr/bin:/bin"
+
+[schedule]
+at-load = true
+every-seconds = 21600

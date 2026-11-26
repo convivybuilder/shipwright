@@ -7,7 +7,9 @@ command = [
 ]
 platforms = ["macos", "linux"]
 scope = "system"
-account = "agents"
+account = "orient"
+# `_orient` on macOS: see jobs/orient.toml's own account-macos comment.
+account-macos = "_orient"
 enabled-by-default = false
 working-directory = "{deploy}/convivy-orient"
 

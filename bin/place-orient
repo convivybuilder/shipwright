@@ -1,0 +1,802 @@
+#!/usr/bin/env python3
+"""place-orient — put Orient's own code in its own account's deploy area,
+link the commands its job runs by bare name into its own `{bin}`, and give
+it its own copy of `builder-backup`, all from root's trees.
+
+    sudo bin/place-orient               place and link what is missing
+    sudo bin/place-orient --dry-run     say what would happen, change nothing
+    sudo bin/place-orient --check       report only; 1 if anything is still pending
+    sudo bin/place-orient --status      the same report, changing nothing
+
+**THE PROBLEM THIS CLOSES.** Orient moves to a no-login account of its own
+(company decision 0025 point 5),
+with a home no other account can read. Nothing has ever placed Orient's own
+code there, given its job the `agentctl` and `python3.11` it runs by bare
+name through `jobs/orient.toml`'s own `{bin}:/usr/bin:/bin` — `link-commands`
+only ever links into `agents`' own `~/.local/bin` — or given
+`jobs/orient-backup.toml` the `{bin}/builder-backup` it names, which is not
+part of `agent-platform`'s own code, so nothing else ever places it under
+Orient's own account either.
+
+**WHAT IT DOES, IN THREE PARTS.**
+
+1. **Placement.** `install-privileged` extracts Orient's commit into a
+   root-owned tree under `/opt/builder/src` and records it. This runs
+   `bin/install-backend --from-tree`, naming that tree, as `sudo -u`
+   Orient's own account — the same way `bin/stand-up-backend`'s own
+   `place-library` step places the Library's code: never as root, and
+   never from a checkout `agents` can edit.
+2. **The `{bin}` links.** Root reads where `agentctl` and the right
+   `python3.11` already live — the root-owned `agent-platform` tree
+   `install-privileged` recorded, and, on a Mac, the checksum-verified
+   standalone CPython it extracted; on Linux, root's own system
+   interpreter — and, when Orient's own `tailnet.json` says its tailnet
+   listener is on, wherever `tailscale` is on root's own PATH. It then
+   writes each link through a child dropped to Orient's own account, the
+   same way `bin/hand-library-inputs` already writes into the Library
+   account's own home, so every link is owned by that account and
+   nothing outside it chooses what `agentctl` resolves to. The job's PATH
+   line, `{bin}:/usr/bin:/bin`, does not change.
+3. **Orient's own copy of `builder-backup`.** Root reads `payload/bin/
+   builder-backup` from the same root-owned shipwright tree
+   `bin/hand-library-inputs` already reads it from for the Library
+   account, and writes it into Orient's own `{bin}` as a copy — never a
+   link into a tree `agents` can write, since Orient's job would then run
+   whatever that account last put at that name.
+
+**ONLY ON THE SHAPES WHERE ORIENT HAS ITS OWN ACCOUNT.** The single-account
+shape runs Orient as the operator, where `place` already puts its code
+where its job looks and its job never names a `{bin}`-only command by a
+bare name needing a link or a copy of its own; there is nothing here to do.
+An install that has not yet provisioned Orient's own account gets the same
+answer, for the same reason.
+
+**REFUSES BEFORE CHANGING ANYTHING**, naming the command that fixes it,
+when root's own record of Orient's code, of `agent-platform`, of the
+shipwright tree `builder-backup` ships in, or (on a Mac) of the pinned
+Python is missing, or the tree one of them names is gone.
+
+**ON AN INSTALL THAT FOLLOWS ORIENT'S MAIN, PLACEMENT IS THE DEPLOY STEP'S.**
+When root's `install.json` holds `"follow_orient_main": true`, root's
+`orient-deploy` places every merge it accepts, so this places the `{bin}` links
+and leaves Orient's code alone rather than putting the install record's older
+commit back.
+
+**IDEMPOTENT.** A link already pointing at the wanted target is left alone;
+one pointing elsewhere is replaced, atomically, so a later release's tree
+move is picked up on a rerun. Orient's own copy of `builder-backup` is left
+alone once its bytes already match this release's own copy, and replaced,
+atomically, once they do not. Anything else at either name — a real file
+where a link belongs, a symlink where a copy belongs, a directory — is
+refused rather than clobbered. Placement is `install-backend`'s own
+idempotence: it reports "nothing changed" when the deploy area already
+matches the named tree.
+
+**WHAT IT NEVER DOES.** It never reads Orient's code or `builder-backup`
+from `agents`' own checkout, only from the root-owned trees
+`install-privileged` extracted. It never reads or writes Orient's own home
+directly as root — only through a child already dropped to that account's
+own uid and gid, the one exception being the placement subprocess itself,
+which `sudo -u` drops before it runs a line of Orient's own code.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pwd
+import re
+import secrets
+import shutil
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+PROG = "place-orient"
+REPO = Path(__file__).resolve().parent.parent
+
+# Duplicated from `bin/provision-accounts`' own `ORIENT_ACCOUNT_NAMES`
+# rather than imported, the same way `bin/hand-library-inputs` already
+# duplicates `LIBRARY_ACCOUNT_NAMES`.
+ORIENT_ACCOUNT_NAMES = {"macos": "_orient", "linux": "orient"}
+
+SUDO = "/usr/bin/sudo"
+
+# Duplicated from `bin/stand-up-backend`'s own constants of the same name:
+# the root-owned prefix, root's own record of what is installed there
+# (`name sha` per line, or `python <version> <sha256>`), and the versioned
+# binary `install-privileged` extracts the pinned standalone CPython to.
+PRIVILEGED_PREFIX = Path("/opt/builder")
+INSTALLED_RECORD = PRIVILEGED_PREFIX / "src" / "installed"
+# Root's install settings. On an install that follows Orient's main, root's
+# `orient-deploy` places every merge, and the record's commit is older than
+# what it serves, so placing the record's commit here would move the site
+# backward under the deploy step's feet.
+INSTALL_CONFIG = PRIVILEGED_PREFIX / "install.json"
+FOLLOW_ORIENT_MAIN_KEY = "follow_orient_main"
+SHA = re.compile(r"[0-9a-f]{40}")
+SHA256 = re.compile(r"[0-9a-f]{64}")
+# A plain version string: no path separator, no `..` traversal, no leading
+# `-` — the record's own `python <version> <sha256>` line is joined straight
+# into a path under PRIVILEGED_PREFIX, and nothing else validates it first.
+VERSION = re.compile(r"(?!-)(?!.*\.\.)[^/]+")
+PINNED_PYTHON_BIN = "python3.11"
+# **NO SEPARATE PINNED INTERPRETER ON LINUX, AND NONE NEEDED ON A MAC EITHER.**
+# `python3.11` on Linux links straight to root's own system one, the same
+# interpreter `bin/stand-up-backend`'s and `bin/migrate-library-account`'s own
+# `ROOT_INTERPRETERS` already name for root's Linux steps. A Mac has no entry
+# here at all: `python_target` links to the checksum-verified standalone
+# CPython install-privileged recorded instead, never a Homebrew path.
+ROOT_INTERPRETERS = {"linux": "/usr/bin/python3"}
+
+# Duplicated from `bin/stand-up-backend`'s own `ROOT_UID`/`ROOT_TOP` and
+# `_owned_by`/`ancestry_problem`: every component of a root-owned path this
+# trusts for execution across an account boundary, up to `top`, must belong
+# to `owner` alone, with no group or other write bit, and must not be a
+# symlink. `agentctl_target()` and `python_target()` build the exact path
+# shape `library_python_args()` already applies this to for the Library's
+# own venv interpreter — a `.is_file()` check alone would still follow a
+# symlink planted at any ancestor, or trust a file another account can write.
+ROOT_UID = 0
+ROOT_TOP = Path("/")
+
+
+def _owned_by(path: Path, owner: int) -> str | None:
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return f"{path} is missing"
+    if stat.S_ISLNK(st.st_mode) or st.st_uid != owner or st.st_mode & 0o022:
+        return f"{path} is not owned by uid {owner} alone, or another account can write it"
+    return None
+
+
+def ancestry_problem(path: Path, owner: int, top: Path) -> str | None:
+    """Why `path` is not trusted as `owner`'s alone, or None when it is.
+
+    Every component from `path` up to and including `top` must belong to
+    `owner` with no group or other write bit and must not be a symlink.
+    """
+    for part in [path, *path.parents]:
+        if part == top or top in part.parents:
+            problem = _owned_by(part, owner)
+            if problem:
+                return problem
+    return None
+
+# The Mac app's own CLI, tried as a fallback the same way
+# `bin/stand-up-backend`'s own `tailscale_candidates` already does: the app
+# puts nothing on PATH until its own settings add it.
+TAILSCALE_APP_CLI = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+
+# Where Orient's own tailnet.json lives once its job's `{state}` resolves
+# against its own account (`jobs/orient.toml`'s `ORIENT_CONFIG_ROOT`,
+# `{state}/orient`, and `{state}` defaulting to `{home}/.local/state`).
+ORIENT_STATE_REL = Path(".local", "state", "orient")
+TAILNET_JSON_NAME = "tailnet.json"
+
+# Where each link, and Orient's own copy of builder-backup, land under
+# Orient's own home.
+BIN_REL = Path(".local", "bin")
+BACKUP_DEST = BIN_REL / "builder-backup"
+
+
+class Refused(Exception):
+    """Something the operator has to decide about. Never a stack trace."""
+
+
+# --- accounts, duplicated from bin/hand-library-inputs ------------------------
+
+
+def platform_name() -> str:
+    return "macos" if sys.platform == "darwin" else "linux"
+
+
+def orient_account_name(platform: str | None = None) -> str:
+    return ORIENT_ACCOUNT_NAMES[platform or platform_name()]
+
+
+def account_home(name: str) -> str | None:
+    try:
+        return pwd.getpwnam(name).pw_dir
+    except KeyError:
+        return None
+
+
+def account_ids(name: str) -> tuple[int, int] | None:
+    try:
+        entry = pwd.getpwnam(name)
+    except KeyError:
+        return None
+    return entry.pw_uid, entry.pw_gid
+
+
+def owned_by(path: str, uid: int) -> bool:
+    """Whether `path` exists, is a real directory and is owned by `uid`.
+
+    Never follows a symlink: a symlink at an account's home would otherwise
+    read or write through it to wherever it points.
+    """
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return True  # nothing there yet is not foreign; it just does not exist
+    if stat.S_ISLNK(info.st_mode):
+        return False
+    return info.st_uid == uid
+
+
+# --- root's own record, duplicated from bin/stand-up-backend -----------------
+
+
+def _read_record(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def installed_sha(record_text: str | None, name: str) -> str | None:
+    if record_text is None:
+        return None
+    for line in record_text.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0] == name and SHA.fullmatch(fields[1]):
+            return fields[1]
+    return None
+
+
+def installed_python(record_text: str | None) -> str | None:
+    """The version on root's own `python <version> <sha256>` line, or None.
+
+    The version is checked against `VERSION` here, before any caller joins
+    it into a path: a record this loose about its own shape is not a line
+    this trusts, the same as a malformed sha256 already is not.
+    """
+    if record_text is None:
+        return None
+    for line in record_text.splitlines():
+        fields = line.split()
+        if (len(fields) == 3 and fields[0] == "python" and SHA256.fullmatch(fields[2])
+                and VERSION.fullmatch(fields[1])):
+            return fields[1]
+    return None
+
+
+def _owned_by_root(path: Path) -> str | None:
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return f"{path} is missing"
+    if stat.S_ISLNK(info.st_mode) or info.st_uid != ROOT_UID or info.st_mode & 0o022:
+        return f"{path} is not owned by root alone, or another account can write it"
+    return None
+
+
+def root_tree_file_problem(path: Path) -> str | None:
+    """Why `path`, somewhere under a root-owned tree beneath
+    `PRIVILEGED_PREFIX`, must not be trusted, or None when every component
+    from it up to that prefix is. Duplicated from
+    `bin/hand-library-inputs`'s own version of this function."""
+    top = PRIVILEGED_PREFIX
+    for part in [path, *path.parents]:
+        if part == top or top in part.parents:
+            problem = _owned_by_root(part)
+            if problem:
+                return problem
+    return None
+
+
+def _read_root_owned(path: Path) -> bytes:
+    """`path`'s bytes, trusted because it lives in a root-owned tree whose
+    ownership the caller already verified. Refuses to follow a symlink at
+    the file's own name regardless, as a last line of defence against a
+    tree that changed underneath this process."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise Refused(f"could not read {path}: {exc.strerror or exc}. Nothing was placed.") from exc
+    with os.fdopen(fd, "rb") as handle:
+        return handle.read()
+
+
+def follows_orient_main(config_text: str | None) -> bool:
+    """Whether install.json turns root's deploy step on. Only the JSON value
+    `true` does; a missing, unreadable or malformed file does not."""
+    if config_text is None:
+        return False
+    try:
+        data = json.loads(config_text)
+    except ValueError:
+        return False
+    return isinstance(data, dict) and data.get(FOLLOW_ORIENT_MAIN_KEY) is True
+
+
+def orient_tree(record_text: str | None) -> tuple[Path, str]:
+    """The root-owned tree `install-privileged` extracted Orient's commit
+    into, and that commit — refused, naming the fix, when the record has
+    no line for it or the tree it names is gone."""
+    sha = installed_sha(record_text, "convivy-orient")
+    if sha is None:
+        raise Refused(
+            f"{INSTALLED_RECORD} names no convivy-orient commit, so there is no tree to "
+            f"place Orient from. Run `sudo bin/install-privileged --shape three`, which "
+            f"extracts and records one. Nothing was placed.")
+    tree = PRIVILEGED_PREFIX / "src" / f"convivy-orient@{sha}"
+    if not tree.is_dir():
+        raise Refused(
+            f"{tree} is missing, so there is no Orient tree to place. Run "
+            f"`sudo bin/install-privileged --shape three`, which extracts one. "
+            f"Nothing was placed.")
+    return tree, sha
+
+
+def agentctl_target(record_text: str | None) -> Path:
+    """`bin/agentctl` in the root-owned `agent-platform` tree
+    `install-privileged` extracted and recorded — never `agents`' own
+    deploy area, which `link-commands` populates instead.
+
+    Re-checked with `ancestry_problem()` before being trusted: Orient's job
+    runs this by bare name through a link into its own `{bin}`, so an
+    `is_file()` check alone would still follow a symlink planted at any
+    ancestor, or trust a file another account can write.
+    """
+    sha = installed_sha(record_text, "agent-platform")
+    if sha is None:
+        raise Refused(
+            f"{INSTALLED_RECORD} names no agent-platform commit, so there is no agentctl "
+            f"to link. Run `sudo bin/install-privileged --shape three`, which extracts "
+            f"and records one. Nothing was linked.")
+    target = PRIVILEGED_PREFIX / "src" / f"agent-platform@{sha}" / "bin" / "agentctl"
+    if not target.is_file():
+        raise Refused(f"{target} is missing. Re-run install-privileged. Nothing was linked.")
+    problem = ancestry_problem(target, ROOT_UID, ROOT_TOP)
+    if problem:
+        raise Refused(
+            f"{target} is not a target this may link agentctl to: {problem}. Re-run "
+            f"install-privileged. Nothing was linked.")
+    return target
+
+
+def python_target(record_text: str | None, platform: str) -> Path:
+    """`python3.11`'s own link target: the pinned standalone CPython on a
+    Mac, root's own system interpreter on Linux.
+
+    The Mac branch is re-checked with `ancestry_problem()` before being
+    trusted, the same as `agentctl_target()` and `bin/stand-up-backend`'s own
+    `library_python_args()` — the identical path shape, trusted for the same
+    reason.
+    """
+    if platform != "macos":
+        return Path(ROOT_INTERPRETERS["linux"])
+    version = installed_python(record_text)
+    if version is None:
+        raise Refused(
+            f"{INSTALLED_RECORD} names no pinned Python, so there is no interpreter to "
+            f"link python3.11 to. Run `sudo bin/install-privileged --shape three`, which "
+            f"installs and records one. Nothing was linked.")
+    target = PRIVILEGED_PREFIX / "python" / version / "bin" / PINNED_PYTHON_BIN
+    if not target.is_file():
+        raise Refused(f"{target} is missing. Re-run install-privileged. Nothing was linked.")
+    problem = ancestry_problem(target, ROOT_UID, ROOT_TOP)
+    if problem:
+        raise Refused(
+            f"{target} is not an interpreter this may link python3.11 to: {problem}. "
+            f"Re-run install-privileged. Nothing was linked.")
+    return target
+
+
+def default_backup_script(record_text: str | None) -> Path:
+    """`payload/bin/builder-backup` in the root-owned shipwright tree
+    root's record names — the same tree `bin/hand-library-inputs`'s own
+    `default_backup_script` already reads it from for the Library
+    account. Never resolved from this file's own location: a copy run
+    from a checkout `agents` can edit would otherwise hand Orient that
+    account's code."""
+    sha = installed_sha(record_text, "shipwright")
+    if sha is None:
+        raise Refused(
+            f"{INSTALLED_RECORD} names no shipwright commit, so there is no root-owned "
+            f"builder-backup to place. Run `sudo bin/install-privileged --shape three`, "
+            f"which extracts and records one. Nothing was placed.")
+    return PRIVILEGED_PREFIX / "src" / f"shipwright@{sha}" / "payload" / "bin" / "builder-backup"
+
+
+def load_backup_script(script: Path | None = None, record_text: str | None = None) -> bytes:
+    """`builder-backup`'s bytes, read only from the root-owned shipwright
+    tree, with no `script` given — never from `agents`' own checkout."""
+    if script is None:
+        script = default_backup_script(record_text)
+        problem = root_tree_file_problem(script)
+        if problem:
+            raise Refused(f"{problem}. Re-run install-privileged. Nothing was placed.")
+    if not script.is_file():
+        raise Refused(f"{script} does not exist; this release's own copy is missing. Nothing was placed.")
+    return _read_root_owned(script)
+
+
+def tailscale_candidates(which=shutil.which) -> list[str]:
+    """Mirrors `bin/stand-up-backend`'s own `tailscale_candidates`:
+    whatever `tailscale` root's own PATH finds, with the Mac app's own CLI
+    as a fallback."""
+    found = which("tailscale")
+    return [p for p in (found, TAILSCALE_APP_CLI) if p]
+
+
+def tailscale_target(which=shutil.which) -> Path | None:
+    """Wherever `tailscale` is on root's own PATH, or None when it is
+    nowhere this looks."""
+    for candidate in tailscale_candidates(which):
+        if os.access(candidate, os.X_OK):
+            return Path(candidate)
+    return None
+
+
+# --- forking and dropping privileges, duplicated from the same tool ----------
+
+
+def _drop_privileges(uid: int, gid: int) -> None:
+    """Become `(uid, gid)` in THIS process, with no supplementary groups
+    carried over. Called only in a child that is about to do nothing else
+    but read or write into that account's own home."""
+    os.setgroups([])
+    os.setgid(gid)
+    os.setuid(uid)
+
+
+def run_as_account(uid: int, gid: int, action, *, drop=None):
+    """Run `action()` — a zero-argument callable returning a JSON-able
+    value — in a child that has dropped to `(uid, gid)` first, and return
+    what it returns, or raise `Refused` with what it raised. Duplicated
+    from `bin/hand-library-inputs`'s own version of this function.
+    """
+    if drop is None:
+        drop = _drop_privileges
+    read_fd, write_fd = os.pipe()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            drop(uid, gid)
+            result = action()
+            payload = json.dumps({"ok": True, "result": result}).encode("utf-8")
+        except BaseException as exc:
+            payload = json.dumps({"ok": False, "error": str(exc)}).encode("utf-8")
+        try:
+            with os.fdopen(write_fd, "wb") as out:
+                out.write(len(payload).to_bytes(8, "big"))
+                out.write(payload)
+        finally:
+            os._exit(0)
+    os.close(write_fd)
+    with os.fdopen(read_fd, "rb") as inp:
+        header = inp.read(8)
+        size = int.from_bytes(header, "big") if header else 0
+        data = inp.read(size) if size else b""
+    os.waitpid(pid, 0)
+    decoded = json.loads(data.decode("utf-8")) if data else {"ok": False, "error": "the child reported nothing"}
+    if not decoded.get("ok"):
+        raise Refused(decoded.get("error") or "the child failed silently")
+    return decoded.get("result")
+
+
+# --- the {bin} links, written only inside a child dropped to Orient's own --
+
+
+def _ensure_dirs(path: Path) -> None:
+    """Create every missing component of `path`, refusing at the first
+    symlink or non-directory found along the way. Runs only inside a child
+    already dropped to Orient's own uid and gid, so every directory
+    created here is owned by that account."""
+    if path.is_symlink() or (path.exists() and not path.is_dir()):
+        raise Refused(f"refusing to use {path}: it is not a plain directory. Nothing was linked.")
+    if path.exists():
+        return
+    _ensure_dirs(path.parent)
+    try:
+        path.mkdir(0o700)
+    except FileExistsError:
+        pass
+
+
+def _link_state(link: Path, target: str) -> str:
+    """"ok" (already the wanted link), "pending" (absent, or a symlink
+    pointing elsewhere), or "occupied" (something else is at that name)."""
+    try:
+        info = os.lstat(link)
+    except FileNotFoundError:
+        return "pending"
+    if not stat.S_ISLNK(info.st_mode):
+        return "occupied"
+    return "ok" if os.readlink(link) == target else "pending"
+
+
+def plan_orient_links(home: Path, items: list[tuple[str, str]]) -> tuple[list[str], list[str]]:
+    """`(pending, occupied)` names from `items` as `(name, target)`. Called
+    only inside a child already dropped to Orient's own uid and gid.
+    Writes nothing."""
+    bin_dir = home / BIN_REL
+    pending, occupied = [], []
+    for name, target in items:
+        state = _link_state(bin_dir / name, target)
+        if state == "pending":
+            pending.append(name)
+        elif state == "occupied":
+            occupied.append(name)
+    return pending, occupied
+
+
+def _atomic_symlink(link: Path, target: str) -> None:
+    """Create or replace the symlink at `link`, atomically, pointing at
+    `target` — the same staging-name-and-rename technique
+    `bin/link-commands`'s own `link_one` uses, so a reader checking this
+    link's name never sees it half-written. Runs only inside a child
+    already dropped to Orient's own uid and gid."""
+    prefix = f".{link.name}.place-orient."
+    for _ in range(8):
+        staging = link.with_name(prefix + secrets.token_hex(8))
+        try:
+            os.symlink(target, staging)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise Refused(f"could not create a staging name for {link} after 8 attempts. Nothing was linked.")
+    try:
+        os.replace(staging, link)
+    except OSError as exc:
+        try:
+            os.unlink(staging)
+        except OSError:
+            pass
+        raise Refused(f"could not create {link}: {exc.strerror or exc}. Nothing was linked.") from None
+
+
+def do_orient_links(home: Path, items: list[tuple[str, str]]) -> list[str]:
+    """Create or replace every pending link; refuse, naming it, at the
+    first one occupied by something other than a symlink. Called only
+    inside a child already dropped to Orient's own uid and gid."""
+    bin_dir = home / BIN_REL
+    _ensure_dirs(bin_dir)
+    written = []
+    for name, target in items:
+        link = bin_dir / name
+        state = _link_state(link, target)
+        if state == "occupied":
+            raise Refused(
+                f"refusing to use {link}: something other than a symlink is there. Nothing was linked.")
+        if state == "pending":
+            _atomic_symlink(link, target)
+            written.append(name)
+    return written
+
+
+# --- Orient's own copy of builder-backup, written the same way -------------
+
+
+def _read_guarded(path: Path) -> bytes | None:
+    """`path`'s bytes, read without following a symlink at its own name.
+    `None` for missing. Called only after the caller has already
+    confirmed, via `lstat`, that a plain regular file is there — this is
+    a last line of defence against a swap in between."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, "rb") as handle:
+        return handle.read()
+
+
+def _backup_state(dest: Path, data: bytes) -> str:
+    """"ok" (a plain regular file already there holding exactly `data`),
+    "pending" (absent, or present with different bytes), or "occupied"
+    (a symlink or anything else at that name — refused, never clobbered,
+    the same rule `_link_state` already holds the `{bin}` links to)."""
+    try:
+        info = os.lstat(dest)
+    except FileNotFoundError:
+        return "pending"
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return "occupied"
+    return "ok" if _read_guarded(dest) == data else "pending"
+
+
+def plan_orient_backup(home: Path, data: bytes) -> str:
+    """`_backup_state` for Orient's own copy of `builder-backup`. Called
+    only inside a child already dropped to Orient's own uid and gid.
+    Writes nothing."""
+    return _backup_state(home / BACKUP_DEST, data)
+
+
+def do_orient_backup(home: Path, data: bytes) -> bool:
+    """Write Orient's own copy of `builder-backup`, atomically, when it
+    is missing or its bytes differ from `data`; leave it alone when they
+    already match. Refuses, naming it, when anything other than a plain
+    file is at that name. Returns whether it wrote. Called only inside a
+    child already dropped to Orient's own uid and gid."""
+    dest = home / BACKUP_DEST
+    state = _backup_state(dest, data)
+    if state == "occupied":
+        raise Refused(f"refusing to use {dest}: something other than a plain file is there. Nothing was placed.")
+    if state == "ok":
+        return False
+    _ensure_dirs(dest.parent)
+    tmp = dest.parent / f".{dest.name}.place-orient.new"
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    fd = os.open(str(tmp), os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o700)
+    with os.fdopen(fd, "wb") as out:
+        out.write(data)
+    os.replace(tmp, dest)
+    return True
+
+
+def orient_tailnet_enabled(home: Path) -> bool:
+    """Whether Orient's own tailnet.json says its tailnet listener is on —
+    its mere presence as a plain file, since a fresh install never writes
+    one at all, and an install that turns the listener on is what carries
+    it in. Never follows a symlink at the name. Called only inside a
+    child already dropped to Orient's own uid and gid, which is what may
+    read its own home."""
+    path = home / ORIENT_STATE_REL / TAILNET_JSON_NAME
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(info.st_mode)
+
+
+# --- placement: install-backend --from-tree, as sudo -u Orient's account ----
+
+
+def place_argv(tree: Path, sha: str, mode: str | None, orient_name: str,
+               interpreter: str = sys.executable) -> list[str]:
+    """The full `sudo` command line that places Orient's code, and `shown`,
+    the part of it a person reads — the same shape
+    `bin/stand-up-backend`'s own `launch` returns for `place-library`.
+    """
+    flags = [
+        "--only", "convivy-orient",
+        "--from-tree", f"convivy-orient={tree}",
+        "--expect-commit", f"convivy-orient={sha}",
+        "--python", interpreter,
+    ]
+    if mode is not None:
+        flags.append({"dry-run": "--dry-run", "check": "--check", "status": "--status"}[mode])
+    shown = [str(REPO / "bin" / "install-backend"), *flags]
+    return [SUDO, "-u", orient_name, "-H", interpreter, *shown], shown
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Put Orient's own code and its own {bin} commands where its job looks.",
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--dry-run", action="store_true", help="say what would happen, change nothing")
+    group.add_argument("--check", action="store_true", help="report only; 1 if anything is still pending")
+    group.add_argument("--status", action="store_true", help="the same report, changing nothing")
+    args = parser.parse_args(argv)
+    mode = "dry-run" if args.dry_run else "check" if args.check else "status" if args.status else None
+
+    if os.geteuid() != 0:
+        print(f"{PROG}: refusing — this needs root, to place Orient's code as its own "
+              f"account and to write into its own home. Nothing was changed.", file=sys.stderr)
+        return 2
+
+    platform = platform_name()
+    orient_name = orient_account_name(platform)
+    home_str = account_home(orient_name)
+    if home_str is None:
+        print(f"{PROG}: no {orient_name} account on this machine — nothing to place. Either "
+              f"this is the single-account shape, where Orient runs as the operator, or "
+              f"Orient's own account has not been provisioned yet.")
+        return 0
+
+    ids = account_ids(orient_name)
+    assert ids is not None  # just resolved by name above
+    orient_uid, orient_gid = ids
+    if not owned_by(home_str, orient_uid):
+        owner = os.lstat(home_str).st_uid
+        print(f"{PROG}: refusing — {home_str} (home of {orient_name}) is owned by uid "
+              f"{owner}, not its own account. Something else made it; this will not read "
+              f"from it or write into it. Nothing was changed.", file=sys.stderr)
+        return 2
+    home = Path(home_str)
+
+    try:
+        record_text = _read_record(INSTALLED_RECORD)
+        tree, sha = orient_tree(record_text)
+        agentctl = agentctl_target(record_text)
+        python = python_target(record_text, platform)
+        backup_bytes = load_backup_script(record_text=record_text)
+    except Refused as exc:
+        print(f"{PROG}: refusing — {exc}", file=sys.stderr)
+        return 2
+    tailscale = tailscale_target()
+
+    if follows_orient_main(_read_record(INSTALL_CONFIG)):
+        print(f"{PROG}: this install follows Orient's main, so root's deploy step places "
+              f"Orient's code; leaving it alone and placing the {BIN_REL}/ links only")
+        place_code = 0
+    else:
+        full, shown = place_argv(tree, sha, mode, orient_name)
+        print(f"→ place: {' '.join(shown)}")
+        place_code = subprocess.run(full).returncode
+        print()
+        if place_code not in (0, 1):
+            return place_code
+
+    try:
+        tailnet_enabled = run_as_account(orient_uid, orient_gid, lambda: orient_tailnet_enabled(home))
+    except Refused as exc:
+        print(f"{PROG}: refusing — {exc}", file=sys.stderr)
+        return 2
+
+    items = [("agentctl", str(agentctl)), (PINNED_PYTHON_BIN, str(python))]
+    if tailscale is not None and tailnet_enabled:
+        items.append(("tailscale", str(tailscale)))
+
+    try:
+        if mode in ("check", "status"):
+            pending, occupied = run_as_account(orient_uid, orient_gid,
+                                               lambda: plan_orient_links(home, items))
+            backup_state = run_as_account(orient_uid, orient_gid,
+                                          lambda: plan_orient_backup(home, backup_bytes))
+            if occupied:
+                print(f"{PROG}: {len(occupied)} link(s) occupied by something other than a "
+                      f"symlink: {', '.join(occupied)}")
+            if backup_state == "occupied":
+                print(f"{PROG}: {BACKUP_DEST} is occupied by something other than a plain file")
+            if pending:
+                print(f"{PROG}: {len(pending)} {BIN_REL}/ link(s) not yet placed: {', '.join(pending)}")
+            else:
+                print(f"{PROG}: every {BIN_REL}/ link this places is in place")
+            print(f"{PROG}: {BACKUP_DEST} is "
+                  f"{'already placed' if backup_state == 'ok' else 'not yet placed'}")
+            work_left = 1 if (pending or occupied or backup_state != "ok") else 0
+            if mode == "status":
+                return place_code
+            return 1 if (place_code == 1 or work_left) else 0
+
+        if mode == "dry-run":
+            pending, occupied = run_as_account(orient_uid, orient_gid,
+                                               lambda: plan_orient_links(home, items))
+            for name, _target in items:
+                if name in occupied:
+                    print(f"{PROG}: {name} is occupied by something other than a symlink; refusing it")
+                else:
+                    verb = "would create" if name in pending else "already linked"
+                    print(f"{PROG}: {verb} {BIN_REL}/{name}")
+            backup_state = run_as_account(orient_uid, orient_gid,
+                                          lambda: plan_orient_backup(home, backup_bytes))
+            if backup_state == "occupied":
+                print(f"{PROG}: {BACKUP_DEST} is occupied by something other than a plain file; refusing it")
+            else:
+                verb = "would copy" if backup_state == "pending" else "already copied"
+                print(f"{PROG}: {verb} {BACKUP_DEST}")
+            return 0
+
+        written = run_as_account(orient_uid, orient_gid, lambda: do_orient_links(home, items))
+        backup_written = run_as_account(orient_uid, orient_gid, lambda: do_orient_backup(home, backup_bytes))
+        if written:
+            for name in written:
+                print(f"{PROG}: linked {BIN_REL}/{name}")
+        if backup_written:
+            print(f"{PROG}: copied {BACKUP_DEST}")
+        if not written and not backup_written:
+            print(f"{PROG}: nothing to place — every {BIN_REL}/ item this places is already there")
+    except Refused as exc:
+        print(f"{PROG}: refusing — {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

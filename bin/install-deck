@@ -9,13 +9,35 @@
 A real run exits 0 when Deck is installed, 2 when it refused, and 3 when Deck
 is installed but something still needs the operator's attention: another
 installed copy to remove (a Deck in /Applications, or an old `Deck.app` this
-could not delete), or, on a laptop install, the ssh config step below
-failing. A superseded bundle under a dotted name that could not be deleted is
-not counted; the next run sweeps it, as it does any leftover.
+could not delete), the ssh config step below failing, or the root-ca build
+below failing with a library checkout to build it from. A superseded bundle
+under a dotted name that could not be deleted is not counted; the next run
+sweeps it, as it does any leftover.
 No outcome of a real run is reported as 1. When one exits 1, an uncaught error
 ended it, such as a failed `git clone` or a filesystem error during placement,
 and Python printed the traceback. `--check` keeps the convention its sibling
 installers share, where 1 means work is left.
+
+## ROOT-CA, THE SIGNING TOOL DECK'S APPROVE, DECLINE AND SET-MODEL ACTS NEED
+
+Section 2.2 of the Library's protocol contract has Deck sign those three acts
+with a Secure Enclave key, under a certificate `root-ca` issues. That tool is
+a Swift package in the LIBRARY repository, not this one, so this builds it
+the same way it builds Deck — from a sibling checkout, `--library-source` or
+`--library-clone-from` naming another one — and `swift build -c release`
+rather than Deck's own `make-app.sh`, since `root-ca` carries no build
+contract of its own to call instead. The built binary is then linked into
+`~/.local/bin`, the same directory `bin/link-commands` links the operator's
+other Builder commands into on the server shapes, so the operator can run
+`root-ca generate-root` and `root-ca sign-signer` by name.
+
+**This step is OPPORTUNISTIC, unlike Deck's own build.** A bare `install-deck`
+call with no sibling `library` checkout and no `--library-clone-from` skips
+it quietly: root-ca is a second, Touch-ID-gated tool this installer also
+places, not the thing it exists to install. Through `builder-install`, the
+sibling checkout is already there, cloned at the same release as
+`convivy-deck`, so a laptop install gets both without asking for either
+source twice.
 
 ## THE SSH CONFIG DECK'S CREW SIDEBAR READS
 
@@ -162,6 +184,19 @@ MACH_O_MAGIC = (
     b"\xbe\xba\xfe\xca",  # universal, byte-swapped
 )
 
+# `root-ca` is the Secure Enclave signing tool a Mac needs for Deck's
+# approve, decline and set-model acts to carry a proof (the Library protocol,
+# section 2.2, "The signing certificate" and "Signed item acts").
+# It is a Swift package in the LIBRARY repository, not this one, so it is
+# built from a sibling `library` checkout the same way Deck itself is built
+# from a sibling `convivy-deck` checkout — `builder-install` clones both into
+# the same source directory before either installer runs.
+LIBRARY_ROOT_CA_PACKAGE = Path("root-ca", "Package.swift")
+ROOT_CA_BIN = "root-ca"
+# Where the operator's other Builder commands are linked on this account —
+# the same default `bin/link-commands` uses on the server shapes.
+DEFAULT_ROOT_CA_BIN_DIR = Path.home() / ".local" / "bin"
+
 
 class Refused(Exception):
     """Something the operator has to decide about. Never a stack trace."""
@@ -262,6 +297,133 @@ def run_crew_ssh_config(agent_platform: Path | None) -> bool:
         file=sys.stderr,
     )
     return True
+
+
+def resolve_library_source(args) -> Path | None:
+    """A sibling `library` checkout carrying the `root-ca` package.
+
+    None when there is no such tree and no `--library-clone-from` was
+    given — the ordinary case for a bare `install-deck` call never made
+    through `builder-install`, the same as `resolve_agent_platform` above:
+    the build-and-link step below is then simply skipped, since there is
+    nothing here for it to build. Unlike Deck's own `--source`, a tree that
+    does not carry the package is not refused outright: root-ca is a second,
+    opportunistic build this installer also does, not its main job.
+    """
+    candidate = (args.library_source or REPO.parent / "library").expanduser()
+    if (candidate / LIBRARY_ROOT_CA_PACKAGE).is_file():
+        return candidate.resolve()
+    if args.library_clone_from is None:
+        return None
+    print(f"{PROG}: cloning {args.library_clone_from} into {candidate}", file=sys.stderr)
+    try:
+        subprocess.run(["git", "clone", args.library_clone_from, str(candidate)], check=True)
+    except (subprocess.CalledProcessError, OSError) as exc:
+        raise Refused(f"cloning {args.library_clone_from} into {candidate} failed: {exc}.")
+    return candidate.resolve() if (candidate / LIBRARY_ROOT_CA_PACKAGE).is_file() else None
+
+
+def build_root_ca(library_source: Path) -> Path:
+    """`swift build -c release` in `library_source/root-ca`, returning the
+    built binary's path.
+
+    **stderr is inherited**, as Deck's own build is, so a first build that
+    fetches its dependencies over HTTPS is seen live rather than arriving
+    silently minutes later.
+    """
+    package_dir = library_source / "root-ca"
+    result = subprocess.run(["swift", "build", "-c", "release"], cwd=str(package_dir), check=False)
+    if result.returncode != 0:
+        raise Refused(
+            f"root-ca's build failed (exit {result.returncode}). Its log is above. Nothing was linked."
+        )
+    binary = package_dir / ".build" / "release" / ROOT_CA_BIN
+    if not binary.is_file():
+        raise Refused(f"swift build did not produce {binary}. Nothing was linked.")
+    return binary
+
+
+def root_ca_link_state(bin_dir: Path, binary: Path | None) -> str:
+    """`"ours"` (already linked to `binary`), `"stale"` (a symlink this step
+    would have made, pointing elsewhere), `"occupied"` (something else
+    entirely) or `"absent"`. Pure inspection, for `--status`, `--dry-run`
+    and `--check`."""
+    link = bin_dir / ROOT_CA_BIN
+    if not os.path.lexists(link):
+        return "absent"
+    if not link.is_symlink():
+        return "occupied"
+    if binary is not None and Path(os.readlink(link)) == binary:
+        return "ours"
+    return "stale"
+
+
+def link_root_ca(binary: Path, bin_dir: Path) -> str:
+    """Point `bin_dir/root-ca` at `binary`, the same directory
+    `bin/link-commands` links the operator's other Builder commands into.
+
+    A single-operator tool, so this skips that command's protection against
+    a concurrent writer racing a predictable staging name — there is only
+    ever one of these running at a time on one laptop — but still replaces
+    the link atomically, via a rename rather than an unlink-then-symlink,
+    so a reader never sees a moment with no `root-ca` at all.
+    """
+    link = bin_dir / ROOT_CA_BIN
+    state = root_ca_link_state(bin_dir, binary)
+    if state == "ours":
+        return f"already linked to {binary}"
+    if state == "occupied":
+        raise Refused(f"{link} exists and is not a symlink this installer made. Move it aside; "
+                      f"nothing was linked.")
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    tmp = bin_dir / f".{ROOT_CA_BIN}.install-deck.tmp"
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    os.symlink(binary, tmp)
+    os.replace(tmp, link)
+    return f"relinked to {binary}" if state == "stale" else f"linked to {binary}"
+
+
+def build_and_link_root_ca(args, bin_dir: Path, mode: str | None) -> bool:
+    """Build and link `root-ca`, reporting as it goes. Returns whether this
+    "needs attention" — a library checkout exists but the build or the link
+    failed — never raises `Refused`, so a problem here does not fail the
+    whole run: Deck itself is already installed by the time this is called.
+    """
+    try:
+        library_source = resolve_library_source(args)
+    except Refused as exc:
+        print(f"{PROG}: root-ca: {exc} Deck's approve, decline and set-model acts need it; "
+              f"fix this and rerun {PROG}, which is safe to rerun.", file=sys.stderr)
+        return True
+    if library_source is None:
+        print(f"{PROG}: root-ca: skipped — no sibling `library` checkout and no "
+              f"--library-clone-from, so there is nothing to build Deck's signing tool from")
+        return False
+    if mode == "status":
+        state = root_ca_link_state(bin_dir, None)
+        print(f"{PROG}: root-ca: "
+              f"{'linked' if state in ('ours', 'stale') else 'NOT linked'} at {bin_dir / ROOT_CA_BIN}")
+        return False
+    if mode == "dry-run":
+        print(f"{PROG}: would build root-ca from {library_source} and link it into {bin_dir}")
+        return False
+    if mode == "check":
+        binary = library_source / "root-ca" / ".build" / "release" / ROOT_CA_BIN
+        state = root_ca_link_state(bin_dir, binary)
+        print(f"{PROG}: root-ca: {'linked' if state == 'ours' else 'NOT linked'} at {bin_dir / ROOT_CA_BIN}")
+        return state != "ours"
+    try:
+        binary = build_root_ca(library_source)
+        report = link_root_ca(binary, bin_dir)
+    except Refused as exc:
+        print(f"{PROG}: root-ca: {exc} Deck's approve, decline and set-model acts need it; "
+              f"fix this and rerun {PROG}, which is safe to rerun.", file=sys.stderr)
+        return True
+    print(f"{PROG}: root-ca: {report}")
+    return False
 
 
 def check_full_clone(source: Path) -> None:
@@ -790,6 +952,16 @@ def main(argv: list[str]) -> int:
                              f"{CREW_SSH_CONFIG_SCRIPT} (default: beside this "
                              "repository); absent, the crew ssh-config step "
                              "is skipped")
+    parser.add_argument("--library-source", type=Path, default=None,
+                        help="a library checkout carrying the root-ca package "
+                             "(default: beside this repository); absent and "
+                             "with no --library-clone-from, the root-ca "
+                             "build-and-link step is skipped")
+    parser.add_argument("--library-clone-from", default=None,
+                        help="clone the library checkout from this URL if "
+                             "--library-source is absent")
+    parser.add_argument("--bin-dir", type=Path, default=DEFAULT_ROOT_CA_BIN_DIR,
+                        help=argparse.SUPPRESS)
     parser.add_argument("--ref", default=None,
                         help="the commit or tag to build (default: the "
                              "checkout's HEAD). A tag is reported with the "
@@ -824,6 +996,7 @@ def main(argv: list[str]) -> int:
     applications = (
         args.applications or Path.home() / "Applications"
     ).expanduser().resolve()
+    bin_dir = args.bin_dir.expanduser().resolve()
 
     try:
         require_macos()
@@ -834,6 +1007,7 @@ def main(argv: list[str]) -> int:
             print(f"  {'installed' if current else 'NOT INSTALLED':<14} "
                   f"{current or f'no {BUNDLE} in this directory'}")
             report_orphans(applications)
+            build_and_link_root_ca(args, bin_dir, "status")
             return 0
 
         source = resolve_source(args)
@@ -853,6 +1027,7 @@ def main(argv: list[str]) -> int:
             current = installed_version(applications)
             for line in outstanding(applications):
                 print(line)
+            build_and_link_root_ca(args, bin_dir, "check")
             if current is None:
                 print(f"{PROG}: Deck is not installed in {applications}")
                 return 1
@@ -909,6 +1084,7 @@ def main(argv: list[str]) -> int:
             print()
             for line in outstanding(applications):
                 print(line)
+            build_and_link_root_ca(args, bin_dir, "dry-run")
             return 0
 
         with tempfile.TemporaryDirectory() as scratch:
@@ -950,6 +1126,11 @@ def main(argv: list[str]) -> int:
         # run and a laptop install's sidebar depends on it, not general
         # advice that applies every time.
         ssh_config_failed = run_crew_ssh_config(resolve_agent_platform(args))
+        # ALSO AFTER THE OUTSTANDING BOILERPLATE, and also non-fatal: a
+        # laptop with no library checkout handy still gets Deck installed,
+        # just without the signing tool its approve, decline and set-model
+        # acts need.
+        root_ca_failed = build_and_link_root_ca(args, bin_dir, None)
         # LAST, AND EXIT 3. Deck is installed, but something still needs the
         # operator's attention, so the run is not finished and its exit
         # status says so. Not 1, which is also what Python exits with on an
@@ -964,6 +1145,8 @@ def main(argv: list[str]) -> int:
         if legacy_note and legacy_note.startswith("could NOT"):
             return 3
         if ssh_config_failed:
+            return 3
+        if root_ca_failed:
             return 3
         return 0
 

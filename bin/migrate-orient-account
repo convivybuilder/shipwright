@@ -1,0 +1,3318 @@
+#!/usr/bin/env python3
+"""migrate-orient-account — move an existing install's Orient onto its own
+account, and rotate its two Library tokens.
+
+    sudo bin/migrate-orient-account --shape two|three --deploy-signals-bound \
+        [--root-ca <file> --app-key <file> --app-config <file> --persons <emails>]
+                                                           migrate what is pending
+    sudo bin/migrate-orient-account --shape two|three --dry-run      say what would happen, change nothing
+    sudo bin/migrate-orient-account --shape two|three --check        report only; 1 if migration is pending
+    sudo bin/migrate-orient-account --shape two|three --status       the same report, changing nothing
+
+`--root-ca`, `--app-key`, `--app-config` and `--persons` (a comma-separated
+list of emails) are the operator's own sources for the Library's person-save
+inputs — the same four `bin/place-person-save` reads on the single-account
+shape. Omitting any of them skips placing those inputs and says so; every
+other step still runs, since saving was already unavailable before this ran.
+
+**THE PROBLEM THIS CLOSES.** An install made before Orient got its own
+service account ran Orient as `agents`, with Orient's control database, its
+two Library credentials and its own config root sitting under `agents`' own
+home, and a LaunchAgent, `com.convivy.orient-deploy-watch`, carrying every
+merge to the live site on `agents`' own behalf. This moves Orient onto its
+own service account, created by `bin/provision-accounts` if it is not there
+yet, places Orient's code there with `bin/place-orient`, rotates
+`library-token` and `library-client-token` (which sat where `agents` could
+read them) rather than carrying them over, and turns on Orient's signed
+document saves.
+
+**`--deploy-signals-bound` IS REQUIRED, AND THIS REFUSES WITHOUT IT.** The
+spec's step 6 starts only once Orient's crew has bound the instruction block
+that reads `deploy_failure` and `deploy_stall` signals to its own sessions
+(step 7), so a stalled deploy is never silent from the first cycle. Whether
+that binding has happened is a fact about another crew's session
+configuration, which nothing this script can reach names or verifies — there
+is no file or command on this machine that answers it. So, as the spec's own
+task asks when it gives no check: this is an explicit operator-confirmation
+flag. Passing it asserts that Orient's crew has made that binding; the
+script trusts the assertion and does not try to re-derive it. It is read
+only in a real run — `--dry-run`, `--check` and `--status` need it not, since
+they change nothing.
+
+**WHAT IT DOES, IN ORDER.** Nothing runs when `{agents' home}/.orient-control/
+control.db` does not exist — a fresh install, or an install already
+migrated, changes nothing. Otherwise, each step below is safe to re-run
+after an earlier run failed partway, and nothing under `agents` or the
+Library is touched until the step before it has fully succeeded:
+
+ 1. Check that the root deploy step — `bin/orient-deploy`, declared in
+    `jobs/follow-orient-main/orient-deploy.toml`, label
+    `com.convivy.orient-deploy` — is loaded in the supervisor, and refuse,
+    naming the missing unit, before anything else runs, if it is not. This
+    only checks; it does not start the root deploy step yet — see step 17.
+ 2. On an install that follows Orient's `main` (`install.json` holds
+    `"follow_orient_main": true`), read what that step last recorded as
+    deployed, `/opt/builder/var/orient-deploy/deployed`, and refuse,
+    before anything moves, if it names no commit — nothing else would put
+    Orient's own code under its own account before the deploy step's
+    first cycle after this migration; see step 13.
+ 3. Create Orient's own account if it is not there yet
+    (`provision-accounts`).
+ 4. Repoint the operator's `cloudflared` setting at Orient's own socket
+    and restart `cloudflared`, before any of Orient's jobs stop, so the
+    tunnel never forwards to Orient's old loopback address while Orient is
+    down.
+ 5. Stop Orient's three units (`com.convivy.orient`, `.orient-dashboard`,
+    `.orient-backup`) wherever they are currently loaded, and take out of
+    the supervisor whichever of their definitions still runs as `agents` or
+    out of `agents`' own deploy path — the same defect, and the same fix,
+    `bin/migrate-library-account` already carries for the Library's units.
+ 6. Remove the old `com.convivy.orient-deploy-watch` LaunchAgent (or, on
+    Linux, its systemd --user unit), which carried every merge to the live
+    site on `agents`' own behalf, keeping its own bytes in memory until the
+    rotation so a rollback can write it back and reload it.
+ 7. Place Orient's own code (`place-orient`) — on an install that follows
+    Orient's `main`, this places only the `{bin}` links, leaving Orient's
+    own code to step 13 below.
+ 8. **THE POINT OF NO RETURN.** Rotate `library-token` and
+    `library-client-token` with `mint_credential.py --replace`, reading
+    each entry's own fields directly from its token store first (the
+    store's own secret key is never one of them) and passing them back
+    unchanged but for the new secret, then refusing unless they still
+    agree afterward. This runs entirely against the Library's own
+    account's token stores and `.orient-control` — never `agents`' —
+    because `deliver-library-credentials` already delivers Orient's
+    credentials there rather than to `agents`.
+ 9. Mint Orient's own narrow signal credential, `capture-token` (holding
+    `signal.create` alone — see `bin/orient-deploy`'s own `post_signal`),
+    into the Library account's own `.orient-control`, unless it is already
+    there: the same idempotent mint a fresh install's `jobs/library.toml`
+    own `prepare` runs, so a machine already carrying it from that mint
+    never mints a second one. Before deciding whether to mint
+    `kb-person-save-token`, re-mint it with no crew in place, with
+    `mint_credential.py --replace`, when the store already carries it under
+    a crew — see `remint_kb_person_save_crew`'s own docstring for why a
+    crew can make it authenticate nobody. Otherwise mint
+    `kb-person-save-token` the same idempotent way `capture-token` is
+    minted, unless `agents` already has a copy — see
+    `mint_kb_person_save_token`'s own docstring for why `agents`' own copy,
+    not the Library's, is the guard there. Deliver both `capture-token` and
+    `kb-person-save-token`, together with the two rotated tokens, to
+    Orient's own account and to `agents` with
+    `bin/deliver-library-credentials`, then delete `library-token` and
+    `library-client-token`'s old, now-superseded copies from `agents`' own
+    `.orient-control`, and `agents`' own old, wide `capture-token` — minted
+    under the name `github-capture`, with `kind` system and `products`
+    `"*"` — where one is there. Absence changes nothing; the operator
+    still revokes its credential by hand, once `orient-deploy` is seen
+    posting with the new, narrow credential, since deleting this file is
+    not revoking it.
+10. Move every other file `.orient-control` and Orient's config root hold —
+    `control.db`, `vapid.json`, `orient-serving-commit`, `orient-restart-
+    started`, `journal-push-token`, `journal-dispatch-token`, and, under the
+    config root, `jwt.json`, `tiers.json`, `tailnet.json`, `roles.json`,
+    `api-tokens.json` — into Orient's own account, verified the same
+    symlink-safe, manifest-checked way `bin/migrate-library-account` moves
+    the Library's state. A failure here names every file this call already
+    copied and every one of the table above still under `agents`' own
+    home, so the operator knows exactly what to delete by hand once
+    Orient's own copy is confirmed.
+11. Move the sibling logs (`orient.log`, `orient-dashboard.log`,
+    `orient-dashboard.err.log`, `orient-backup.log`), as best-effort
+    cleanup after the state is already promoted.
+12. Remove `agents`' now-unused `~/.local/deploy/convivy-orient`.
+13. On an install that follows Orient's `main`, place the commit step 2
+    read, extracted from root's own bare copy exactly as `bin/orient-
+    deploy` extracts and places a commit, under Orient's own deploy area —
+    nothing else would, until the root deploy step's own first cycle after
+    this migration (see step 7).
+14. Run `bin/orient-make-statement-key` as Orient's own account, from the
+    tree root `place-orient` placed, with the Python in Orient's own
+    deploy area (never root's system Python, which has no `cryptography`
+    and which the tool refuses to run under), and place its one line of
+    output under `orient_statement_key` in the operator's own
+    `kb-verifier.json`, leaving any `persons` entry already there
+    untouched. Place the Library's seven person-save inputs the same way —
+    `--root-ca`, `--app-key`, `--app-config` and `--persons`, through a
+    child dropped to the Library account's own uid and gid, reusing
+    `bin/place-person-save`'s own placement logic — writing the SAME line
+    this step just captured, held in memory, into `orient-statement-key.json`
+    too, never read back from `kb-verifier.json` or any other file. Skipped,
+    with a report saying so, when any of the four is not given.
+15. Deploy the shared agent-platform area the document service runs
+    `agentctl` from, `~/.local/deploy/agent-platform-shared` under `agents`'
+    own home, with the Bosun's `install-agent-platform-shared`, run as
+    `agents`, before the document service is installed. Then install the
+    document service with Orient's own group as `--client-group`, create
+    its socket directory, and load its LaunchDaemon. Both refuse by name on
+    Linux, because neither has an installation design for that platform yet.
+16. Restart Orient, which is also what makes it start using the document
+    service: `jobs/orient.toml`'s own `[account-environment]` names
+    `ORIENT_KB_DOCUMENT_SOCKET`, read fresh on each call by convivy-orient's
+    own `kb_commit.py`, only while Orient's own account is in force, so this
+    restart is the step that moves saving onto the service step 15 just
+    installed rather than the in-process route that stops working the
+    moment Orient leaves `agents`. First renders every declared Orient unit
+    from the root tree's declarations as Orient's own, since the agents'
+    units were already removed in step 5 and `install-jobs --start` only
+    activates a unit already on disk, then starts every one of them; a
+    rollback, by contrast, restarts only the agents' units this install
+    actually had, so an install made before `com.convivy.orient-backup`
+    existed is never asked to start that one.
+17. Only once that restart reports no problem, start the root deploy step
+    that step 1 already checked is loaded — never earlier, since starting it
+    before Orient's own system unit exists is exactly what fails against an
+    install whose Orient `main` is ahead of the deployed commit: the cycle
+    places the new commit, then its restart of `com.convivy.orient.service`
+    fails, `Unit not found`, and the swap-back fails the same way. This is
+    already past the point of no return, so a failure here is reported, not
+    rolled back, and never leaves the timer or the service running — see
+    `start_root_deploy_step` below.
+
+**ROLLBACK.** A failure any time before the two tokens are rotated (step 8
+above) restores whatever unit this run removed and restarts whatever this
+run stopped, and leaves `agents`' own files untouched — so a failure there
+always leaves the old tokens working, as the task that commissioned this
+script requires. Once cloudflared's config has been written (step 4),
+rollback puts the original setting back whether or not that step went on
+to validate or restart cloudflared itself, naming what it restored rather
+than letting the failure's own "nothing further was migrated" stand
+uncorrected. Before any of Orient's units have stopped — a
+`validate_cloudflared` or `restart_cloudflared` refusal inside step 4
+itself — the old, agents'-own Orient is still serving the port throughout,
+so rollback writes the file back directly, restarting cloudflared again
+only if it had already been restarted onto the new setting. Once Orient's
+units have stopped, rollback restarts cloudflared only once the restored,
+agents'-own Orient is confirmed to hold its old loopback port again: the
+process listening on it, read with `lsof`, has to be the main process the
+system supervisor itself reports for the restored `com.convivy.orient`
+unit, and a connection to the port has to succeed. An impostor bound to
+that port — any process the supervisor does not report as that unit's own
+— fails the check exactly as no listener at all does, and the tunnel is
+left pointed at Orient's own socket, naming whatever holds the port, when
+something does, rather than ever revert onto a port that account does not
+really own. A failure from step 8 onward is cleanup, not reversible: the new account
+already holds verified, promoted data by then, so this reports what it
+could not finish rather than unwinding what already succeeded, the same
+split `bin/migrate-library-account` already draws between its own
+verified-and-promoted state move and the best-effort log move after it;
+code already placed (the root tree, and Orient's own deploy area) is left
+for the next run, since placing it again changes nothing.
+
+**THE ROOT DEPLOY STEP THIS STARTS.** The design calls this "the root
+deploy step" — a root-owned LaunchDaemon or systemd timer that fetches,
+verifies and places
+each signed merge to Orient's `main`, replacing the `com.convivy.orient-
+deploy-watch` LaunchAgent this script retires. That step is `bin/orient-
+deploy`, declared in `jobs/follow-orient-main/orient-deploy.toml`, label
+`com.convivy.orient-deploy` — the same label `ROOT_DEPLOY_UNIT_LABEL` below
+already names, and the same state file, `/opt/builder/run/orient-deploy/
+state.json`, `ROOT_DEPLOY_STATE_DIR` already names. That tool and job land
+through their own change, a sibling of this one rather than something this
+one builds on, so an install this runs against may not have enabled it yet.
+Step 1 above checks whether the unit is actually loaded before relying on
+it, and refuses cleanly, naming the missing unit, rather than assuming it
+is there — see `root_deploy_step_loaded` below — but does not start it
+until step 17, once Orient's own units are confirmed running again; see
+`start_root_deploy_step` below.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import errno
+import importlib.machinery
+import importlib.util
+import json
+import os
+import plistlib
+import pwd
+import re
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import NamedTuple
+
+PROG = "migrate-orient-account"
+HERE_FILE = Path(__file__).resolve()
+REPO = HERE_FILE.parent.parent
+sys.path.insert(0, str(REPO / "tools"))
+from jobs import declaration  # noqa: E402
+
+# `bin/install-privileged`'s own `running_copy()` (see "refusing to run
+# from" there) is the ownership check: `main()`'s real-run path loads
+# that sibling through `_install_privileged_for_extract()` right after
+# this script's own path check passes, and treats the `SystemExit` its
+# `running_copy()` raises as this script's own refusal — so the two
+# cannot disagree about ownership of `prefix`, `prefix/src`, the
+# extracted tree root, the `bin` directory, install-privileged's own
+# file, or its two further siblings (`github-gate`,
+# `account_entities.py`). `running_copy()` checks its OWN file's path,
+# never this one's, so `script_location_problem` below still checks,
+# on its own, that this file sits at the expected
+# `<prefix>/src/shipwright@<sha>/bin/migrate-orient-account` shape —
+# the one thing loading the sibling does not cover.
+RUNNING = re.compile(r"^(?P<prefix>.*)/src/shipwright@(?P<sha>[0-9a-f]{40})/bin/migrate-orient-account$")
+
+
+def script_location_problem(here_file: Path) -> str | None:
+    """Whether `here_file` has the shape
+    `<prefix>/src/shipwright@<sha>/bin/migrate-orient-account`, or why
+    it does not. Called only in the real-run path, in `main()`, before
+    `migrate()` changes anything — never at import time. Ownership and
+    writability of the tree this file sits in are checked separately,
+    by loading install-privileged's own `running_copy()` (see the
+    comment above `RUNNING`); this function covers only this script's
+    own path, which that check does not.
+    """
+    if not RUNNING.match(str(here_file)):
+        return "the file is not at <prefix>/src/shipwright@<sha>/bin/migrate-orient-account"
+    return None
+
+
+def _load_sibling(module_name: str, filename: str):
+    """`filename`, from this file's own directory, loaded under
+    `module_name` rather than `import`ed by path. Mirrors `bin/orient-
+    deploy`'s own helper of the same name."""
+    loader = importlib.machinery.SourceFileLoader(module_name, str(REPO / "bin" / filename))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(module_name, loader))
+    sys.modules[module_name] = module
+    loader.exec_module(module)
+    return module
+
+
+# `bin/place-orient`'s own `place_argv()`, reused here rather than
+# re-derived, for `place_deployed_commit` below. Safe to load eagerly,
+# unlike `bin/install-privileged` (see `_extract_deployed_tree` below):
+# place-orient does no work and no path check at import time, only
+# function and class definitions.
+place_orient = _load_sibling("place_orient_for_migrate_orient_account", "place-orient")
+
+# `bin/place-person-save`'s own `place_entries()`, reused here rather than
+# duplicated, for `place_library_person_save_inputs` below: same safety
+# reasoning as `place_orient` above — this does no work and no path check at
+# import time, only function and class definitions.
+place_person_save = _load_sibling("place_person_save_for_migrate_orient_account", "place-person-save")
+
+AGENTS = "agents"
+# Duplicated from `bin/provision-accounts`' own tables rather than imported,
+# the same way `bin/migrate-library-account` already duplicates its own.
+LIBRARY_ACCOUNT_NAMES = {"macos": "_library", "linux": "library"}
+ORIENT_ACCOUNT_NAMES = {"macos": "_orient", "linux": "orient"}
+
+SUDO = "/usr/bin/sudo"
+# The same interpreters `bin/stand-up-backend`'s own `ROOT_INTERPRETERS`
+# names, for the root-owned copies of `provision-accounts`, `place-orient`,
+# `deliver-library-credentials` and `install-jobs` this runs beside.
+ROOT_INTERPRETERS = {"darwin": "/opt/homebrew/bin/python3.11", "linux": "/usr/bin/python3"}
+PRIVILEGED_PREFIX = Path("/opt/builder")
+
+
+def root_interpreter(platform: str) -> str:
+    """`ROOT_INTERPRETERS`, keyed by `sys.platform`'s own spelling
+    ("darwin"/"linux"), indexed by this file's own "macos"/"linux"
+    `platform` strings. `bin/stand-up-backend`'s own call sites re-derive
+    the dict key from `sys.platform` directly rather than from a "macos"/
+    "linux" variable, for exactly this reason."""
+    return ROOT_INTERPRETERS["darwin" if platform == "macos" else "linux"]
+
+# The three Orient units `jobs/orient.toml`, `jobs/orient-dashboard.toml` and
+# `jobs/orient-backup.toml` declare.
+ORIENT_UNIT_LABELS = ("com.convivy.orient", "com.convivy.orient-dashboard", "com.convivy.orient-backup")
+# Which of the three schedules a recurring run, and so gets a sibling
+# `.timer` on Linux (see `tools/jobs/render_systemd.needs_timer`): the main
+# job runs continuously (`at-load` alone) and has none; the dashboard build
+# and the backup each declare a schedule of their own. Duplicated here
+# rather than read from the declaration, the same way
+# `bin/migrate-library-account` already duplicates its own equivalent.
+ORIENT_UNITS_WITH_TIMER = frozenset({"com.convivy.orient-dashboard", "com.convivy.orient-backup"})
+SYSTEMD_SYSTEM_DIR = "/etc/systemd/system"
+LAUNCHD_SYSTEM_DIR = "/Library/LaunchDaemons"
+
+# THE OLD WATCHER THIS RETIRES. A LaunchAgent (a per-user, not system-scope,
+# job) that ran as `agents` and carried every merge to the live site on its
+# own behalf. No file under `jobs/` declares it, because it was never one of
+# Builder's own job declarations; it is removed by name alone.
+OLD_DEPLOY_WATCH_LABEL = "com.convivy.orient-deploy-watch"
+
+# THE NEW ROOT DEPLOY STEP THIS STARTS IN ITS PLACE. Not yet shipped by this
+# release — see the module docstring's own note. Named here as the one
+# concrete thing this script can check for and act on: a unit already
+# loaded under this label, root-owned, the way every other root-run
+# supervisor unit in this codebase is found.
+ROOT_DEPLOY_UNIT_LABEL = "com.convivy.orient-deploy"
+ROOT_DEPLOY_STATE_DIR = PRIVILEGED_PREFIX / "run" / "orient-deploy"
+
+STATE_REL = Path(".local", "state")
+ORIENT_CONTROL = ".orient-control"
+ORIENT_CONFIG_REL = Path(".local", "state", "orient")
+DEPLOY_ORIENT_REL = Path(".local", "deploy", "convivy-orient")
+BIN_REL = Path(".local", "bin")
+
+# The two Library credentials Orient's own account receives and rotates —
+# duplicated from `bin/deliver-library-credentials`' own `ORIENT_CREDENTIAL_NAMES`.
+ORIENT_TOKEN_NAMES = ("library-token", "library-client-token")
+# `mint_credential.py`'s own `--file` value for each of the two, in the same
+# order as `ORIENT_TOKEN_NAMES` — the agents-type store for the first, the
+# clients-type store for the second, matching `jobs/library.toml`'s own
+# `prepare` entries for `library-token`/`library-client-token`.
+ORIENT_TOKEN_STORE_FILES = ("agents", "clients")
+ORIENT_MINT_NAME = "orient"
+# The on-disk file each of `ORIENT_TOKEN_STORE_FILES` names, under the
+# Library account's own state directory — `jobs/library.toml`'s own
+# `LIBRARY_API_TOKENS`/`LIBRARY_CLIENT_TOKENS` (`{state}/library/
+# api-tokens.json` and `.../client-tokens.json`), duplicated here rather
+# than read from that job's environment, the same way every other store
+# name in this file is duplicated rather than imported.
+ORIENT_TOKEN_STORE_FILENAMES = {"agents": "api-tokens.json", "clients": "client-tokens.json"}
+
+# Orient's own narrow signal credential — never rotated, since it does not
+# exist on an install this script has not already touched; see
+# `mint_capture_token` below. Duplicated from `jobs/library.toml`'s own
+# `prepare` mint of the same name, the same way every other credential name
+# and store path in this file is duplicated rather than imported.
+CAPTURE_TOKEN_NAME = "capture-token"
+CAPTURE_TOKEN_MINT_PREFIX = "orient-deploy-signals-"
+# Every agent capability but `signal.create`, withheld from the `agent` role
+# `mint_credential.py --kind agent` would otherwise grant in full. Computed at
+# mint time, in `library_role_withholds` below, never written out here as a
+# tuple: see that function for why.
+CAPTURE_TOKEN_GRANT = "signal.create"
+
+# The credential the document service — running as `agents` — presents to the
+# Library's person-save route on Orient's behalf, read from
+# `~/.orient-control/kb-person-save-token` by the Bosun's `agentctl kb apply`.
+# A fresh install's `jobs/library.toml` own `prepare` mints this on every
+# shape, and `deliver-library-credentials` already routes it to `agents` as
+# one of `KNOWN_CREDENTIAL_NAMES`; this install may predate that mint, so this
+# script mints it too, the same idempotent way it mints `capture-token`, when
+# `agents` still has none. Holds `reference.person_save` alone: every other
+# agent capability, `signal.create` included, is withheld — computed the same
+# way as `capture-token`'s own, in `library_role_withholds` below. Minted with
+# no crew: the Library resolves a crew credential's entity through its own
+# project registry, and a crew with no row there makes the Library refuse the
+# credential with "no resolvable identity", so a token minted for a crew one
+# install has and another lacks authenticates nobody on the second. An
+# install that minted it with a crew is corrected in place by
+# `remint_kb_person_save_crew` below.
+KB_PERSON_SAVE_TOKEN_NAME = "kb-person-save-token"
+KB_PERSON_SAVE_GRANT = "reference.person_save"
+
+# Every other file `.orient-control` and the config root hold for Orient,
+# duplicated here rather than read from Orient's own code, the same way
+# `bin/migrate-library-account` duplicates its own credential names rather
+# than importing them. NEVER `capture-token`: that name is `agents`' own old,
+# wide signal credential (minted under the store name `github-capture`),
+# left where it is rather than moved — see `mint_capture_token` below, which
+# mints Orient's own narrow replacement instead.
+ORIENT_CONTROL_OTHER_NAMES = (
+    "control.db", "vapid.json", "orient-serving-commit", "orient-restart-started",
+    "journal-push-token", "journal-dispatch-token",
+)
+
+# Named here only for `remaining_agents_orient_files` below's own report —
+# the config root's own move is still the whole-tree `copy_tree` a few
+# names down, which copies whatever is actually there, not only these five.
+ORIENT_CONFIG_ROOT_NAMES = ("jwt.json", "tiers.json", "tailnet.json", "roles.json", "api-tokens.json")
+
+# The sibling logs `jobs/orient.toml`, `orient-dashboard.toml` and
+# `orient-backup.toml` each write directly under `{state}`, moved the same
+# best-effort way `bin/migrate-library-account` moves `library.log`.
+ORIENT_SIBLING_LOGS = ("orient.log", "orient-dashboard.log", "orient-dashboard.err.log", "orient-backup.log")
+
+# Where `bin/orient-make-statement-key` writes the key this run creates, and
+# the operator's own verifier file it gets placed into.
+STATEMENT_KEY_NAME = "kb-statement-key.pem"
+KB_VERIFIER_REL = Path(".config", "convivy", "kb-verifier.json")
+
+# The document service's own socket directory and group. `install-kb-document-
+# api` itself loads nothing and runs no sudo: it only prints the root commands
+# below for an operator to run by hand, which `install_document_service`
+# below performs itself, as root, rather than leaving them printed.
+KB_DOCUMENT_SOCKET_DIR = Path("/var/db/convivy-kb-documents")
+KB_DOCUMENT_SOCKET_NAME = "kb-documents.sock"
+# setgid + 0750. The setgid bit is what makes a socket bind() under this
+# directory inherit its group, which `mkdir`'s own mode argument cannot set,
+# so it is applied with a separate `chmod`.
+KB_DOCUMENT_SOCKET_MODE = 0o2750
+KB_DOCUMENT_API_LABEL = "com.convivy.kb-document-api"
+# How long `install_document_service` keeps retrying the LaunchDaemon's
+# bootstrap after booting the previous one out: 20 tries, half a second apart.
+BOOTSTRAP_ATTEMPTS = 20
+BOOTSTRAP_RETRY_SECONDS = 0.5
+# `install-kb-document-api` stages its LaunchDaemon variant under the
+# deploy area it builds for itself, running as `agents` — never where this
+# script's own root steps could be mistaken for what it printed.
+KB_DOCUMENT_DAEMON_PLIST_REL = Path(".local", "deploy", "kb-document-api",
+                                    f"{KB_DOCUMENT_API_LABEL}.daemon-example.plist")
+# 23 decimal is octal 027, the umask the document service's design calls
+# for. launchd.plist(5) stores `Umask` as a decimal integer whose digits
+# read as octal.
+KB_DOCUMENT_DAEMON_UMASK = 23
+# The only keys `install-kb-document-api` itself ever writes into this
+# plist: `Label` and `ProgramArguments` come from its own template, and
+# `UserName`, `GroupName` and `Umask` are the three it appends for the
+# LaunchDaemon variant. `verify_staged_daemon_plist` refuses anything else —
+# `Sockets` or `MachServices` named here would hand `agents` a privileged
+# bind that launchd performs on root's own signature of this unit.
+KB_DOCUMENT_DAEMON_PLIST_ALLOWED_KEYS = frozenset(
+    {"Label", "ProgramArguments", "UserName", "GroupName", "Umask"})
+
+# The keys install-kb-document-api copies into the daemon plist unchanged from
+# agent-platform's own launchd template, where `__HOME__` is the only
+# substitution. Each is accepted only when it equals the value root renders
+# itself from its own placed tree's copy of that template, never on the
+# staged plist's say-so: `agents` writes the staged plist, and a log path or
+# working directory it chose would be opened by launchd for this job.
+KB_DOCUMENT_DAEMON_TEMPLATE_KEYS = frozenset(
+    {"WorkingDirectory", "RunAtLoad", "KeepAlive", "StandardOutPath", "StandardErrorPath",
+     "EnvironmentVariables"})
+KB_DOCUMENT_API_TEMPLATE_REL = Path("launchd", "com.convivy.kb-document-api.plist")
+
+# The operator's own `cloudflared` configuration, and the service running
+# it: `cloudflared` stays the operator's. The label is this install's own
+# choice, not read from any file; `--cloudflared-label` overrides it for an
+# install that named it differently.
+CLOUDFLARED_CONFIG_REL = Path(".cloudflared", "config.yml")
+DEFAULT_CLOUDFLARED_LABEL = "com.cloudflare.cloudflared"
+ORIENT_SOCKET_PATH = "/opt/builder/run/orient/orient.sock"
+
+# The old loopback address `repoint_cloudflared`'s own ingress rule match
+# names (`http://127.0.0.1:8099`) — the port a rollback confirms is truly
+# held by the restored, agents'-own Orient before writing that line back,
+# with `lsof`.
+ORIENT_OLD_LOOPBACK_PORT = 8099
+LSOF = "/usr/sbin/lsof"
+
+# Whether this install follows Orient's main, and what root's deploy step
+# last recorded as deployed — read for `place_deployed_commit` below,
+# duplicated from `bin/place-orient`'s own `follows_orient_main` and
+# `bin/orient-deploy`'s own `deployed_commit`/`DEPLOYED` respectively,
+# rather than imported: neither is part of either tool's own public shape.
+INSTALL_CONFIG_NAME = "install.json"
+FOLLOW_ORIENT_MAIN_KEY = "follow_orient_main"
+ORIENT_DEPLOY_RECORD_REL = Path("var", "orient-deploy", "deployed")
+CONVIVY_ORIENT_REPO = "convivy-orient"
+SHA = re.compile(r"[0-9a-f]{40}")
+
+ROOT_UID = 0
+ROOT_TOP = Path("/")
+DIR_OPEN = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+FILE_OPEN = os.O_RDONLY | os.O_NOFOLLOW
+NEW_FILE = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+
+
+class Refused(Exception):
+    """Something the operator has to decide about. Never a stack trace."""
+
+
+# --- accounts, duplicated from bin/migrate-library-account --------------------
+
+
+def library_account_name(platform: str | None = None) -> str:
+    platform = platform or ("macos" if sys.platform == "darwin" else "linux")
+    return LIBRARY_ACCOUNT_NAMES[platform]
+
+
+def orient_account_name(platform: str | None = None) -> str:
+    platform = platform or ("macos" if sys.platform == "darwin" else "linux")
+    return ORIENT_ACCOUNT_NAMES[platform]
+
+
+def account_home(name: str) -> str | None:
+    try:
+        return pwd.getpwnam(name).pw_dir
+    except KeyError:
+        return None
+
+
+def account_ids(name: str) -> tuple[int, int] | None:
+    try:
+        entry = pwd.getpwnam(name)
+    except KeyError:
+        return None
+    return entry.pw_uid, entry.pw_gid
+
+
+def user_manager_argv(account: str, uid: int, *args: str) -> list[str]:
+    """argv for a `systemctl --user` call against `account`'s own user
+    manager, run as `account` via `sudo` from root. `sudo -H` clears the
+    environment, so `systemctl --user` has nothing to find that manager
+    by without `XDG_RUNTIME_DIR` supplied here from `uid` directly."""
+    return [SUDO, "-u", account, "-H", "env", f"XDG_RUNTIME_DIR=/run/user/{uid}",
+            "systemctl", "--user", *args]
+
+
+def owned_by(path: str, uid: int) -> bool:
+    """Whether `path` exists, is a real directory and is owned by `uid`.
+
+    Never follows a symlink: a symlink at an account's home would otherwise
+    read or write through it to wherever it points.
+    """
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return True  # nothing there yet is not foreign; it just does not exist
+    if stat.S_ISLNK(info.st_mode):
+        return False
+    return info.st_uid == uid
+
+
+def _owned_by(path: Path, owner: int) -> str | None:
+    """Duplicated from `bin/place-orient`'s own version of this function."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return f"{path} is missing"
+    if stat.S_ISLNK(st.st_mode) or st.st_uid != owner or st.st_mode & 0o022:
+        return f"{path} is not owned by uid {owner} alone, or another account can write it"
+    return None
+
+
+def ancestry_problem(path: Path, owner: int, top: Path) -> str | None:
+    """Why `path` is not trusted as `owner`'s alone, or None when it is.
+
+    Every component from `path` up to and including `top` must belong to
+    `owner` with no group or other write bit and must not be a symlink.
+    Duplicated from `bin/place-orient`'s own version of this function.
+    """
+    for part in [path, *path.parents]:
+        if part == top or top in part.parents:
+            problem = _owned_by(part, owner)
+            if problem:
+                return problem
+    return None
+
+
+def mkdir_owned(path: Path, uid: int, gid: int) -> None:
+    """Create `path` and every missing ancestor below one that already
+    exists, each private (`0700`) and owned by `(uid, gid)`. Duplicated from
+    `bin/migrate-library-account`'s own version of this function."""
+    if path.exists():
+        return
+    mkdir_owned(path.parent, uid, gid)
+    os.mkdir(path, 0o700)
+    os.chown(path, uid, gid)
+
+
+# --- forking and dropping privileges, duplicated from the same tool -----------
+
+
+def _drop_privileges(uid: int, gid: int) -> None:
+    """Become `(uid, gid)` in THIS process, with no supplementary groups
+    carried over. Called only in a child that is about to do nothing else
+    but read or write what that account owns, or run one command as it."""
+    os.setgroups([])
+    os.setgid(gid)
+    os.setuid(uid)
+
+
+def run_as_account(uid: int, gid: int, action, *, drop=None):
+    """Run `action()` — a zero-argument callable returning a JSON-able
+    value — in a child that has dropped to `(uid, gid)` first, and return
+    what it returns, or raise `Refused` with what it raised. Duplicated
+    from `bin/migrate-library-account`'s own version of this function."""
+    if drop is None:
+        drop = _drop_privileges
+    read_fd, write_fd = os.pipe()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            drop(uid, gid)
+            result = action()
+            payload = json.dumps({"ok": True, "result": result}).encode("utf-8")
+        except BaseException as exc:
+            payload = json.dumps({"ok": False, "error": str(exc)}).encode("utf-8")
+        try:
+            with os.fdopen(write_fd, "wb") as out:
+                out.write(len(payload).to_bytes(8, "big"))
+                out.write(payload)
+        finally:
+            os._exit(0)
+    os.close(write_fd)
+    with os.fdopen(read_fd, "rb") as inp:
+        header = inp.read(8)
+        size = int.from_bytes(header, "big") if header else 0
+        data = inp.read(size) if size else b""
+    os.waitpid(pid, 0)
+    decoded = json.loads(data.decode("utf-8")) if data else {"ok": False, "error": "the child reported nothing"}
+    if not decoded.get("ok"):
+        raise Refused(decoded.get("error") or "the child failed silently")
+    return decoded.get("result")
+
+
+# --- detection ------------------------------------------------------------------
+
+
+def agents_orient_control(agents_home: Path) -> Path:
+    return agents_home / ORIENT_CONTROL
+
+
+def needs_migration(agents_home: Path) -> bool:
+    """Whether `agents` still holds Orient's own control database.
+
+    True only for an install whose Orient used to run as `agents`. A fresh
+    install, and an install already migrated (the source was removed once
+    the copy was verified), both answer False, so a rerun changes nothing.
+    `control.db`, not the `.orient-control` directory itself, marks a real
+    Orient: `jobs/orient.toml`'s own `directories` creates that directory
+    for Orient's first start to use, and the Library's own `prepare` mints
+    `library-token`/`library-client-token` into it on `agents` too, on an
+    install that has never run Orient at all — the same reasoning
+    `bin/migrate-library-account`'s own `needs_migration` already applies to
+    the Library's `library.db`.
+    """
+    db = agents_orient_control(agents_home) / "control.db"
+    try:
+        info = os.lstat(db)
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(info.st_mode)
+
+
+# --- accounts and units, called as subprocesses -------------------------------
+
+
+def ensure_orient_account(shape: str, platform: str, run=subprocess.run) -> bool:
+    """Create Orient's own account for `shape`, if it is missing. Returns
+    whether it was created. Calls `bin/provision-accounts`, the same copy
+    this tool ships beside, rather than duplicating what it already does."""
+    name = orient_account_name(platform)
+    if account_home(name) is not None:
+        return False
+    tool = REPO / "bin" / "provision-accounts"
+    interpreter = root_interpreter(platform)
+    done = run([interpreter, str(tool), "--shape", shape],
+               capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        raise Refused(
+            f"could not create the {name} account: provision-accounts --shape {shape} exited "
+            f"{done.returncode}: {(done.stderr or done.stdout).strip()}. Nothing was migrated.")
+    if account_home(name) is None:
+        raise Refused(
+            f"provision-accounts --shape {shape} ran but {name} still does not exist. "
+            f"Nothing was migrated.")
+    return True
+
+
+def place_orient_code(platform: str, run=subprocess.run) -> None:
+    """Place Orient's own code and `{bin}` links with `bin/place-orient`,
+    the same copy this tool ships beside. Idempotent by that tool's own
+    design, so calling it again on a rerun changes nothing once it has
+    already succeeded."""
+    tool = REPO / "bin" / "place-orient"
+    interpreter = root_interpreter(platform)
+    done = run([interpreter, str(tool)], capture_output=True, text=True, check=False)
+    if done.returncode not in (0, 1):
+        raise Refused(
+            f"could not place Orient's own code: place-orient exited {done.returncode}: "
+            f"{(done.stderr or done.stdout).strip()}. Nothing was migrated.")
+
+
+def agents_builder_root(agents_home: str, run=subprocess.run) -> str:
+    """The Builder root `agents` runs with, read by `agents` from its own
+    linked command. Duplicated from `bin/migrate-library-account`'s own
+    version of this function."""
+    link = f"{agents_home}/.local/bin/builder-root"
+    done = run([SUDO, "-u", AGENTS, "-H", link], capture_output=True, text=True, check=False)
+    root = (done.stdout or "").strip()
+    if done.returncode != 0 or not os.path.isabs(root) or "\n" in root:
+        raise Refused(
+            f"could not read the Builder root from {link} as {AGENTS}. The link step places "
+            f"that command, so it has to have run already. Nothing was migrated.")
+    return root
+
+
+def _install_jobs_argv(agents_home: str, root: str, platform: str) -> list[str]:
+    interpreter = root_interpreter(platform)
+    return [
+        interpreter, str(REPO / "bin" / "install-jobs"),
+        "--home", agents_home, "--root", root,
+        "--jobs", str(REPO / "jobs"),
+        "--log-dir", str(PRIVILEGED_PREFIX / "var" / "log"),
+    ]
+
+
+def _install_jobs_output(done) -> str:
+    """Both streams of an `install-jobs` run, stdout first. `install-jobs`
+    prints why a job failed (a start that did not leave it running, a
+    stop timeout) on stdout, while systemctl's own lines go to stderr, so
+    reporting only one stream can drop the reason a step failed."""
+    return "\n".join(s.strip() for s in (done.stdout or "", done.stderr or "") if s.strip())
+
+
+def stop_orient_units(agents_home: str, root: str, platform: str, run=subprocess.run) -> None:
+    """Stop Orient's three units wherever they are currently loaded.
+    Idempotent: a unit that is not running is reported and counts as
+    stopped. Mirrors `bin/migrate-library-account`'s own `stop_library_units`."""
+    argv = _install_jobs_argv(agents_home, root, platform) + ["--stop", *ORIENT_UNIT_LABELS]
+    done = run(argv, capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        raise Refused(
+            f"could not stop Orient's units before moving its data: install-jobs --stop "
+            f"exited {done.returncode}: {_install_jobs_output(done)}. Nothing was migrated.")
+
+
+def render_orient_units(agents_home: str, root: str, platform: str, privileged_prefix: Path,
+                        run=subprocess.run) -> str | None:
+    """Render Orient's own units from the root tree's declarations, writing
+    their unit files to disk without starting or activating any of them —
+    an `install-jobs` run with none of `--activate`, `--stop`, `--start`,
+    `--check`, `--status` or `--dry-run`. `--only ORIENT_UNIT_LABELS` keeps
+    this from also walking every other declared job's prepare steps (as
+    their own privileged accounts) the way an unscoped render did: an
+    unrelated job's prepare failure stopped Orient's own units ever being
+    written, and was then misreported as Orient's own problem. Install-jobs
+    merges `--only`'s record entries into the rest, so the other jobs' own
+    entries are kept rather than read as retired. `start_orient_units` below
+    only runs `install-jobs --start`, which activates a unit already on disk
+    and renders nothing; by the end of the migration, `remove_agents_units`
+    has already deleted the agents' own unit files, so nothing puts Orient's
+    own on disk unless this runs first. `--record` is required: a root run
+    refuses to keep its own record under `agents_home`, which is
+    `install-jobs`' default location for it. Never raises."""
+    argv = _install_jobs_argv(agents_home, root, platform) + [
+        "--only", *ORIENT_UNIT_LABELS,
+        "--record", str(privileged_prefix / "var" / "install-jobs" / "units.json"),
+    ]
+    try:
+        done = run(argv, capture_output=True, text=True, check=False)
+    except OSError as exc:
+        return str(exc)
+    if done.returncode != 0:
+        return f"install-jobs exited {done.returncode}: {_install_jobs_output(done)}"
+    return None
+
+
+def start_orient_units(agents_home: str, root: str, platform: str, labels: tuple[str, ...],
+                       run=subprocess.run) -> str | None:
+    """Start Orient's units named in `labels`. Rollback passes only the units
+    this install actually has (`existing_orient_labels` below, read once the
+    agents' units are restored): `install-jobs --start` refuses the whole
+    batch, naming it, when asked for a label whose unit file is not there,
+    which is exactly what asking for `com.convivy.orient-backup` on an
+    install made before that unit existed would do. `install-jobs --start`
+    only activates a unit already on disk; it renders nothing. The end of
+    the migration passes `ORIENT_UNIT_LABELS` itself, having already
+    rendered them with `render_orient_units` above, since by then the
+    agents' units are gone. An empty `labels` starts nothing, since
+    `install-jobs --start` needs at least one label. Never raises. Mirrors
+    `bin/migrate-library-account`'s own `start_library_units`."""
+    if not labels:
+        return None
+    argv = _install_jobs_argv(agents_home, root, platform) + ["--start", *labels]
+    try:
+        done = run(argv, capture_output=True, text=True, check=False)
+    except OSError as exc:
+        return str(exc)
+    if done.returncode != 0:
+        return f"install-jobs --start exited {done.returncode}: {_install_jobs_output(done)}"
+    return None
+
+
+# --- the units an old install left running as agents, duplicated ---------------
+
+
+def unit_paths(label: str, platform: str, system_dir: str) -> list[Path]:
+    """Every file `label`'s unit occupies in `system_dir`. Duplicated from
+    `bin/migrate-library-account`'s own version of this function."""
+    if platform == "macos":
+        return [Path(system_dir) / f"{label}.plist"]
+    paths = [Path(system_dir) / f"{label}.service"]
+    if label in ORIENT_UNITS_WITH_TIMER:
+        paths.append(Path(system_dir) / f"{label}.timer")
+    return paths
+
+
+def existing_orient_labels(platform: str, system_dir: str) -> list[str]:
+    """Which of `ORIENT_UNIT_LABELS` this install actually has a unit file
+    for, under `system_dir` — what rollback passes `start_orient_units`,
+    rather than `ORIENT_UNIT_LABELS` outright, once the agents' units are
+    restored. An
+    install made before `com.convivy.orient-backup` existed never has that
+    one, and `install-jobs --start` refuses the whole batch, naming it,
+    when asked for a label whose unit file is not there."""
+    return [label for label in ORIENT_UNIT_LABELS if unit_paths(label, platform, system_dir)[0].exists()]
+
+
+def unit_names_agents(data: bytes, platform: str, agents_home: Path) -> bool:
+    """Whether a unit's own `.service` or `.plist` bytes still run it as
+    `agents` or out of `agents`' own deploy path, rather than Orient's own
+    account. Duplicated from `bin/migrate-library-account`'s own version of
+    this function, against `DEPLOY_ORIENT_REL` in place of the Library's."""
+    deploy = str(agents_home / DEPLOY_ORIENT_REL)
+    if platform == "macos":
+        plist = plistlib.loads(data)
+        return plist.get("UserName") == AGENTS or str(plist.get("WorkingDirectory", "")).startswith(deploy)
+    for line in data.decode("utf-8", "replace").splitlines():
+        stripped = line.strip()
+        if stripped == f"User={AGENTS}" or stripped.startswith(f"WorkingDirectory={deploy}"):
+            return True
+    return False
+
+
+def remove_agents_units(agents_home: Path, platform: str, system_dir: str,
+                         removed: dict[Path, bytes], run=subprocess.run) -> None:
+    """Take out of the supervisor every one of Orient's three units that
+    still names `agents` or its deploy path. Duplicated from
+    `bin/migrate-library-account`'s own version of this function, against
+    `ORIENT_UNIT_LABELS` in place of the Library's."""
+    for label in ORIENT_UNIT_LABELS:
+        paths = unit_paths(label, platform, system_dir)
+        try:
+            primary_data = paths[0].read_bytes()
+        except FileNotFoundError:
+            continue
+        if not unit_names_agents(primary_data, platform, agents_home):
+            continue
+        if platform == "macos":
+            run(["launchctl", "bootout", f"system/{label}"], capture_output=True, check=False)
+        else:
+            for path in paths:
+                run(["systemctl", "disable", "--now", path.name], capture_output=True, check=False)
+        removed[paths[0]] = primary_data
+        paths[0].unlink()
+        for path in paths[1:]:
+            try:
+                removed[path] = path.read_bytes()
+            except FileNotFoundError:
+                continue
+            path.unlink()
+    if platform == "linux" and removed and shutil.which("systemctl"):
+        run(["systemctl", "daemon-reload"], capture_output=True, check=False)
+
+
+def restore_agents_units(removed: dict[Path, bytes]) -> None:
+    """Write every unit `remove_agents_units` removed back to its original
+    path, byte for byte. Duplicated from `bin/migrate-library-account`'s own
+    version of this function."""
+    for path, data in removed.items():
+        path.write_bytes(data)
+
+
+# --- the old deploy watcher, a per-user LaunchAgent/systemd --user unit --------
+
+
+def deploy_watch_paths(platform: str, agents_home: Path) -> list[Path]:
+    """Where `OLD_DEPLOY_WATCH_LABEL`'s own declaration lives: a LaunchAgent
+    under `agents`' own `~/Library/LaunchAgents` on macOS, or, on Linux, the
+    matching per-user systemd unit under `agents`' own
+    `~/.config/systemd/user` — never confirmed on Linux, since the watcher
+    this retires was built ad hoc for a Mac; kept generic here so a Linux
+    install carrying an equivalent by the same name is still cleaned up
+    rather than silently skipped."""
+    if platform == "macos":
+        return [agents_home / "Library" / "LaunchAgents" / f"{OLD_DEPLOY_WATCH_LABEL}.plist"]
+    base = agents_home / ".config" / "systemd" / "user"
+    return [base / f"{OLD_DEPLOY_WATCH_LABEL}.service", base / f"{OLD_DEPLOY_WATCH_LABEL}.timer"]
+
+
+def remove_deploy_watch(platform: str, agents_home: Path, agents_uid: int,
+                        removed: dict[Path, bytes], run=subprocess.run) -> None:
+    """Boot out (macOS) or disable (Linux) and remove the old deploy
+    watcher, if it is still there. Idempotent: an install already migrated,
+    or one that never carried this ad hoc watcher at all, has nothing at
+    these paths and this changes nothing."""
+    paths = [p for p in deploy_watch_paths(platform, agents_home) if p.exists()]
+    if not paths:
+        return
+    if platform == "macos":
+        run(["launchctl", "bootout", f"gui/{agents_uid}/{OLD_DEPLOY_WATCH_LABEL}"],
+            capture_output=True, check=False)
+    else:
+        run(user_manager_argv(AGENTS, agents_uid, "disable", "--now",
+            f"{OLD_DEPLOY_WATCH_LABEL}.service"), capture_output=True, check=False)
+    for path in paths:
+        removed[path] = path.read_bytes()
+        path.unlink()
+
+
+def restore_deploy_watch(platform: str, agents_uid: int, removed: dict[Path, bytes],
+                         run=subprocess.run) -> None:
+    """Write the old deploy watcher's files back and reload it, for
+    rollback. Never raises — the same promise `start_library_units` already
+    keeps in `bin/migrate-library-account`'s own rollback path."""
+    watch_paths = [p for p in removed if OLD_DEPLOY_WATCH_LABEL in p.name]
+    if not watch_paths:
+        return
+    for path in watch_paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(removed[path])
+    try:
+        if platform == "macos":
+            run(["launchctl", "bootstrap", f"gui/{agents_uid}", str(watch_paths[0])],
+                capture_output=True, check=False)
+        else:
+            run(user_manager_argv(AGENTS, agents_uid, "enable", "--now",
+                f"{OLD_DEPLOY_WATCH_LABEL}.service"), capture_output=True, check=False)
+    except OSError:
+        pass  # best-effort; the files are back either way
+
+
+# --- the new root deploy step --------------------------------------------------
+
+
+def root_deploy_step_loaded(platform: str, run=subprocess.run) -> bool:
+    """Whether `ROOT_DEPLOY_UNIT_LABEL` is already loaded in the supervisor
+    — true only once `bin/orient-deploy` (spec step 4; see the module
+    docstring) has been installed and loaded from its own job declaration,
+    `jobs/follow-orient-main/orient-deploy.toml`. Never raises: a missing
+    `launchctl`/`systemctl` answers False, the same "nothing to find" a real
+    refusal path turns into a clear message."""
+    if platform == "macos":
+        done = run(["launchctl", "print", f"system/{ROOT_DEPLOY_UNIT_LABEL}"],
+                   capture_output=True, text=True, check=False)
+        return done.returncode == 0
+    done = run(["systemctl", "is-enabled", f"{ROOT_DEPLOY_UNIT_LABEL}.timer"],
+               capture_output=True, text=True, check=False)
+    return done.returncode == 0
+
+
+def start_root_deploy_step(platform: str, run=subprocess.run) -> None:
+    """Start the root deploy step that replaces the old watcher. Refuses,
+    naming the missing unit, when it is not loaded — see the module
+    docstring's note on `ROOT_DEPLOY_UNIT_LABEL`. This refusal is
+    deliberately the one that stops the whole migration before anything is
+    rotated."""
+    if not root_deploy_step_loaded(platform, run=run):
+        raise Refused(
+            f"{ROOT_DEPLOY_UNIT_LABEL} is not loaded in the supervisor. That is "
+            f"bin/orient-deploy's own job, declared in "
+            f"jobs/follow-orient-main/orient-deploy.toml. Install and load it first. "
+            f"Nothing was migrated.")
+    if platform == "macos":
+        done = run(["launchctl", "kickstart", "-k", f"system/{ROOT_DEPLOY_UNIT_LABEL}"],
+                   capture_output=True, text=True, check=False)
+    else:
+        run(["systemctl", "start", f"{ROOT_DEPLOY_UNIT_LABEL}.timer"], capture_output=True, check=False)
+        done = run(["systemctl", "start", f"{ROOT_DEPLOY_UNIT_LABEL}.service"],
+                   capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        raise Refused(
+            f"{ROOT_DEPLOY_UNIT_LABEL} is loaded but could not be started: exited "
+            f"{done.returncode}: {(done.stderr or done.stdout).strip()}. Nothing was migrated.")
+
+
+def stop_root_deploy_step(platform: str, run=subprocess.run) -> None:
+    """Stop the root deploy step, for rollback. Never raises."""
+    try:
+        if platform == "macos":
+            run(["launchctl", "bootout", f"system/{ROOT_DEPLOY_UNIT_LABEL}"], capture_output=True, check=False)
+        else:
+            run(["systemctl", "stop", f"{ROOT_DEPLOY_UNIT_LABEL}.service",
+                f"{ROOT_DEPLOY_UNIT_LABEL}.timer"], capture_output=True, check=False)
+    except OSError:
+        pass
+
+
+# --- following Orient's main: placing the deploy step's own record --------------
+
+
+def follows_orient_main(privileged_prefix: Path) -> bool:
+    """Whether root's own `install.json` turns the deploy step on — the
+    same check `bin/place-orient`'s own `follows_orient_main` already
+    makes before deciding whether to place Orient's code itself or leave
+    it to the deploy step. Duplicated here rather than imported, the same
+    way every other function this file shares with `place-orient` already
+    is."""
+    try:
+        data = json.loads((privileged_prefix / INSTALL_CONFIG_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get(FOLLOW_ORIENT_MAIN_KEY) is True
+
+
+def read_deployed_commit(privileged_prefix: Path) -> str | None:
+    """The commit root's own deploy step (`bin/orient-deploy`) last
+    recorded as deployed, under `{privileged_prefix}/var/orient-deploy/
+    deployed` — the same record `bin/orient-deploy`'s own
+    `deployed_commit()`/`write_deployed()` read and write. `None` when the
+    file is missing or does not hold a commit."""
+    try:
+        text = (privileged_prefix / ORIENT_DEPLOY_RECORD_REL).read_text(encoding="ascii")
+    except OSError:
+        return None
+    sha = text.strip()
+    return sha if SHA.fullmatch(sha) else None
+
+
+def convivy_orient_repo_name(privileged_prefix: Path) -> str:
+    """The convivy-orient repository's own name: install.json's
+    `convivy_orient_repo`, falling back to `CONVIVY_ORIENT_REPO` exactly
+    where `bin/orient-deploy`'s own `Context.load()` falls back to
+    `install-privileged`'s own `DEFAULTS["convivy_orient_repo"]` — when
+    install.json does not exist, does not hold a JSON object, or does not
+    carry the key. Duplicated from `follows_orient_main`'s own read of
+    the same file, rather than read through `install-privileged`'s own
+    `load_config`, which refuses outside its own extracted tree at import
+    time (see `_install_privileged_for_extract` below): this is read on
+    every real run, not only one that follows Orient's main."""
+    try:
+        data = json.loads((privileged_prefix / INSTALL_CONFIG_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return CONVIVY_ORIENT_REPO
+    if not isinstance(data, dict):
+        return CONVIVY_ORIENT_REPO
+    repo = data.get("convivy_orient_repo")
+    return repo if isinstance(repo, str) and repo else CONVIVY_ORIENT_REPO
+
+
+def _install_privileged_for_extract():
+    """`bin/install-privileged`'s own `extract()`, loaded only when this
+    runs for real — never at import time, including under this file's own
+    test suite: install-privileged's own module load refuses unless it
+    sits in its own extracted tree (true once this script, too, is run
+    from there, the same tree `bin/orient-deploy` runs from; see the
+    module docstring), which a test importing this module from an
+    arbitrary checkout is not."""
+    return _load_sibling("install_privileged_for_migrate_orient_account", "install-privileged")
+
+
+def extract_deployed_tree(privileged_prefix: Path, sha: str) -> Path:
+    """convivy-orient's own tree at `sha`, extracted from root's own bare
+    copy exactly as `bin/orient-deploy` extracts a commit —
+    `install-privileged`'s own `extract()`, reused here rather than
+    duplicated. The bare copy is named from `convivy_orient_repo_name`,
+    not the hardcoded `CONVIVY_ORIENT_REPO`, so this agrees with
+    `bin/orient-deploy`'s own `Context` about which repository's bare
+    copy and commit root's deploy step actually recorded."""
+    module = _install_privileged_for_extract()
+    repo = convivy_orient_repo_name(privileged_prefix)
+    bare = str(privileged_prefix / "src" / f"{repo}.git")
+    return Path(module.extract(str(privileged_prefix), bare, repo, sha))
+
+
+def place_deployed_commit(privileged_prefix: Path, sha: str, orient_name: str, platform: str, *,
+                          extract=extract_deployed_tree, run=subprocess.run) -> None:
+    """On an install that follows Orient's main, nothing else puts
+    Orient's code under its own account before its first restart:
+    `place_orient_code()` leaves it to the deploy step on such an install
+    (`bin/place-orient`'s own `follows_orient_main` check), and the deploy
+    step itself is not started until Orient's own units are confirmed
+    running again, near the end of `migrate()`. This places the commit
+    the deploy step already recorded as deployed, with `install-backend
+    --from-tree`, in the exact argv shape `bin/place-orient`'s own
+    `place_argv()` builds — reused here rather than re-derived. `extract`,
+    injectable for a test, defaults to `extract_deployed_tree` above.
+
+    `extract` itself may raise a refusal that is not this script's own:
+    the real `extract_deployed_tree` calls into `install-privileged`'s own
+    `extract()`, which raises its own `Refused` (`github_gate.Refused`) —
+    a class `main()`'s own `except Refused` does not recognise, so it
+    would otherwise escape as a traceback after the two tokens are
+    already rotated and Orient's state already moved. Caught here by
+    class name rather than identity: a test's own injected `extract`
+    raises a stand-in for the sibling's class, never the real one, and
+    loading the real `install-privileged` here, on every call, would run
+    its own location guard against a checkout this script's own test
+    suite loads from.
+
+    Loading that sibling (inside `extract_deployed_tree`, through
+    `_install_privileged_for_extract`) can also raise `SystemExit`: its
+    own `running_copy()` calls `sys.exit(2)` rather than raising
+    `Refused` when the extracted tree fails its ownership check.
+    `SystemExit` is a `BaseException`, not an `Exception` — `except
+    Exception` does not see it, so it is caught here by its own type,
+    past the same point of no return, with the same report.
+    """
+    try:
+        tree = extract(privileged_prefix, sha)
+    except Refused:
+        raise
+    except SystemExit as exc:
+        raise Refused(
+            f"could not extract {sha}'s own tree to place under {orient_name}'s own deploy "
+            f"area: install-privileged's own location check refused loading it (exit "
+            f"{exc.code}). Orient's own account already holds its rotated tokens and its "
+            f"moved state; its own code was not placed, so neither Orient nor "
+            f"{ROOT_DEPLOY_UNIT_LABEL} may start against it. Place {sha} under {orient_name}'s "
+            f"own deploy area by hand once this is resolved, then restart Orient and start "
+            f"{ROOT_DEPLOY_UNIT_LABEL} yourself. Nothing further was migrated.") from exc
+    except Exception as exc:
+        if type(exc).__name__ != "Refused":
+            raise
+        raise Refused(
+            f"could not extract {sha}'s own tree to place under {orient_name}'s own deploy "
+            f"area: {exc} Orient's own account already holds its rotated tokens and its moved "
+            f"state; its own code was not placed, so neither Orient nor "
+            f"{ROOT_DEPLOY_UNIT_LABEL} may start against it. Place {sha} under {orient_name}'s "
+            f"own deploy area by hand once this is resolved, then restart Orient and start "
+            f"{ROOT_DEPLOY_UNIT_LABEL} yourself. Nothing further was migrated.") from exc
+    interpreter = root_interpreter(platform)
+    full, _shown = place_orient.place_argv(tree, sha, None, orient_name, interpreter)
+    done = run(full, capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        raise Refused(
+            f"could not place {sha} under {orient_name}'s own deploy area before its "
+            f"restart: install-backend exited {done.returncode}: "
+            f"{(done.stderr or done.stdout).strip()}. Nothing further was migrated.")
+
+
+# --- cloudflared's own old loopback port, checked before a rollback writes back -
+
+
+def lsof_listener_pid(port: int = ORIENT_OLD_LOOPBACK_PORT, run=subprocess.run) -> int | None:
+    """The pid of whatever process `lsof` reports as LISTENing on
+    `127.0.0.1:{port}`, read from `lsof -nP -iTCP:{port} -sTCP:LISTEN`'s
+    own machine-readable `-F p` (pid-only) output. `None` when nothing is
+    listening, or `lsof` itself could not be run."""
+    done = run([LSOF, "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-F", "p"],
+              capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        return None
+    for line in (done.stdout or "").splitlines():
+        if line.startswith("p"):
+            try:
+                return int(line[1:])
+            except ValueError:
+                continue
+    return None
+
+
+def supervisor_main_pid(label: str, platform: str, run=subprocess.run) -> int | None:
+    """The system supervisor's own report of `label`'s main process:
+    `launchctl print`'s own `pid = <N>` line on macOS, `systemctl show
+    ...MainPID`'s own value on Linux. `None` when the unit is not running,
+    is not loaded, or the supervisor cannot be read."""
+    if platform == "macos":
+        done = run(["launchctl", "print", f"system/{label}"], capture_output=True, text=True, check=False)
+        if done.returncode != 0:
+            return None
+        for line in (done.stdout or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("pid = "):
+                try:
+                    return int(stripped[len("pid = "):])
+                except ValueError:
+                    return None
+        return None
+    done = run(["systemctl", "show", f"{label}.service", "-p", "MainPID", "--value"],
+              capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        return None
+    try:
+        pid = int((done.stdout or "").strip())
+    except ValueError:
+        return None
+    return pid or None  # 0 means the unit is not running
+
+
+def _real_port_connects(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(2)
+        try:
+            sock.connect(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+def confirm_restored_orient_holds_port(platform: str, *, run=subprocess.run,
+                                       port_connects=_real_port_connects) -> tuple[bool, str | None]:
+    """Whether 127.0.0.1's own old loopback port is held by the restored
+    agents' Orient unit's own main process, confirmed two ways: the
+    system supervisor's own report of that unit's main pid matches
+    `lsof`'s own listener pid, and a connection to the port succeeds.
+    Returns `(True, None)` once it is; otherwise `(False, <a description
+    of whatever holds the port, or None when nothing does>)` — what a
+    rollback's own report names when it leaves the tunnel on the socket.
+    Never mistakes an impostor bound to the same port for the restored
+    unit: a pid lsof reports that the supervisor's own report does not
+    name as that unit's main process is refused, by name, same as no
+    listener at all. The two `False` cases are worded differently: a pid
+    mismatch names an impostor holding the port instead, while a matching
+    pid that still fails to connect names the restored unit itself, not
+    yet accepting connections.
+    """
+    listener_pid = lsof_listener_pid(run=run)
+    if listener_pid is None:
+        return False, None
+    main_pid = supervisor_main_pid(ORIENT_UNIT_LABELS[0], platform, run=run)
+    if main_pid is None or main_pid != listener_pid:
+        return False, f"pid {listener_pid} holds it instead"
+    if not port_connects(ORIENT_OLD_LOOPBACK_PORT):
+        return False, (f"the restored Orient (pid {listener_pid}) holds the port but is "
+                       f"not yet accepting connections")
+    return True, None
+
+
+def _write_cloudflared_config(config_path: Path, text: str) -> None:
+    """Write `text` to `config_path` atomically, preserving the existing
+    file's permission bits and ownership. The temporary file is written by
+    this process, which runs as root, into a directory the operator owns,
+    so every step binds to the fd of the file this call actually created,
+    never to the temporary name by path: `O_EXCL | O_NOFOLLOW` refuses to
+    open through a symlink planted there ahead of time, and the chmod/chown
+    that follow are `fchmod`/`fchown` on that fd rather than `chmod`/`chown`
+    on the path, so neither can be redirected to wherever such a symlink
+    points. A regular-file leftover from an earlier, unfinished run is
+    removed before the open; anything else at that name is refused rather
+    than removed. Shared by `repoint_cloudflared` for its own replacement
+    and by `revert_cloudflared` for the rollback."""
+    tmp = config_path.with_name(f".{config_path.name}.rollback")
+    st = os.stat(config_path)
+    try:
+        leftover = os.lstat(tmp)
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISREG(leftover.st_mode):
+            raise Refused(
+                f"refusing {tmp}: it already exists there and is not a plain regular "
+                f"file. Nothing further was migrated.")
+        os.unlink(tmp)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, stat.S_IMODE(st.st_mode))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as out:
+            out.write(text)
+        os.fchmod(fd, stat.S_IMODE(st.st_mode))
+        os.fchown(fd, st.st_uid, st.st_gid)
+    finally:
+        os.close(fd)
+    os.replace(tmp, config_path)
+
+
+def revert_cloudflared(config_path: Path, original_text: str, operator: str, operator_uid: int,
+                       platform: str, label: str, run=subprocess.run) -> None:
+    """Write `original_text` — the bytes `repoint_cloudflared` found
+    before this run changed them — back to `config_path`, atomically, and
+    restart `cloudflared`. Called only once
+    `confirm_restored_orient_holds_port` has confirmed the restored,
+    agents'-own Orient truly holds the old loopback port."""
+    _write_cloudflared_config(config_path, original_text)
+    restart_cloudflared(operator, operator_uid, platform, label, run=run)
+
+
+# --- the symlink-safe tree copy, duplicated from bin/migrate-library-account ---
+
+
+def _open_dir(parent_fd: int, name: str, shown: str) -> int:
+    try:
+        return os.open(name, DIR_OPEN, dir_fd=parent_fd)
+    except OSError as exc:
+        raise Refused(f"refusing {shown}: {exc.strerror}. Nothing was migrated.") from exc
+
+
+def _read_hashing(fin, fout=None, chunk_size: int = 1 << 20) -> tuple[int, str]:
+    import hashlib
+    hasher = hashlib.sha256()
+    size = 0
+    while True:
+        chunk = fin.read(chunk_size)
+        if not chunk:
+            break
+        hasher.update(chunk)
+        if fout is not None:
+            fout.write(chunk)
+        size += len(chunk)
+    return size, hasher.hexdigest()
+
+
+def copy_tree(src_fd: int, dst_fd: int, shown: str, uid: int, gid: int,
+              manifest: dict[str, tuple[int, str]] | None = None, rel: str = "") -> None:
+    """Copy every entry under `src_fd` into `dst_fd`, owned by `(uid, gid)`,
+    private permission bits only. Never follows a symlink, and refuses any
+    special file. Duplicated from `bin/migrate-library-account`'s own
+    version of this function; see that file's own docstring for why."""
+    for name in sorted(os.listdir(src_fd)):
+        info = os.stat(name, dir_fd=src_fd, follow_symlinks=False)
+        entry_shown = f"{shown}/{name}"
+        entry_rel = f"{rel}/{name}" if rel else name
+        if stat.S_ISDIR(info.st_mode):
+            os.mkdir(name, 0o700, dir_fd=dst_fd)
+            child_dst = _open_dir(dst_fd, name, entry_shown)
+            try:
+                os.fchown(child_dst, uid, gid)
+                child_src = _open_dir(src_fd, name, entry_shown)
+                try:
+                    copy_tree(child_src, child_dst, entry_shown, uid, gid, manifest, entry_rel)
+                finally:
+                    os.close(child_src)
+            finally:
+                os.close(child_dst)
+        elif stat.S_ISREG(info.st_mode):
+            in_fd = os.open(name, FILE_OPEN, dir_fd=src_fd)
+            try:
+                out_fd = os.open(name, NEW_FILE, 0o600, dir_fd=dst_fd)
+                try:
+                    with os.fdopen(in_fd, "rb", closefd=False) as fin, \
+                            os.fdopen(out_fd, "wb", closefd=False) as fout:
+                        size, digest = _read_hashing(fin, fout)
+                    os.fchown(out_fd, uid, gid)
+                finally:
+                    os.close(out_fd)
+            finally:
+                os.close(in_fd)
+            if manifest is not None:
+                manifest[entry_rel] = (size, digest)
+        else:
+            kind = "a symlink" if stat.S_ISLNK(info.st_mode) else "neither a regular file nor a directory"
+            raise Refused(
+                f"refusing {entry_shown}: it is {kind}, which this will not follow or copy. "
+                f"Nothing was migrated.")
+
+
+def hash_tree(root: Path) -> dict[str, tuple[int, str]]:
+    """Duplicated from `bin/migrate-library-account`'s own version of this
+    function."""
+    listing: dict[str, tuple[int, str]] = {}
+    for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
+        for name in filenames:
+            path = Path(dirpath, name)
+            with open(path, "rb") as f:
+                size, digest = _read_hashing(f)
+            listing[str(path.relative_to(root))] = (size, digest)
+    return listing
+
+
+def verify_tree_copy(manifest: dict[str, tuple[int, str]], dst: Path) -> None:
+    """Duplicated from `bin/migrate-library-account`'s own version of this
+    function."""
+    after = hash_tree(dst)
+    if manifest != after:
+        missing = sorted(set(manifest) - set(after))
+        wrong = sorted(k for k in set(manifest) & set(after) if manifest[k] != after[k])
+        extra = sorted(set(after) - set(manifest))
+        raise Refused(
+            f"the copy at {dst} does not match what was read from its source: missing={missing[:5]} "
+            f"wrong={wrong[:5]} unexpected={extra[:5]}. Nothing was migrated.")
+
+
+# --- flat file moves, for .orient-control's and the config root's own remainder -
+
+
+def _copied_so_far(copied: list[str]) -> str:
+    """The clause every `copy_flat_files` refusal below appends: this call
+    runs only after the two Library tokens are already rotated (the point
+    of no return — see `migrate()`'s own call site), so none of its own
+    refusals may claim nothing was migrated, and whatever it already
+    copied before failing has to be named rather than lost in a generic
+    message."""
+    return f" Already copied this call: {', '.join(copied)}." if copied else " Nothing copied this call yet."
+
+
+def copy_flat_files(src_dir: Path, dst_dir: Path, names: tuple[str, ...], uid: int, gid: int,
+                    owner_uid: int, copied: list[str]) -> None:
+    """Copy every one of `names` directly under `src_dir`, that is actually
+    there, into `dst_dir`, owned by `(uid, gid)`, appending each copied name
+    to `copied`. Never follows a symlink, and refuses a special file or a
+    name already present at the destination — the same discipline
+    `bin/migrate-library-account`'s own `copy_credentials` already holds,
+    generalised past `is_known_credential`'s own name list to whatever
+    subset of `names` this call is given. Called only after the two
+    Library tokens are already rotated, so every refusal here names what
+    this call already copied instead of claiming nothing was migrated."""
+    if not src_dir.is_dir():
+        return
+    src_fd = os.open(str(src_dir), DIR_OPEN)
+    try:
+        if os.fstat(src_fd).st_uid != owner_uid:
+            raise Refused(f"refusing {src_dir}: it is not owned by {AGENTS}.{_copied_so_far(copied)}")
+        dst_dir.mkdir(mode=0o700, exist_ok=True)
+        dst_fd = os.open(str(dst_dir), DIR_OPEN)
+        try:
+            os.fchown(dst_fd, uid, gid)
+            present = set(os.listdir(src_fd))
+            for name in sorted(names):
+                if name not in present:
+                    continue
+                info = os.stat(name, dir_fd=src_fd, follow_symlinks=False)
+                if not stat.S_ISREG(info.st_mode):
+                    raise Refused(
+                        f"refusing {src_dir}/{name}: it is not a plain regular file."
+                        f"{_copied_so_far(copied)}")
+                in_fd = os.open(name, FILE_OPEN, dir_fd=src_fd)
+                try:
+                    try:
+                        out_fd = os.open(name, NEW_FILE, 0o600, dir_fd=dst_fd)
+                    except FileExistsError as exc:
+                        raise Refused(
+                            f"refusing {dst_dir}/{name}: it already exists there. This looks "
+                            f"like a previous migration that did not finish cleanly. Resolve "
+                            f"by hand.{_copied_so_far(copied)}") from exc
+                    try:
+                        with os.fdopen(in_fd, "rb", closefd=False) as fin, \
+                                os.fdopen(out_fd, "wb", closefd=False) as fout:
+                            shutil.copyfileobj(fin, fout)
+                        os.fchown(out_fd, uid, gid)
+                    finally:
+                        os.close(out_fd)
+                finally:
+                    os.close(in_fd)
+                copied.append(name)
+        finally:
+            os.close(dst_fd)
+    finally:
+        os.close(src_fd)
+
+
+def remaining_agents_orient_files(agents_home: Path) -> list[str]:
+    """Which of the files the module docstring's own table gives Orient —
+    both Library tokens, `.orient-control`'s other names, and the config
+    root's own five — are still present under `agents`' own home. Named
+    for the report a failure after the token rotation gives the operator:
+    each is deleted by hand, once Orient's own copy is confirmed, so
+    commitment 5 (`agents` holds no human-reserved capability) holds on
+    this install too."""
+    found = []
+    agents_oc = agents_orient_control(agents_home)
+    for name in (*ORIENT_TOKEN_NAMES, *ORIENT_CONTROL_OTHER_NAMES):
+        if os.path.lexists(agents_oc / name):
+            found.append(str(agents_oc / name))
+    config_root = agents_home / ORIENT_CONFIG_REL
+    for name in ORIENT_CONFIG_ROOT_NAMES:
+        if os.path.lexists(config_root / name):
+            found.append(str(config_root / name))
+    return found
+
+
+def move_sibling_logs(agents_home: Path, orient_home: Path, agents_uid: int,
+                      orient_ids: tuple[int, int]) -> list[str]:
+    """Copy every one of `ORIENT_SIBLING_LOGS` that is actually there from
+    `{agents_home}/.local/state` to the same place under Orient's own
+    account, and remove the original on success. Best-effort: called only
+    after Orient's state is already promoted, so a failure here is reported
+    by the caller rather than rolled back, the same way
+    `bin/migrate-library-account`'s own `move_sibling_log` is. Returns the
+    names it moved."""
+    moved: list[str] = []
+    src_dir = agents_home / STATE_REL
+    dst_dir = orient_home / STATE_REL
+    for name in ORIENT_SIBLING_LOGS:
+        src = src_dir / name
+        try:
+            in_fd = os.open(str(src), FILE_OPEN)
+        except FileNotFoundError:
+            continue
+        try:
+            info = os.fstat(in_fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != agents_uid:
+                os.close(in_fd)
+                continue
+            mkdir_owned(dst_dir, *orient_ids)
+            dst = dst_dir / name
+            if os.path.lexists(dst):
+                os.close(in_fd)
+                continue
+            out_fd = os.open(str(dst), NEW_FILE, 0o600)
+            try:
+                with os.fdopen(in_fd, "rb", closefd=False) as fin, \
+                        os.fdopen(out_fd, "wb", closefd=False) as fout:
+                    shutil.copyfileobj(fin, fout)
+                os.fchown(out_fd, *orient_ids)
+            finally:
+                os.close(out_fd)
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(in_fd)
+        os.remove(src)
+        moved.append(name)
+    return moved
+
+
+# --- credential rotation --------------------------------------------------------
+
+
+def library_deploy_dir(library_home: Path) -> Path:
+    return library_home / ".local" / "deploy" / "library"
+
+
+def mint_credential_argv(library_home: Path, *extra: str) -> list[str]:
+    deploy = library_deploy_dir(library_home)
+    return [str(deploy / ".venv" / "bin" / "python"), str(deploy / "mint_credential.py"), *extra]
+
+
+def mint_credential_env(library_home: Path) -> dict[str, str]:
+    """The environment `mint_credential.py` runs under — `HOME` naming the
+    Library's own account, the same way `jobs/library.toml`'s own
+    `[environment] HOME = "{home}"` does for every `prepare` entry that
+    calls it. Called inside a child `run_as_account` has already dropped to
+    that account's own uid and gid, which does not by itself change `HOME`
+    — the fork inherits root's own environment — so every subprocess call
+    into `mint_credential.py` below passes this explicitly rather than
+    relying on inherited state.
+    """
+    return {"HOME": str(library_home), "PATH": "/usr/bin:/bin"}
+
+
+def library_role_withholds(library_home: Path, grant: str, run=subprocess.run) -> list[str]:
+    """Every capability the Library's own `agent` role grants, except
+    `grant` itself — computed by running the Library's own interpreter
+    against the Library's own tree, the identical `identity.ROLE_CAPS
+    ["agent"]` computation `jobs/library.toml`'s own mint of
+    `capture-token` and `kb-person-save-token` runs at install time —
+    rather than a tuple written out here, which a later release adding a
+    capability to that role would silently grant instead of withhold.
+    Runs with the Library's own deploy directory as the working directory,
+    the same `working-directory` `jobs/library.toml` names for every
+    `prepare` step, so `import identity` resolves the Library's own module
+    rather than failing to find it or finding some other one on this
+    process's own path. Refuses, naming `grant`, when the computation
+    fails or yields nothing to withhold — an empty list would mint a
+    credential holding every agent capability, the opposite of what
+    either mint calling this is for.
+    """
+    deploy = library_deploy_dir(library_home)
+    # `identity` imports `store`, whose module top level refuses to load
+    # without LIBRARY_DB or ORIENT_CONTROL_DB. The job's own mints run under
+    # the job's [environment], which sets LIBRARY_DB; this runs under
+    # `mint_credential_env`, which does not. So the script sets the same
+    # never-opened placeholder `mint_credential.py` itself sets before its
+    # own imports, with `setdefault`, and reads no database.
+    script = ("import os\n"
+              "os.environ.setdefault('LIBRARY_DB', '/nonexistent/role-withholds-placeholder.db')\n"
+              "import identity, sys\n"
+             f"sys.stdout.write(','.join(sorted(c for c in identity.ROLE_CAPS['agent'] if c != {grant!r})))")
+    argv = [str(deploy / ".venv" / "bin" / "python"), "-c", script]
+    done = run(argv, capture_output=True, text=True, check=False,
+              cwd=str(deploy), env=mint_credential_env(library_home))
+    if done.returncode != 0:
+        raise Refused(
+            f"could not compute --withholds for {grant} from the Library's own identity module: "
+            f"exited {done.returncode}: {(done.stderr or done.stdout).strip()}. Nothing was minted.")
+    withholds = sorted({c for c in done.stdout.strip().split(",") if c})
+    if not withholds:
+        raise Refused(
+            f"computing --withholds for {grant} from the Library's own identity module yielded "
+            f"nothing to withhold. Refusing to mint a credential holding every agent capability. "
+            f"Nothing was minted.")
+    return withholds
+
+
+def tokens_file_path(library_home: Path, store_file: str) -> Path:
+    """Where `store_file`'s own token store (`"agents"` or `"clients"`)
+    sits on disk, under the Library account's own state directory."""
+    return library_home / STATE_REL / "library" / ORIENT_TOKEN_STORE_FILENAMES[store_file]
+
+
+# Every field `mint_credential.py --replace` can rebuild an entry from —
+# every one of its own non-secret, non-timestamp flags (`--kind`,
+# `--products`, `--grants`, `--holds-reserved`, `--withholds`, `--profile`,
+# `--crew`, `--entity`, `--all-entities`). Restricting a read entry to
+# exactly this set, rather than keeping everything the JSON holds, is what
+# keeps the secret — the store's own key for the entry, never a field
+# inside it — and `created_at` out of both the `--replace` argv and the
+# before/after comparison, with no need to name either by its own key.
+ORIENT_TOKEN_ENTRY_FIELDS = (
+    "kind", "products", "grants", "holds_reserved", "withholds",
+    "profile", "crew", "entity", "all_entities",
+)
+
+
+def read_store_entry(tokens_file: Path, name: str, *, required: bool = True) -> dict | None:
+    """`name`'s own entry in `tokens_file`, a JSON object keyed by each
+    entry's own secret, with the entry found by its `name` field rather than
+    by the key. Returns the entry's value restricted to
+    `ORIENT_TOKEN_ENTRY_FIELDS`, so neither the secret that keys it nor
+    `created_at` is ever read into it. Refuses, naming `tokens_file`, when
+    it cannot be read or parsed as a JSON object, or when `name` is carried
+    by more than one entry — the same ambiguity `mint_credential.py`'s own
+    `--revoke` refuses. Also refuses, naming the field, when the entry
+    carries a field outside `ORIENT_TOKEN_ENTRY_FIELDS` and outside `name`
+    and `created_at` — a field `mint_credential.py --replace` cannot be
+    told to carry forward, rather than one this script could silently drop.
+    When `name` is carried by no entry, refuses the same way unless
+    `required` is False, in which case this returns None — an install that
+    predates the credential's own mint carries no such entry at all.
+    """
+    try:
+        text = tokens_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise Refused(f"could not read {tokens_file}: {exc}. Nothing was migrated.") from exc
+    try:
+        store = json.loads(text)
+    except ValueError as exc:
+        raise Refused(f"{tokens_file} does not hold valid JSON: {exc}. Nothing was migrated.") from exc
+    if not isinstance(store, dict):
+        raise Refused(f"{tokens_file} does not hold a JSON object. Nothing was migrated.")
+    matches = [entry for entry in store.values()
+              if isinstance(entry, dict) and entry.get("name") == name]
+    if not matches and not required:
+        return None
+    if len(matches) != 1:
+        raise Refused(
+            f"{name} is carried by {len(matches)} entries in {tokens_file}, not exactly one. "
+            f"Nothing was migrated.")
+    entry = matches[0]
+    unknown = sorted(set(entry) - set(ORIENT_TOKEN_ENTRY_FIELDS) - {"name", "created_at"})
+    if unknown:
+        raise Refused(
+            f"{name}'s own entry in {tokens_file} carries {', '.join(unknown)}, outside "
+            f"ORIENT_TOKEN_ENTRY_FIELDS and neither name nor created_at. Refusing to rotate "
+            f"past a field this script does not know to carry forward. Nothing was migrated.")
+    return {k: entry[k] for k in ORIENT_TOKEN_ENTRY_FIELDS if k in entry}
+
+
+def replace_argv_for(library_home: Path, store_file: str, tokens_file: Path, name: str,
+                     out_path: Path, fields: dict) -> list[str]:
+    """The full `mint_credential.py --replace` command line that rebuilds
+    `name`'s entry in `store_file` from `fields` (`read_store_entry`'s own
+    result) — every one of `ORIENT_TOKEN_ENTRY_FIELDS` the entry actually
+    carries, each passed back as `--<key with dashes for underscores>
+    <value>`, a list value joined with commas, and an empty list or empty
+    string passed as `--<flag>=` (the same empty-value shape
+    `jobs/library.toml`'s own `--holds-reserved=` already uses) so that a
+    withheld grant is reasserted as withheld rather than silently dropped.
+    A null value is skipped: `mint_credential.py` reads its absence as the
+    field's own default. `--tokens-file` is always passed explicitly, the
+    same way `bin/deliver-library-credentials` always passes it to
+    `mint-crew-ops-credentials`, rather than relying on `mint_credential.py`'s
+    own environment-variable default.
+    """
+    argv = mint_credential_argv(library_home, "--file", store_file, "--name", name,
+                                "--tokens-file", str(tokens_file), "--replace", "--out", str(out_path))
+    for key, value in fields.items():
+        if value is None:
+            continue
+        flag = "--" + key.replace("_", "-")
+        rendered = ",".join(str(v) for v in value) if isinstance(value, list) else str(value)
+        if rendered == "":
+            argv.append(f"{flag}=")  # an empty list/string, reasserted as withheld, not dropped
+        else:
+            argv += [flag, rendered]
+    return argv
+
+
+def compare_entries(before: dict, after: dict, name: str, store_file: str) -> None:
+    """Refuse unless `before` and `after` — each already restricted to
+    `ORIENT_TOKEN_ENTRY_FIELDS` by `read_store_entry`, so neither carries
+    the secret that keys the entry or `created_at` — agree on every field,
+    the verification this design requires after every `--replace`."""
+    if before != after:
+        raise Refused(
+            f"{name}'s own fields in the {store_file} store changed when it was replaced: "
+            f"before={before} after={after}. Refusing — this would have dropped or changed a "
+            f"grant. Nothing further was migrated.")
+
+
+def rotate_orient_token(library_home: Path, library_ids: tuple[int, int], store_file: str,
+                        out_path: Path, run=subprocess.run) -> None:
+    """Rotate one of Orient's two Library tokens with `--replace`, reading
+    its own entry directly from the token store first and refusing unless
+    it agrees with what comes back afterward. Runs entirely as the
+    Library's own account, by `run_as_account`, the same boundary every
+    other read or write of either account's own files already holds in
+    this file and in `bin/migrate-library-account`."""
+    tokens_file = tokens_file_path(library_home, store_file)
+
+    def _rotate() -> dict:
+        before = read_store_entry(tokens_file, ORIENT_MINT_NAME)
+        argv = replace_argv_for(library_home, store_file, tokens_file, ORIENT_MINT_NAME, out_path, before)
+        done = run(argv, capture_output=True, text=True, check=False, env=mint_credential_env(library_home))
+        if done.returncode != 0:
+            raise Refused(
+                f"could not rotate {ORIENT_MINT_NAME}'s token in the {store_file} store: "
+                f"mint_credential.py --replace exited {done.returncode}: "
+                f"{(done.stderr or done.stdout).strip()}. Nothing further was migrated.")
+        after = read_store_entry(tokens_file, ORIENT_MINT_NAME)
+        compare_entries(before, after, ORIENT_MINT_NAME, store_file)
+        return after
+
+    run_as_account(*library_ids, _rotate)
+
+
+def capture_token_mint_name() -> str:
+    """The name `capture-token` is minted under: `CAPTURE_TOKEN_MINT_PREFIX`
+    plus this machine's own short hostname, lowercased — the same name a
+    fresh install's `jobs/library.toml` own `prepare` mint computes (there,
+    via `socket.gethostname()` through `{python} -c`), so the two paths that
+    can mint this credential never disagree about its name on one machine.
+    Per-machine, rather than the bare prefix alone, so a later
+    `mint_credential.py --revoke` of it is unambiguous."""
+    return CAPTURE_TOKEN_MINT_PREFIX + socket.gethostname().split(".")[0].lower()
+
+
+def mint_capture_token(library_home: Path, library_ids: tuple[int, int],
+                       run=subprocess.run, withholds: list[str] | None = None) -> bool:
+    """Mint Orient's own narrow signal credential into the Library account's
+    own `.orient-control/capture-token`, unless it is already there —
+    whether from an earlier run of this function or from a fresh install's
+    `jobs/library.toml` own `prepare`, which mints into the exact same path
+    under its own `creates` guard. Runs entirely as the Library's own
+    account, by `run_as_account`, the same boundary `rotate_orient_token`
+    already holds. Passes `--tokens-file` explicitly, the same way
+    `replace_argv_for` does, because `mint_credential.py` refuses to guess
+    which file holds the agents token. Returns whether it minted anything.
+    """
+    out_path = library_home / ORIENT_CONTROL / CAPTURE_TOKEN_NAME
+
+    def _mint() -> bool:
+        if out_path.exists():
+            return False
+        computed = withholds if withholds is not None else \
+            library_role_withholds(library_home, CAPTURE_TOKEN_GRANT, run=run)
+        argv = mint_credential_argv(
+            library_home, "--file", "agents", "--name", capture_token_mint_name(),
+            "--kind", "agent", "--products", "convivy-orient",
+            "--withholds", ",".join(computed),
+            "--tokens-file", str(tokens_file_path(library_home, "agents")),
+            "--hashed", "--out", str(out_path))
+        done = run(argv, capture_output=True, text=True, check=False, env=mint_credential_env(library_home))
+        if done.returncode != 0:
+            raise Refused(
+                f"could not mint Orient's own {CAPTURE_TOKEN_NAME}: mint_credential.py exited "
+                f"{done.returncode}: {(done.stderr or done.stdout).strip()}. Nothing further was migrated.")
+        return True
+
+    return run_as_account(*library_ids, _mint)
+
+
+def mint_kb_person_save_token(library_home: Path, library_ids: tuple[int, int],
+                              run=subprocess.run, withholds: list[str] | None = None) -> bool:
+    """Mint `kb-person-save-token` into the Library account's own
+    `.orient-control/kb-person-save-token`, unless it is already there —
+    whether from an earlier run of this function or from a fresh install's
+    `jobs/library.toml` own `prepare`, which mints into the exact same path
+    under its own `creates` guard. Runs entirely as the Library's own
+    account, by `run_as_account`, the same boundary `mint_capture_token`
+    already holds. The caller (`migrate()`) only calls this when `agents`
+    itself still has no copy — see `KB_PERSON_SAVE_TOKEN_NAME`'s own comment
+    for why this account may already hold one `deliver_to_orient` below has
+    not yet delivered. Returns whether it minted anything.
+    """
+    out_path = library_home / ORIENT_CONTROL / KB_PERSON_SAVE_TOKEN_NAME
+
+    def _mint() -> bool:
+        if out_path.exists():
+            return False
+        computed = withholds if withholds is not None else \
+            library_role_withholds(library_home, KB_PERSON_SAVE_GRANT, run=run)
+        argv = mint_credential_argv(
+            library_home, "--file", "agents", "--name", "kb-person-save",
+            "--grants", KB_PERSON_SAVE_GRANT,
+            "--withholds", ",".join(computed),
+            "--tokens-file", str(tokens_file_path(library_home, "agents")),
+            "--out", str(out_path))
+        done = run(argv, capture_output=True, text=True, check=False, env=mint_credential_env(library_home))
+        if done.returncode != 0:
+            raise Refused(
+                f"could not mint {KB_PERSON_SAVE_TOKEN_NAME}: mint_credential.py exited "
+                f"{done.returncode}: {(done.stderr or done.stdout).strip()}. Nothing further was migrated.")
+        return True
+
+    return run_as_account(*library_ids, _mint)
+
+
+def remint_kb_person_save_crew(library_home: Path, library_ids: tuple[int, int],
+                               run=subprocess.run) -> bool:
+    """Re-mint `kb-person-save` with no crew, with `mint_credential.py
+    --replace`, when the Library's own `agents` store already carries it
+    under a crew, the shape an earlier mint wrote. A crew the install's
+    project registry has no row for makes the token authenticate nobody
+    (see `KB_PERSON_SAVE_TOKEN_NAME`'s own comment), so this drops the crew
+    in place rather than leaving it for `mint_kb_person_save_token`, which
+    only ever mints where there is none. Reads the entry's own fields first
+    and passes them all back unchanged but for `crew`, which `--replace`
+    then omits, and refuses, by `compare_entries`, unless they still agree
+    afterward. Returns False, changing nothing, when the store carries no
+    `kb-person-save` entry at all or carries one with no crew. Runs
+    entirely as the Library's own account, the same boundary
+    `rotate_orient_token` already holds.
+    """
+    tokens_file = tokens_file_path(library_home, "agents")
+    out_path = library_home / ORIENT_CONTROL / KB_PERSON_SAVE_TOKEN_NAME
+
+    def _remint() -> bool:
+        before = read_store_entry(tokens_file, "kb-person-save", required=False)
+        if before is None or before.get("crew") is None:
+            return False
+        wanted = {k: v for k, v in before.items() if k != "crew"}
+        argv = replace_argv_for(library_home, "agents", tokens_file, "kb-person-save", out_path, wanted)
+        done = run(argv, capture_output=True, text=True, check=False, env=mint_credential_env(library_home))
+        if done.returncode != 0:
+            raise Refused(
+                f"could not re-mint kb-person-save with no crew: "
+                f"mint_credential.py --replace exited {done.returncode}: "
+                f"{(done.stderr or done.stdout).strip()}. Nothing further was migrated.")
+        after = read_store_entry(tokens_file, "kb-person-save")
+        compare_entries(wanted, after, "kb-person-save", "agents")
+        return True
+
+    return run_as_account(*library_ids, _remint)
+
+
+def deliver_to_orient(run=subprocess.run, install_json: str | None = None) -> None:
+    """Deliver the rotated tokens and `capture-token` to Orient's own account,
+    and whatever `KNOWN_CREDENTIAL_NAMES` names — `kb-person-save-token`
+    included — to `agents`, with `bin/deliver-library-credentials`, the same
+    copy this tool ships beside. That tool already routes all three of
+    `ORIENT_CREDENTIAL_NAMES` to Orient's account rather than to `agents`,
+    and only overwrites a name whose bytes differ from what the destination
+    already holds, so this is exactly what carries the rotated values, and
+    `capture-token` if `mint_capture_token` minted it, across — and, in the
+    same call, `kb-person-save-token` if `mint_kb_person_save_token` minted
+    it."""
+    tool = REPO / "bin" / "deliver-library-credentials"
+    platform = "macos" if sys.platform == "darwin" else "linux"
+    interpreter = root_interpreter(platform)
+    argv = [interpreter, str(tool)]
+    if install_json:
+        argv += ["--install-json", install_json]
+    done = run(argv, capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        raise Refused(
+            f"could not deliver the rotated tokens to Orient's own account: "
+            f"deliver-library-credentials exited {done.returncode}: "
+            f"{(done.stderr or done.stdout).strip()}. Nothing further was migrated.")
+
+
+# --- the statement key and its verifier entry -----------------------------------
+
+
+def run_orient_make_statement_key(orient_home: Path, orient_ids: tuple[int, int], tree: Path,
+                                  python: Path, run=subprocess.run) -> str:
+    """Run `bin/orient-make-statement-key` as Orient's own account, from
+    the tree root `place-orient` just placed — never `agents`' own
+    checkout, and never as the operator — and return the one line of
+    base64 it prints: the standard base64 of the public key's DER
+    SubjectPublicKeyInfo. Idempotent in the sense the spec gives it: a
+    second run refuses because the key file already exists, which this
+    treats as "already done" rather than a failure, returning None for the
+    caller to leave `kb-verifier.json` as it already is.
+
+    `sudo` clears the environment, so `ORIENT_CONFIG_ROOT` and
+    `ORIENT_STATE_ROOT` are passed explicitly via `env`, matching the
+    values `jobs/orient.toml`'s `[environment]` gives Orient's own
+    service. Without them, Orient's `paths._resolve_root` falls back to
+    the tree's own directory, and the key lands outside the config root
+    the service reads, or fails outright if that directory isn't
+    writable.
+    """
+    script = tree / "bin" / "orient-make-statement-key"
+    uid, gid = orient_ids
+    config_root = orient_home / ORIENT_CONFIG_REL
+    argv = [SUDO, "-u", orient_account_name(), "-H", "env",
+            f"ORIENT_CONFIG_ROOT={config_root}", f"ORIENT_STATE_ROOT={config_root}",
+            str(python), str(script)]
+    done = run(argv, capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        if "exists" in (done.stderr or "").lower():
+            return ""
+        raise Refused(
+            f"orient-make-statement-key exited {done.returncode}: "
+            f"{(done.stderr or done.stdout).strip()}. Nothing further was migrated.")
+    line = (done.stdout or "").strip()
+    if not line or "\n" in line:
+        raise Refused(
+            f"orient-make-statement-key printed something other than one line: {done.stdout!r}. "
+            f"Nothing further was migrated.")
+    return line
+
+
+_ALREADY_ROTATED = ("The two Library tokens were already rotated; the statement key was "
+                    "not placed.")
+
+
+def _open_or_create_operator_dir(parent_fd: int, name: str, shown: Path,
+                                 operator_ids: tuple[int, int]) -> int:
+    """Open `name` under `parent_fd`, relative to that `fd` and never by
+    path, refusing it — by whatever `OSError` the kernel gives `DIR_OPEN`'s
+    own `O_NOFOLLOW` for a symlink or anything but a directory — rather
+    than resolving it. Creates it — mode 0700, owned by `operator_ids` —
+    when it is not there yet. Called once for every directory on the walk
+    down from the operator's home to the verifier's own `kb-verifier.json`,
+    the same way `copy_tree`'s own walk uses `_open_dir`: a symlink planted
+    at any level of that walk, not only at the verifier's own name, must
+    not steer where root ends up writing, `chmod`-ing or `chown`-ing."""
+    created = False
+    try:
+        fd = os.open(name, DIR_OPEN, dir_fd=parent_fd)
+    except FileNotFoundError:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+            created = True
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise Refused(f"could not create {shown}: {exc.strerror}. {_ALREADY_ROTATED}") from exc
+        try:
+            fd = os.open(name, DIR_OPEN, dir_fd=parent_fd)
+        except OSError as exc:
+            raise Refused(f"refusing {shown}: {exc.strerror}. {_ALREADY_ROTATED}") from exc
+    except OSError as exc:
+        raise Refused(f"refusing {shown}: {exc.strerror}. {_ALREADY_ROTATED}") from exc
+    if created:
+        try:
+            os.fchown(fd, *operator_ids)
+        except OSError as exc:
+            os.close(fd)
+            raise Refused(f"could not set the owner of {shown}: {exc.strerror}. "
+                          f"{_ALREADY_ROTATED}") from exc
+    return fd
+
+
+def _write_statement_key(dir_fd: int, leaf: str, dir_shown: Path,
+                         operator_ids: tuple[int, int], pubkey_line: str) -> None:
+    """Write `pubkey_line` into `leaf`, relative to `dir_fd` and never by
+    path, the same symlink-refusing, `OSError`-to-`Refused` discipline
+    `place_statement_key_in_verifier`'s own docstring describes. Leaves a
+    temporary file behind, named `.<leaf>.migrating`, only when a step
+    after it was opened fails."""
+    path_shown = dir_shown / leaf
+    tmp_name = f".{leaf}.migrating"
+    tmp_shown = dir_shown / tmp_name
+    try:
+        info = os.lstat(leaf, dir_fd=dir_fd)
+    except FileNotFoundError:
+        info = None
+    except OSError as exc:
+        raise Refused(f"refusing {path_shown}: {exc.strerror}. {_ALREADY_ROTATED}") from exc
+    if info is not None and stat.S_ISLNK(info.st_mode):
+        raise Refused(f"refusing {path_shown}: it is a symlink. {_ALREADY_ROTATED}")
+    data: dict = {}
+    if info is not None and stat.S_ISREG(info.st_mode):
+        try:
+            fd_r = os.open(leaf, FILE_OPEN, dir_fd=dir_fd)
+            try:
+                with os.fdopen(fd_r, "r", closefd=False, encoding="utf-8") as fin:
+                    text = fin.read()
+            finally:
+                os.close(fd_r)
+        except OSError as exc:
+            raise Refused(f"could not read {path_shown}: {exc.strerror}. {_ALREADY_ROTATED}") from exc
+        try:
+            data = json.loads(text)
+        except ValueError as exc:
+            raise Refused(f"{path_shown} does not hold valid JSON: {exc}. {_ALREADY_ROTATED}") from exc
+        if not isinstance(data, dict):
+            raise Refused(f"{path_shown} does not hold a JSON object. {_ALREADY_ROTATED}")
+    data["orient_statement_key"] = pubkey_line
+
+    try:
+        tmp_info = os.lstat(tmp_name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        tmp_info = None
+    except OSError as exc:
+        raise Refused(f"refusing {tmp_shown}: {exc.strerror}. {_ALREADY_ROTATED}") from exc
+    if tmp_info is not None:
+        if not stat.S_ISREG(tmp_info.st_mode):
+            raise Refused(
+                f"refusing {tmp_shown}: it exists and is not a plain regular file. "
+                f"{_ALREADY_ROTATED}")
+        try:
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        except OSError as exc:
+            raise Refused(f"could not remove the leftover {tmp_shown}: {exc.strerror}. "
+                          f"{_ALREADY_ROTATED}") from exc
+
+    try:
+        fd = os.open(tmp_name, NEW_FILE, 0o600, dir_fd=dir_fd)
+    except FileExistsError as exc:
+        raise Refused(f"refusing {tmp_shown}: it already exists. {_ALREADY_ROTATED}") from exc
+    except OSError as exc:
+        raise Refused(f"could not create {tmp_shown}: {exc.strerror}. {_ALREADY_ROTATED}") from exc
+    try:
+        try:
+            with os.fdopen(fd, "w", closefd=False, encoding="utf-8") as out:
+                out.write(json.dumps(data, indent=2) + "\n")
+            os.fchmod(fd, 0o600)
+            os.fchown(fd, *operator_ids)
+            written = os.fstat(fd)
+            os.replace(tmp_name, leaf, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except OSError as exc:
+            raise Refused(f"could not place {path_shown}: {exc.strerror}. {_ALREADY_ROTATED}") from exc
+    except Refused:
+        try:
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(fd)
+
+    try:
+        after = os.lstat(leaf, dir_fd=dir_fd)
+    except OSError as exc:
+        raise Refused(f"could not confirm {path_shown} after placing it: {exc.strerror}. "
+                      f"The two Library tokens were already rotated.") from exc
+    if not stat.S_ISREG(after.st_mode) or (after.st_dev, after.st_ino) != (written.st_dev, written.st_ino):
+        raise Refused(
+            f"refusing {path_shown}: right after placing it, it is not the file this call "
+            f"just wrote. The two Library tokens were already rotated.")
+
+
+def place_statement_key_in_verifier(operator_home: Path, operator_ids: tuple[int, int],
+                                    pubkey_line: str) -> None:
+    """Place `pubkey_line` unchanged under `orient_statement_key` in the
+    operator's own `kb-verifier.json`, leaving any `persons` entry already
+    there untouched. Creates the file, mode 0600, owned by the operator,
+    when it is not there yet: a new file holding `persons` and
+    `orient_statement_key`.
+
+    Runs as root, called only after the two Library tokens are already
+    rotated — the point of no return — in a home directory the operator
+    owns end to end, but whose contents, before this call ever runs, an
+    attacker able to write there beforehand controls. Every directory from
+    `operator_home` down to the verifier's own `kb-verifier.json` is
+    therefore opened component by component, relative to its own parent's
+    `fd` (`_open_or_create_operator_dir`, the same `DIR_OPEN` primitive
+    `copy_tree`'s own walk uses), never resolved by path: a symlink planted
+    at any level of that walk — not only at the verifier's own name — is
+    refused rather than followed, and a missing directory is created, mode
+    0700 and owned by the operator, rather than left to a path-based
+    `mkdir(parents=True)` that would walk through a symlink the same way a
+    plain `open` would. The verifier itself and the fixed-name temporary
+    file this writes through (`_write_statement_key`) are opened the same
+    way, relative to that pinned directory: both are refused by `os.lstat`
+    when either is a symlink, never by a path operation that would follow
+    one. The temporary file is opened with `O_EXCL`, same as `NEW_FILE`
+    everywhere else in this script, so a leftover there is removed first,
+    and only when it is a plain regular file.
+
+    The temporary file's own descriptor stays open through the rename:
+    right after `os.replace`, this `lstat`s the verifier's own name again
+    and refuses it unless it is a regular file sharing that descriptor's
+    own `(st_dev, st_ino)` — the rename landed what this call just wrote,
+    not something swapped into the temporary name in the gap between
+    writing it and renaming it over. Any other `OSError` along this walk —
+    the traversal, the lstats, the read, the write, `fchmod`, `fchown` or
+    the rename itself — becomes a `Refused` naming the step, never a raw
+    traceback, since this runs past the point of no return; the temporary
+    file is removed on any failure that leaves it behind.
+    """
+    if not pubkey_line:
+        return  # the key already existed; leave the verifier as it is
+    dir_names = KB_VERIFIER_REL.parts[:-1]
+    leaf = KB_VERIFIER_REL.parts[-1]
+    try:
+        dir_fd = os.open(str(operator_home), DIR_OPEN)
+    except OSError as exc:
+        raise Refused(f"refusing {operator_home}: {exc.strerror}. {_ALREADY_ROTATED}") from exc
+    try:
+        shown = operator_home
+        for name in dir_names:
+            shown = shown / name
+            next_fd = _open_or_create_operator_dir(dir_fd, name, shown, operator_ids)
+            os.close(dir_fd)
+            dir_fd = next_fd
+        _write_statement_key(dir_fd, leaf, shown, operator_ids, pubkey_line)
+    finally:
+        os.close(dir_fd)
+
+
+# --- the Library's own person-save inputs ---------------------------------------
+
+
+def place_library_person_save_inputs(library_home: Path, library_ids: tuple[int, int],
+                                     root_ca: str, app_key: str, app_config: str,
+                                     persons: list[str] | None, key: str | None,
+                                     run_as=run_as_account) -> list[tuple[str, str]]:
+    """Place the Library's seven person-save inputs under
+    `{library_home}/.library/person-save/`, through a child that has dropped
+    to the Library account's own uid and gid — delivery writes into another
+    account, so root opens nothing in that home. Reuses `bin/place-person-save`'s
+    own `place_entries()` (loaded as `place_person_save` above) rather than a
+    second copy.
+
+    `key` is the line this migration already captured from
+    `bin/orient-make-statement-key`'s own stdout, held in memory by the
+    caller — never read back from `kb-verifier.json` or any other file, since
+    whoever could write that file before the copy would choose the key the
+    Library trusts from then on. `persons` is the operator's own list, from
+    `--persons`, the same way `--root-ca`, `--app-key` and `--app-config` are
+    the operator's own files. `key=None` places the six entries that need no
+    Orient key, the same as a fresh install's own placement before Orient has
+    made one.
+    """
+    d = library_home / ".library" / "person-save"
+    # Read as root, before the drop: the Library account cannot read the
+    # operator's home, where these files usually are. A macOS rehearsal
+    # refused with "Permission denied" on the operator's --root-ca.
+    try:
+        root_ca = place_person_save.preread(root_ca, "--root-ca")
+        app_key = place_person_save.preread(app_key, "--app-key")
+        app_config = place_person_save.preread(app_config, "--app-config")
+    except place_person_save.Refused as exc:
+        raise Refused(str(exc)) from exc
+    except OSError as exc:
+        raise Refused(f"could not read {exc.filename}: {exc.strerror}. Nothing was placed.") from exc
+
+    def _place():
+        gate = place_person_save.load_gate()
+        gh = gate.GitHub()
+        return place_person_save.place_entries(
+            d, root_ca=root_ca, key=key, persons=persons,
+            app_key=app_key, app_config=app_config, gate=gate, gh=gh)
+
+    return run_as(*library_ids, _place)
+
+
+# --- the shared agent-platform deploy area, read by the document service -------
+
+# Where the Bosun's `install-agent-platform-shared` builds the area, under
+# `agents`' own home — the account the document service runs as, which finds
+# the area under its own home and never on `PATH`.
+AGENT_PLATFORM_SHARED_REL = Path(".local", "deploy", "agent-platform-shared")
+
+
+def install_agent_platform_shared(agent_platform_tree: Path, agents_home: Path, platform: str,
+                                  run=subprocess.run) -> None:
+    """Deploy-pin the shared agent-platform area the document service runs
+    `agentctl` from, with the Bosun's `bin/install-agent-platform-shared`, run
+    as `agents` — before the document service is installed, below, which
+    needs the area to exist the moment it starts taking saves. Reads root's
+    own bare copy of agent-platform at the commit of the placed tree the rest
+    of this migration already uses, the same copy and the same commit
+    `install_document_service` below reads `install-kb-document-api` from.
+
+    `--allow-non-main` is required: root's own record is rarely the literal
+    ref `main`, and the installer's own rule 6 refuses anything else without
+    it. `--deploy-dir` is passed explicitly, naming `agents`' own area, so a
+    non-main ref into the DEFAULT production path — which that installer's
+    own rule 6 additionally refuses without naming the path explicitly —
+    never happens by omission. The Bosun owns that script; this only calls
+    it, the same split `install_document_service` already draws for
+    `install-kb-document-api`.
+
+    Refuses outright on Linux, the same as `install_document_service`: the
+    document service this deploys for has no Linux shape designed yet.
+    """
+    if platform != "macos":
+        raise Refused(
+            "install_agent_platform_shared: refusing on Linux — the document service this "
+            "deploys for has no Linux shape designed yet. Nothing further was migrated.")
+    tool = agent_platform_tree / "bin" / "install-agent-platform-shared"
+    if not tool.is_file():
+        raise Refused(
+            f"{tool} does not exist in the placed agent-platform tree. Nothing further was "
+            f"migrated.")
+    problem = ancestry_problem(tool, ROOT_UID, ROOT_TOP)
+    if problem:
+        raise Refused(
+            f"{tool} is not a tree this may run as {AGENTS}: {problem}. Nothing further was "
+            f"migrated.")
+    name, _, sha = agent_platform_tree.name.partition("@")
+    if name != "agent-platform" or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise Refused(
+            f"{agent_platform_tree} does not name an agent-platform commit "
+            f"(agent-platform@<40 hex>). Nothing further was migrated.")
+    bare = agent_platform_tree.parent / "agent-platform.git"
+    problem = ancestry_problem(bare, ROOT_UID, ROOT_TOP)
+    if problem:
+        raise Refused(
+            f"{bare} is not a repository this may install from as {AGENTS}: {problem}. "
+            f"Nothing further was migrated.")
+    deploy_dir = agents_home / AGENT_PLATFORM_SHARED_REL
+    # Mirrors `install_document_service`'s own call: sudo's PATH lacks the
+    # install's Python, and git refuses a repository another account owns
+    # ("dubious ownership") without `safe.directory` for this one command.
+    path = f"{os.path.dirname(root_interpreter(platform))}:/usr/bin:/bin:/usr/sbin:/sbin"
+    done = run([SUDO, "-u", AGENTS, "-H", "/usr/bin/env", f"PATH={path}", "GIT_CONFIG_COUNT=1",
+               "GIT_CONFIG_KEY_0=safe.directory", f"GIT_CONFIG_VALUE_0={bare}",
+               str(tool), f"--repo={bare}", f"--ref={sha}", "--allow-non-main",
+               f"--deploy-dir={deploy_dir}"],
+              capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        raise Refused(
+            f"could not deploy the shared agent-platform area: install-agent-platform-shared "
+            f"exited {done.returncode}: {(done.stderr or done.stdout).strip()}. Nothing further "
+            f"was migrated.")
+
+
+# --- the document service -------------------------------------------------------
+
+
+class DirOps(NamedTuple):
+    """The directory primitives `ensure_document_socket_dir` calls,
+    injectable so a test can record exactly what owner, group and mode this
+    script asked for without depending on this process's own privilege to
+    really set them, or on whether this kernel keeps the setgid bit for a
+    non-root chmod."""
+    mkdir: object
+    chown: object
+    chmod: object
+    lstat: object
+
+
+def _mkdir_with_parents(path: Path, mode: int) -> None:
+    Path(path).mkdir(mode=mode, parents=True)
+
+
+REAL_DIR_OPS = DirOps(mkdir=_mkdir_with_parents, chown=os.chown, chmod=os.chmod, lstat=os.lstat)
+
+
+def ensure_document_socket_dir(socket_dir: Path, uid: int, gid: int, *,
+                               dir_ops: DirOps = REAL_DIR_OPS) -> None:
+    """Create `socket_dir`, owned by `uid:gid`, mode 2750 — one of the root
+    commands `install-kb-document-api` only prints for an operator to run
+    by hand, performed here instead. Never follows a symlink. Idempotent: a
+    directory that already has exactly this owner, group and mode is left
+    alone. One that differs in any of the three is refused rather than
+    corrected — correcting it would be this script deciding, on root's
+    behalf, that what is there is wrong.
+    """
+    try:
+        info = dir_ops.lstat(socket_dir)
+    except FileNotFoundError:
+        dir_ops.mkdir(socket_dir, 0o750)
+        dir_ops.chown(socket_dir, uid, gid)
+        dir_ops.chmod(socket_dir, KB_DOCUMENT_SOCKET_MODE)  # mkdir's own mode cannot set the setgid bit
+        return
+    if stat.S_ISLNK(info.st_mode):
+        raise Refused(f"refusing {socket_dir}: it is a symlink. Nothing further was migrated.")
+    if not stat.S_ISDIR(info.st_mode):
+        raise Refused(f"refusing {socket_dir}: it exists and is not a directory. Nothing further was migrated.")
+    actual = (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode))
+    wanted = (uid, gid, KB_DOCUMENT_SOCKET_MODE)
+    if actual != wanted:
+        raise Refused(
+            f"refusing {socket_dir}: it already exists with owner={info.st_uid} group={info.st_gid} "
+            f"mode={oct(stat.S_IMODE(info.st_mode))}, not owner={uid} group={gid} "
+            f"mode={oct(KB_DOCUMENT_SOCKET_MODE)}. Resolve by hand. Nothing further was migrated.")
+
+
+def render_daemon_template_values(agent_platform_tree: Path, agents_home: Path) -> dict:
+    """The template keys' values, rendered by root from its own placed
+    agent-platform tree's launchd template with `__HOME__` set to `agents`'
+    home, exactly as install-kb-document-api renders them."""
+    template = agent_platform_tree / KB_DOCUMENT_API_TEMPLATE_REL
+    problem = ancestry_problem(template, ROOT_UID, ROOT_TOP)
+    if problem:
+        raise Refused(f"{template} is not a template this may trust: {problem}. "
+                      f"Nothing further was migrated.")
+    try:
+        text = template.read_text(encoding="utf-8")
+        rendered = plistlib.loads(text.replace("__HOME__", str(agents_home)).encode("utf-8"))
+    except (OSError, ValueError) as exc:
+        raise Refused(f"could not read {template}: {exc}. Nothing further was migrated.") from exc
+    if not isinstance(rendered, dict):
+        raise Refused(f"{template} does not hold a dictionary. Nothing further was migrated.")
+    return {k: rendered[k] for k in KB_DOCUMENT_DAEMON_TEMPLATE_KEYS if k in rendered}
+
+
+def verify_staged_daemon_plist(path: Path, agents_uid: int, orient_group: str,
+                               template_values: dict | None = None) -> dict:
+    """Refuse a staged LaunchDaemon plist that is not exactly what
+    `install-kb-document-api` is trusted to have staged under `agents`' own
+    deploy area. Opened exactly once, with `O_NOFOLLOW`, and every check —
+    the symlink/regular-file test, the ownership and mode checks, and the
+    bytes handed to `plistlib` — reads that one descriptor, never the path
+    again, so nothing `agents` does to the path after this call can change
+    what was checked.
+
+    Refuses on any key outside the five `install-kb-document-api` itself
+    ever writes into this plist (`KB_DOCUMENT_DAEMON_PLIST_ALLOWED_KEYS`), on
+    `Label`, `UserName`, `GroupName` or `Umask` not matching exactly what
+    this migration expects, and on `ProgramArguments` not a non-empty list
+    of strings all rooted under the deploy directory
+    `install-kb-document-api` writes its own code to (`path`'s own parent),
+    apart from one `--socket=` argument naming exactly the socket under
+    `KB_DOCUMENT_SOCKET_DIR`.
+
+    Returns the parsed plist on success — `install_document_service` then
+    re-serializes this exact dict for the live copy, rather than reading
+    `path`'s bytes a second time.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            raise Refused(
+                f"{path} does not exist. install-kb-document-api was supposed to stage it "
+                f"there. Nothing further was migrated.") from exc
+        if exc.errno == errno.ELOOP:
+            raise Refused(f"refusing {path}: it is a symlink. Nothing further was migrated.") from exc
+        raise Refused(f"could not open {path}: {exc.strerror}. Nothing further was migrated.") from exc
+    try:
+        info = os.fstat(fd)
+        # Checked before any read: `agents` owns this directory and could stage a
+        # FIFO instead of a plist, which `O_NONBLOCK` above kept the open from
+        # blocking on, but a read would still block waiting for a writer.
+        if not stat.S_ISREG(info.st_mode):
+            raise Refused(f"refusing {path}: it is not a plain regular file. Nothing further was migrated.")
+        if info.st_uid != agents_uid:
+            raise Refused(f"refusing {path}: it is not owned by {AGENTS}. Nothing further was migrated.")
+        if stat.S_IMODE(info.st_mode) & (stat.S_IWGRP | stat.S_IWOTH):
+            raise Refused(
+                f"refusing {path}: it is group- or other-writable ({oct(stat.S_IMODE(info.st_mode))}). "
+                f"Nothing further was migrated.")
+        chunks = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        data = b"".join(chunks)
+    finally:
+        os.close(fd)
+    try:
+        plist = plistlib.loads(data)
+    except (ValueError, OSError) as exc:
+        raise Refused(f"{path} does not hold a valid plist: {exc}. Nothing further was migrated.") from exc
+    if not isinstance(plist, dict):
+        raise Refused(f"refusing {path}: its top level is not a dictionary. Nothing further was migrated.")
+    template_values = template_values or {}
+    unknown = sorted(set(plist) - KB_DOCUMENT_DAEMON_PLIST_ALLOWED_KEYS - set(template_values))
+    if unknown:
+        raise Refused(
+            f"refusing {path}: it carries key(s) install-kb-document-api never writes into "
+            f"this plist: {', '.join(unknown)}. Nothing further was migrated.")
+    differing = sorted(k for k in template_values if k in plist and plist[k] != template_values[k])
+    if differing:
+        raise Refused(
+            f"refusing {path}: {', '.join(differing)} differ(s) from what root renders from its own "
+            f"copy of the template. Nothing further was migrated.")
+    for key in ("Label", "UserName", "GroupName"):
+        value = plist.get(key)
+        if not isinstance(value, str):
+            raise Refused(
+                f"refusing {path}: {key} is {value!r} ({type(value).__name__}), not a string. "
+                f"Nothing further was migrated.")
+    if plist.get("Label") != KB_DOCUMENT_API_LABEL:
+        raise Refused(
+            f"refusing {path}: Label is {plist.get('Label')!r}, not {KB_DOCUMENT_API_LABEL!r}. "
+            f"Nothing further was migrated.")
+    if plist.get("UserName") != AGENTS:
+        raise Refused(
+            f"refusing {path}: UserName is {plist.get('UserName')!r}, not {AGENTS!r}. "
+            f"Nothing further was migrated.")
+    if plist.get("GroupName") != orient_group:
+        raise Refused(
+            f"refusing {path}: GroupName is {plist.get('GroupName')!r}, not {orient_group!r}. "
+            f"Nothing further was migrated.")
+    umask = plist.get("Umask")
+    # `bool` is a subclass of `int`, so `isinstance(True, int)` passes; checked apart to
+    # keep `Umask: true` from reading as the integer 1. A plist `<real>` deserializes to
+    # `float`, which this excludes too, since `23.0 == 23` would otherwise pass the
+    # equality check below while launchd keeps requiring an integer.
+    if not isinstance(umask, int) or isinstance(umask, bool):
+        raise Refused(
+            f"refusing {path}: Umask is {umask!r} ({type(umask).__name__}), not an integer. "
+            f"Nothing further was migrated.")
+    if umask != KB_DOCUMENT_DAEMON_UMASK:
+        raise Refused(
+            f"refusing {path}: Umask is {umask!r}, not {KB_DOCUMENT_DAEMON_UMASK} "
+            f"(octal 027). Nothing further was migrated.")
+    program_arguments = plist.get("ProgramArguments")
+    if (not isinstance(program_arguments, list) or not program_arguments
+            or not all(isinstance(arg, str) for arg in program_arguments)):
+        raise Refused(
+            f"refusing {path}: ProgramArguments is {program_arguments!r}, not a non-empty "
+            f"list of strings. Nothing further was migrated.")
+    deploy_dir = Path(os.path.normpath(str(path.parent)))
+    # agent-platform's launchd template names the socket explicitly, so every
+    # staged plist carries this one argument outside the deploy directory. It
+    # is accepted only as root's own socket path, the directory
+    # ensure_document_socket_dir() creates.
+    socket_arg = f"--socket={KB_DOCUMENT_SOCKET_DIR / KB_DOCUMENT_SOCKET_NAME}"
+    outside = []
+    for arg in program_arguments:
+        if arg == socket_arg:
+            continue
+        if not os.path.isabs(arg):
+            outside.append(arg)
+            continue
+        normalized = Path(os.path.normpath(arg))
+        if normalized != deploy_dir and deploy_dir not in normalized.parents:
+            outside.append(arg)
+    if outside:
+        raise Refused(
+            f"refusing {path}: ProgramArguments names {outside!r} outside {deploy_dir}, where "
+            f"install-kb-document-api deploys its own code. Nothing further was migrated.")
+    return plist
+
+
+def confirm_document_service_deployed(tool: Path, run=subprocess.run) -> None:
+    """Confirm, with `install-kb-document-api --status` run as `agents`,
+    that a commit is actually deployed."""
+    done = run([SUDO, "-u", AGENTS, "-H", str(tool), "--status"],
+              capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        raise Refused(
+            f"install-kb-document-api --status exited {done.returncode}: "
+            f"{(done.stderr or done.stdout).strip()} — no commit confirmed deployed. "
+            f"Nothing further was migrated.")
+    deployed = any(line.startswith("commit:") and line.split(":", 1)[1].strip()
+                  for line in (done.stdout or "").splitlines())
+    if not deployed:
+        raise Refused(
+            f"install-kb-document-api --status printed no commit: {done.stdout!r}. "
+            f"Nothing further was migrated.")
+
+
+def install_document_service(agent_platform_tree: Path, orient_group: str, orient_gid: int,
+                             agents_home: Path, agents_uid: int, platform: str,
+                             socket_dir: Path = KB_DOCUMENT_SOCKET_DIR,
+                             system_dir: str | None = None,
+                             dir_ops: DirOps = REAL_DIR_OPS,
+                             run=subprocess.run, sleep=time.sleep) -> None:
+    """Install the document service with Orient's own group as
+    `--client-group`, then do, as root, what `bin/install-kb-document-api`
+    only prints for an operator rather than doing itself, because that
+    installer loads nothing and runs no sudo: create the socket directory,
+    copy the staged LaunchDaemon plist into the supervisor's system
+    directory, and bootstrap it, then confirm a commit is actually deployed.
+
+    Refuses outright on Linux: the document service has no Linux shape
+    designed yet, so there is nothing here to perform as root.
+
+    The installer itself is run as `agents`, never as root directly: the
+    service runs under the account that runs `agentctl`, which is `agents`
+    on every shape this script handles — the same way `place-orient` drops
+    to Orient's own account before calling `install-backend` rather than
+    letting that command run as root. `--repo` and `--ref` are passed
+    explicitly, naming root's own bare copy at the commit of the placed
+    agent-platform tree the rest of this migration already uses, rather
+    than whatever checkout the installer would otherwise fall back to.
+    """
+    if platform != "macos":
+        raise Refused(
+            "install_document_service: refusing on Linux — the document service has no "
+            "Linux shape designed yet (/var/db and launchd are macOS-only here). Nothing "
+            "further was migrated.")
+    tool = agent_platform_tree / "bin" / "install-kb-document-api"
+    if not tool.is_file():
+        raise Refused(f"{tool} does not exist in the placed agent-platform tree. Nothing further was migrated.")
+    problem = ancestry_problem(tool, ROOT_UID, ROOT_TOP)
+    if problem:
+        raise Refused(
+            f"{tool} is not a tree this may run as {AGENTS}: {problem}. Nothing further was "
+            f"migrated.")
+    # The installer reads a git ref with `git archive`, never a working tree,
+    # so it is pointed at root's own bare copy at the commit this install
+    # records for agent-platform (the placed tree's own `@<sha>`), not at the
+    # extracted tree, which is not a repository. The r45 macOS rehearsal
+    # showed the three things this line answers: install-kb-document-api
+    # parses `--name=value` only, and refused `--client-group <group>` as an
+    # unknown option; `main` resolves in neither root's bare copy nor agents'
+    # release clone, so the release's own commit is named, with
+    # `--allow-non-main`, the installer's override for that; and git refuses
+    # a repository another account owns ("dubious ownership"), so
+    # `safe.directory` names this one bare copy, for this one command, as
+    # command-line configuration.
+    name, _, sha = agent_platform_tree.name.partition("@")
+    if name != "agent-platform" or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise Refused(
+            f"{agent_platform_tree} does not name an agent-platform commit "
+            f"(agent-platform@<40 hex>). Nothing further was migrated.")
+    bare = agent_platform_tree.parent / "agent-platform.git"
+    problem = ancestry_problem(bare, ROOT_UID, ROOT_TOP)
+    if problem:
+        raise Refused(
+            f"{bare} is not a repository this may install from as {AGENTS}: {problem}. "
+            f"Nothing further was migrated.")
+    # sudo's own PATH lacks the install's Python (Homebrew's python3.11 on
+    # macOS), which the installer finds on PATH; r45 stopped on
+    # "python3.11 not found on PATH" until its directory came first.
+    path = f"{os.path.dirname(root_interpreter(platform))}:/usr/bin:/bin:/usr/sbin:/sbin"
+    done = run([SUDO, "-u", AGENTS, "-H", "/usr/bin/env", f"PATH={path}", "GIT_CONFIG_COUNT=1",
+               "GIT_CONFIG_KEY_0=safe.directory", f"GIT_CONFIG_VALUE_0={bare}",
+               str(tool), f"--client-group={orient_group}", f"--repo={bare}",
+               f"--ref={sha}", "--allow-non-main"],
+              capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        raise Refused(
+            f"install-kb-document-api --client-group {orient_group} exited {done.returncode}: "
+            f"{(done.stderr or done.stdout).strip()}. Nothing further was migrated.")
+
+    ensure_document_socket_dir(socket_dir, agents_uid, orient_gid, dir_ops=dir_ops)
+
+    staged_plist = agents_home / KB_DOCUMENT_DAEMON_PLIST_REL
+    validated_plist = verify_staged_daemon_plist(
+        staged_plist, agents_uid, orient_group,
+        template_values=render_daemon_template_values(agent_platform_tree, agents_home))
+
+    live_dir = Path(system_dir or LAUNCHD_SYSTEM_DIR)
+    live_plist = live_dir / f"{KB_DOCUMENT_API_LABEL}.plist"
+    # Serialized from the dict `verify_staged_daemon_plist` already parsed
+    # and checked, never read from `staged_plist` a second time: `agents`
+    # owns that path throughout, so a second read could see bytes swapped in
+    # after the check above passed.
+    data = plistlib.dumps(validated_plist)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    try:
+        handle = os.open(live_plist, flags, 0o644)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise Refused(
+                f"refusing to write {live_plist}: it is a symlink. Nothing further was "
+                f"migrated.") from exc
+        raise Refused(f"could not write {live_plist}: {exc.strerror}. Nothing further was migrated.") from exc
+    with os.fdopen(handle, "wb") as out:
+        out.write(data)
+
+    # **THE BOOTSTRAP IS RETRIED, BOUNDED, BECAUSE A BOOTOUT CAN RETURN BEFORE
+    # LAUNCHD WILL TAKE THE SAME LABEL BACK.** Re-running stand-up-backend on a
+    # running three-account macOS install (rehearsal r57, 2026-11-25, twice in
+    # a row) booted the daemon out and then had this bootstrap exit 5
+    # ("Input/output error"), leaving the document service unloaded. A plain
+    # bootstrap of the same plist straight after the refusal succeeded on its
+    # first try, so the refusal is transient; a first install, with nothing
+    # to boot out, never hits it.
+    run(["launchctl", "bootout", f"system/{KB_DOCUMENT_API_LABEL}"], capture_output=True, check=False)
+    for attempt in range(1, BOOTSTRAP_ATTEMPTS + 1):
+        done = run(["launchctl", "bootstrap", "system", str(live_plist)],
+                  capture_output=True, text=True, check=False)
+        if done.returncode == 0:
+            break
+        if attempt < BOOTSTRAP_ATTEMPTS:
+            sleep(BOOTSTRAP_RETRY_SECONDS)
+    if done.returncode != 0:
+        raise Refused(
+            f"launchctl bootstrap system {live_plist} failed on all {BOOTSTRAP_ATTEMPTS} tries; "
+            f"the last exited {done.returncode}: {(done.stderr or done.stdout).strip()}. The document "
+            f"service is not loaded now; `sudo launchctl bootstrap system {live_plist}` loads "
+            f"it. Nothing further was migrated.")
+
+    confirm_document_service_deployed(tool, run=run)
+
+
+def orient_job_declares_document_socket(jobs_dir: Path = REPO / "jobs") -> bool:
+    """Whether `jobs/orient.toml`'s own `[account-environment]` carries
+    `ORIENT_KB_DOCUMENT_SOCKET` — the variable convivy-orient's own
+    `kb_commit.py` reads fresh on each call (`_SERVICE_SOCKET_ENV`) to reach
+    the document service `install_document_service` just installed. Read
+    directly from the declaration rather than assumed, so `migrate()`'s own
+    report of a document-service install never outruns what Orient's job
+    actually tells its restarted process to connect to.
+    """
+    job = declaration.load(jobs_dir / "orient.toml")
+    return bool(job.account_environment.get("ORIENT_KB_DOCUMENT_SOCKET"))
+
+
+# --- cloudflared ------------------------------------------------------------------
+
+
+_CLOUDFLARED_SERVICE_RE = re.compile(r"^(\s*service:\s*)(\S+)(\s*)$")
+
+
+def repoint_cloudflared(config_path: Path, socket_path: str = ORIENT_SOCKET_PATH) -> bool:
+    """Replace the one ingress rule's `service:` line that still points at
+    Orient's old loopback address with `unix:<socket_path>`, line for line,
+    leaving every other line byte for byte. Returns whether it changed
+    anything. Refuses, naming the file, when no such line is there to
+    replace and the socket line is not already in place either — this never
+    guesses which of several `service:` lines is Orient's own when more
+    than one could match, since `cloudflared`'s config has no stdlib parser
+    this codebase already depends on elsewhere.
+    """
+    if not config_path.is_file():
+        raise Refused(f"{config_path} does not exist. Nothing further was migrated.")
+    wanted = f"unix:{socket_path}"
+    lines = config_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    changed = False
+    already = False
+    new_lines = []
+    for line in lines:
+        match = _CLOUDFLARED_SERVICE_RE.match(line.rstrip("\n"))
+        if match and match.group(2) in ("http://127.0.0.1:8099", wanted):
+            if match.group(2) == wanted:
+                already = True
+                new_lines.append(line)
+                continue
+            newline = "\n" if line.endswith("\n") else ""
+            new_lines.append(f"{match.group(1)}{wanted}{match.group(3)}{newline}")
+            changed = True
+        else:
+            new_lines.append(line)
+    if not changed and not already:
+        raise Refused(
+            f"{config_path} names no ingress rule pointed at Orient's old loopback address "
+            f"(http://127.0.0.1:8099), and none already at {wanted}. Refusing to guess which "
+            f"line is Orient's own. Nothing further was migrated.")
+    if changed:
+        _write_cloudflared_config(config_path, "".join(new_lines))
+    return changed
+
+
+def validate_cloudflared(config_path: Path, operator: str, run=subprocess.run) -> None:
+    done = run([SUDO, "-u", operator, "-H", "cloudflared", "tunnel", "--config", str(config_path),
+               "ingress", "validate"], capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        raise Refused(
+            f"cloudflared tunnel ingress validate exited {done.returncode}: "
+            f"{(done.stderr or done.stdout).strip()} against {config_path}. Nothing further "
+            f"was migrated.")
+
+
+def restart_cloudflared(operator: str, operator_uid: int, platform: str, label: str,
+                        run=subprocess.run) -> None:
+    if platform == "macos":
+        done = run(["launchctl", "kickstart", "-k", f"gui/{operator_uid}/{label}"],
+                   capture_output=True, text=True, check=False)
+    else:
+        done = run(user_manager_argv(operator, operator_uid, "restart", label),
+                   capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        note = (f" {operator}'s own user manager has to be running for this — "
+                f"`loginctl enable-linger {operator}` starts it at boot."
+                if platform == "linux" else "")
+        raise Refused(
+            f"could not restart cloudflared ({label}): exited {done.returncode}: "
+            f"{(done.stderr or done.stdout).strip()}.{note} Nothing further was migrated.")
+
+
+def _with_cloudflared_note(message: str, note: str) -> str:
+    """`message`'s own "Nothing further was migrated"/"Nothing was
+    migrated" ending is false once rollback has gone on to restore
+    cloudflared's config, so replace it with `note` — capitalized, as the
+    start of a new sentence — rather than leaving both claims standing
+    side by side."""
+    corrected = f"{note[0].upper()}{note[1:]}."
+    for suffix in ("Nothing further was migrated.", "Nothing was migrated."):
+        if message.endswith(suffix):
+            return f"{message[:-len(suffix)].rstrip()} {corrected}"
+    return f"{message} {corrected}"
+
+
+# --- the migration itself -------------------------------------------------------
+
+
+def migrate(agents_home: Path, shape: str, platform: str, *, operator: str,
+            cloudflared_label: str = DEFAULT_CLOUDFLARED_LABEL,
+            privileged_prefix: Path = PRIVILEGED_PREFIX,
+            document_socket_dir: Path = KB_DOCUMENT_SOCKET_DIR,
+            document_dir_ops: DirOps = REAL_DIR_OPS,
+            jobs_dir: Path = REPO / "jobs",
+            port_connects=_real_port_connects,
+            person_save_sources: tuple[str, str, str, list[str] | None] | None = None,
+            run=subprocess.run, report=print, system_dir: str | None = None) -> None:
+    """Move Orient's state and credentials from `agents` to its own
+    account, as the module docstring's own "WHAT IT DOES, IN ORDER" lays
+    out. Raises `Refused` on any failure before the two tokens are rotated,
+    after rolling back whatever this run had already written, restoring
+    any unit this run removed, and restarting any unit this run stopped. A
+    failure from the rotation onward is reported rather than unwound — see
+    the module docstring's own "ROLLBACK".
+
+    `privileged_prefix` and `document_socket_dir` default to this
+    machine's real root-owned locations; a test overrides both, the same
+    way `system_dir` is already overridden, so nothing here ever touches
+    a real `/opt/builder` or `/var/db` outside a real install.
+    `document_dir_ops` defaults to the real `os.mkdir`/`chown`/`chmod`/
+    `lstat`; a test overrides it so the socket directory's owner, group and
+    mode are only ever recorded, never really set. `jobs_dir` defaults to
+    this repository's own `jobs/`, where `orient_job_declares_document_socket`
+    reads `orient.toml` from; a test overrides it to exercise the report
+    this produces when that declaration does not carry the variable.
+
+    `person_save_sources`, when given, is `(root_ca, app_key, app_config,
+    persons)` — the operator's own sources for the Library's person-save
+    inputs, the same four `main()` reads from `--root-ca`, `--app-key`,
+    `--app-config` and `--persons`. `None` skips placing them and says so;
+    it never refuses the rest of the migration, since saving was already
+    unavailable before this ran.
+    """
+    orient_name = orient_account_name(platform)
+    actual_system_dir = system_dir or (LAUNCHD_SYSTEM_DIR if platform == "macos" else SYSTEMD_SYSTEM_DIR)
+    agents_ids = account_ids(AGENTS)
+    assert agents_ids is not None
+    stopped = False
+    root: str | None = None
+    removed_units: dict[Path, bytes] = {}
+    removed_watch: dict[Path, bytes] = {}
+    cloudflared_file_written = False
+    cloudflared_restarted = False
+    cloudflared_config_path: Path | None = None
+    cloudflared_original_text: str | None = None
+    operator_ids: tuple[int, int] | None = None
+
+    def rollback(reason: Exception) -> str | None:
+        """Undo whatever this run already did, and return a sentence
+        describing what it restored on cloudflared's own behalf, or
+        `None` when there was nothing to restore there. The caller folds
+        that sentence into the message it raises, since `reason` on its
+        own would otherwise still claim nothing further was migrated even
+        once this has written the operator's cloudflared config back."""
+        if removed_watch:
+            restore_deploy_watch(platform, agents_ids[0], removed_watch, run=run)
+        if removed_units:
+            restore_agents_units(removed_units)
+        restarted_ok = not stopped
+        if stopped:
+            labels = existing_orient_labels(platform, actual_system_dir)
+            restart_problem = start_orient_units(str(agents_home), root or "", platform, labels, run=run)
+            if restart_problem:
+                if cloudflared_file_written:
+                    report(f"{PROG}: rolling back, but Orient's own units could not be restarted, "
+                           f"so cloudflared is left pointed at the socket; the site stays dark "
+                           f"until Orient's old units are restarted by hand and cloudflared is "
+                           f"repointed at unix:{ORIENT_SOCKET_PATH} by hand.")
+                raise Refused(
+                    f"{reason} Rolling back, but Orient's units could not be restarted "
+                    f"either: {restart_problem}. Start them by hand.") from reason
+            restarted_ok = True
+        if not (cloudflared_file_written and restarted_ok):
+            return None
+        assert cloudflared_config_path is not None and cloudflared_original_text is not None
+        assert operator_ids is not None
+        if not stopped:
+            # No Orient unit has stopped on this path — the failure that
+            # triggered this rollback was validate_cloudflared's or
+            # restart_cloudflared's own, inside the same step that wrote
+            # the file, before step 5 stops anything. The old,
+            # agents'-own Orient is still serving the port throughout, so
+            # there is nothing to confirm: put the file back, and restart
+            # cloudflared again only if it was actually restarted onto
+            # the new setting — if that restart never happened, the live
+            # process never picked up the write, and the file is all
+            # that needs reverting.
+            if cloudflared_restarted:
+                revert_cloudflared(cloudflared_config_path, cloudflared_original_text, operator,
+                                   operator_ids[0], platform, cloudflared_label, run=run)
+                note = (f"restored {cloudflared_config_path} to its own original setting "
+                        f"and restarted cloudflared")
+            else:
+                _write_cloudflared_config(cloudflared_config_path, cloudflared_original_text)
+                note = f"restored {cloudflared_config_path} to its own original setting"
+            report(f"{PROG}: {note}")
+            return note
+        confirmed, holder = confirm_restored_orient_holds_port(platform, run=run,
+                                                               port_connects=port_connects)
+        if confirmed:
+            revert_cloudflared(cloudflared_config_path, cloudflared_original_text, operator,
+                               operator_ids[0], platform, cloudflared_label, run=run)
+            note = f"rolled cloudflared back to {cloudflared_config_path}'s own original setting"
+            report(f"{PROG}: {note}")
+            return note
+        named = f" {holder}." if holder else " Nothing holds it yet."
+        report(f"{PROG}: rolling back, but the restored Orient does not yet hold "
+               f"127.0.0.1:{ORIENT_OLD_LOOPBACK_PORT}, so cloudflared is left pointed at "
+               f"the socket; the site stays dark.{named}")
+        return None
+
+    try:
+        root = agents_builder_root(str(agents_home), run=run)
+        # Checked first, before anything moves at all: starting the root
+        # deploy step this early, before Orient's own system unit exists,
+        # is what a run against an install whose Orient main is ahead of
+        # the deployed commit refused on (bin/orient-deploy placed the new
+        # commit, then its restart of com.convivy.orient.service failed,
+        # Unit not found, and the swap-back failed the same way) — see
+        # start_root_deploy_step below, called only once Orient's own
+        # units are confirmed running again, near the end of this
+        # function.
+        if not root_deploy_step_loaded(platform, run=run):
+            raise Refused(
+                f"{ROOT_DEPLOY_UNIT_LABEL} is not loaded in the supervisor. That is "
+                f"bin/orient-deploy's own job, declared in "
+                f"jobs/follow-orient-main/orient-deploy.toml. Install and load it first. "
+                f"Nothing was migrated.")
+
+        following_main = follows_orient_main(privileged_prefix)
+        deployed_sha: str | None = None
+        if following_main:
+            deployed_sha = read_deployed_commit(privileged_prefix)
+            if deployed_sha is None:
+                raise Refused(
+                    f"this install follows Orient's main, and "
+                    f"{privileged_prefix / ORIENT_DEPLOY_RECORD_REL} names no deployed commit, "
+                    f"so there is nothing to place under {orient_name}'s own account before it "
+                    f"restarts. Nothing was migrated.")
+
+        created_account = ensure_orient_account(shape, platform, run=run)
+        if created_account:
+            report(f"{PROG}: created the {orient_name} account")
+
+        orient_home_str = account_home(orient_name)
+        if orient_home_str is None:
+            raise Refused(f"{orient_name} still does not exist after provisioning. Nothing was migrated.")
+        orient_home = Path(orient_home_str)
+        orient_ids = account_ids(orient_name)
+        assert orient_ids is not None
+        if not owned_by(orient_home_str, orient_ids[0]):
+            raise Refused(
+                f"{orient_home} (home of {orient_name}) is not owned by its own account. "
+                f"Nothing was migrated.")
+
+        # Resolved here, not at the end: the repoint below needs the
+        # operator's own cloudflared config before any job stops.
+        operator_home_str = account_home(operator)
+        operator_ids = account_ids(operator)
+        if operator_home_str is None or operator_ids is None:
+            raise Refused(
+                f"could not resolve the operator account ({operator!r}), so there is nowhere "
+                f"to repoint cloudflared before any job stops. Nothing was migrated.")
+
+        # Repointed and restarted before any job stops, so the tunnel
+        # never forwards to Orient's old loopback address while Orient is
+        # down: a request fails rather than reaches another account until
+        # Orient listens on its own socket.
+        cloudflared_config_path = Path(operator_home_str) / CLOUDFLARED_CONFIG_REL
+        try:
+            cloudflared_original_text = cloudflared_config_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise Refused(
+                f"could not read {cloudflared_config_path}: {exc}. Nothing was migrated.") from exc
+        changed = repoint_cloudflared(cloudflared_config_path)
+        if changed:
+            cloudflared_file_written = True
+            validate_cloudflared(cloudflared_config_path, operator, run=run)
+            restart_cloudflared(operator, operator_ids[0], platform, cloudflared_label, run=run)
+            cloudflared_restarted = True
+            report(f"{PROG}: repointed {cloudflared_config_path} at unix:{ORIENT_SOCKET_PATH} and "
+                   f"restarted cloudflared, before stopping any of Orient's own jobs")
+        else:
+            report(f"{PROG}: {cloudflared_config_path} already names Orient's own socket")
+
+        stopped = True
+        stop_orient_units(str(agents_home), root, platform, run=run)
+
+        remove_agents_units(agents_home, platform, actual_system_dir, removed_units, run=run)
+        remove_deploy_watch(platform, agents_home, agents_ids[0], removed_watch, run=run)
+
+        place_orient_code(platform, run=run)
+
+        library_name = library_account_name(platform)
+        library_home_str = account_home(library_name)
+        if library_home_str is None:
+            raise Refused(
+                f"{library_name} does not exist. Run bin/migrate-library-account first. "
+                f"Nothing was migrated.")
+        library_home = Path(library_home_str)
+        library_ids = account_ids(library_name)
+        assert library_ids is not None
+        # Both mints below run after the rotation, past the point of no
+        # return, so the capabilities they withhold are computed here,
+        # while a failure still rolls back. A rehearsal of this migration
+        # failed computing them after the rotation, leaving the install
+        # with rotated tokens and Orient stopped.
+        capture_withholds = run_as_account(
+            *library_ids, lambda: library_role_withholds(library_home, CAPTURE_TOKEN_GRANT, run=run))
+        person_save_withholds = run_as_account(
+            *library_ids, lambda: library_role_withholds(library_home, KB_PERSON_SAVE_GRANT, run=run))
+    except Exception as exc:
+        cloudflared_note = rollback(exc)
+        # `exc`'s own message, in the Refused case, still ends "Nothing
+        # further was migrated"/"Nothing was migrated" — true when this
+        # is caught before cloudflared's config was ever written, false
+        # once rollback has just put it back; `_with_cloudflared_note`
+        # corrects that ending only when there is something to correct.
+        if isinstance(exc, Refused):
+            if cloudflared_note:
+                raise Refused(_with_cloudflared_note(str(exc), cloudflared_note)) from exc
+            raise
+        message = f"refusing — {exc}. Nothing was migrated."
+        if cloudflared_note:
+            message = _with_cloudflared_note(message, cloudflared_note)
+        raise Refused(message) from exc
+
+    # Past this point Orient's own account holds real data — the account is
+    # provisioned, its code is placed, and the tokens are about to be
+    # rotated — so failures from here on are reported, not unwound — the
+    # state they would be undoing may already be verified and promoted by
+    # the time they happen. This mirrors bin/migrate-library-account's own
+    # split between its reversible setup and its one-way promotion.
+    for store_file, out_name in zip(ORIENT_TOKEN_STORE_FILES, ORIENT_TOKEN_NAMES):
+        out_path = library_home / ORIENT_CONTROL / out_name
+        rotate_orient_token(library_home, library_ids, store_file, out_path, run=run)
+        report(f"{PROG}: rotated {out_name} in the {store_file} store")
+
+    if mint_capture_token(library_home, library_ids, run=run, withholds=capture_withholds):
+        report(f"{PROG}: minted Orient's own narrow signal credential ({CAPTURE_TOKEN_NAME})")
+
+    # Checked before anything below decides whether to mint: an install or
+    # an earlier run of this migration may already hold `kb-person-save`
+    # under a crew, which authenticates nobody where the install's project
+    # registry has no row for it, whether or not `agents` has a copy — see
+    # `remint_kb_person_save_crew`'s own docstring.
+    reminted_person_save = remint_kb_person_save_crew(library_home, library_ids, run=run)
+    if reminted_person_save:
+        report(f"{PROG}: re-minted {KB_PERSON_SAVE_TOKEN_NAME} with no crew; a crew the "
+               f"project registry has no row for makes the Library refuse it")
+
+    # Checked against `agents`' own copy, never the Library's: the Library
+    # may already hold one from a fresh install's `jobs/library.toml` own
+    # `prepare`, minted under this same release before this migration ever
+    # ran, while `agents` has not yet received it — see
+    # `mint_kb_person_save_token`'s own docstring.
+    agents_oc = agents_orient_control(agents_home)
+    deliver_person_save = reminted_person_save or not (agents_oc / KB_PERSON_SAVE_TOKEN_NAME).exists()
+    if not reminted_person_save and deliver_person_save and mint_kb_person_save_token(
+            library_home, library_ids, run=run, withholds=person_save_withholds):
+        report(f"{PROG}: minted {KB_PERSON_SAVE_TOKEN_NAME}")
+    elif not deliver_person_save:
+        report(f"{PROG}: {AGENTS} already holds {KB_PERSON_SAVE_TOKEN_NAME}; left it alone")
+
+    deliver_to_orient(run=run)
+    report(f"{PROG}: delivered the rotated tokens and {CAPTURE_TOKEN_NAME} to {orient_home / ORIENT_CONTROL}")
+    if deliver_person_save:
+        report(f"{PROG}: delivered {KB_PERSON_SAVE_TOKEN_NAME} to {agents_oc / KB_PERSON_SAVE_TOKEN_NAME}")
+
+    for name in ORIENT_TOKEN_NAMES:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(agents_oc / name)
+    report(f"{PROG}: removed {AGENTS}'s own, now-superseded copies of {', '.join(ORIENT_TOKEN_NAMES)}")
+
+    # agents' own old, wide capture-token (minted under the name
+    # github-capture) is gone now that Orient's own narrow one is
+    # delivered: absence changes nothing, and the operator still revokes
+    # its credential by hand, since deleting this file is not revoking it.
+    agents_capture = agents_oc / CAPTURE_TOKEN_NAME
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(agents_capture)
+        report(f"{PROG}: removed {agents_capture}; revoke its credential once this migration "
+               f"has finished")
+
+    try:
+        copied: list[str] = []
+        copy_flat_files(agents_oc, orient_home / ORIENT_CONTROL, ORIENT_CONTROL_OTHER_NAMES,
+                        *orient_ids, agents_ids[0], copied)
+        for name in copied:
+            os.remove(agents_oc / name)
+        if copied:
+            report(f"{PROG}: moved {', '.join(copied)} to {orient_home / ORIENT_CONTROL}")
+
+        src_config = agents_home / ORIENT_CONFIG_REL
+        if src_config.is_dir():
+            dst_config_parent = orient_home / ORIENT_CONFIG_REL.parent
+            dst_config = orient_home / ORIENT_CONFIG_REL
+            if os.path.lexists(dst_config):
+                raise Refused(
+                    f"{dst_config} already exists, and {src_config} is still there too. This "
+                    f"looks like a previous migration that did not finish cleanly. Resolve by "
+                    f"hand.")
+            mkdir_owned(dst_config_parent, *orient_ids)
+            staging = dst_config_parent / f".{ORIENT_CONFIG_REL.name}.migrating-{os.getpid()}"
+            manifest: dict[str, tuple[int, str]] = {}
+            src_fd = os.open(str(src_config), DIR_OPEN)
+            try:
+                if os.fstat(src_fd).st_uid != agents_ids[0]:
+                    raise Refused(f"refusing {src_config}: it is not owned by {AGENTS}.")
+                os.mkdir(staging, 0o700)
+                dst_fd = os.open(str(staging), DIR_OPEN)
+                try:
+                    os.fchown(dst_fd, *orient_ids)
+                    copy_tree(src_fd, dst_fd, str(src_config), *orient_ids, manifest)
+                finally:
+                    os.close(dst_fd)
+            finally:
+                os.close(src_fd)
+            verify_tree_copy(manifest, staging)
+            os.rename(staging, dst_config)
+            shutil.rmtree(src_config)
+            report(f"{PROG}: moved {src_config} to {dst_config}")
+    except Refused as exc:
+        remaining = remaining_agents_orient_files(agents_home)
+        raise Refused(
+            f"{exc} Still under {AGENTS}'s own home: "
+            f"{', '.join(remaining) if remaining else 'nothing from the table above'}. Delete "
+            f"each by hand once {orient_name}'s own copy is confirmed.") from exc
+
+    try:
+        moved_logs = move_sibling_logs(agents_home, orient_home, agents_ids[0], orient_ids)
+        if moved_logs:
+            report(f"{PROG}: moved {', '.join(moved_logs)}")
+    except OSError as exc:
+        report(f"{PROG}: migrated, but could not move every sibling log: {exc}. Move "
+               f"{agents_home / STATE_REL} by hand.")
+
+    deploy_dir = agents_home / DEPLOY_ORIENT_REL
+    if os.path.lexists(deploy_dir) and not os.path.islink(deploy_dir):
+        shutil.rmtree(deploy_dir, ignore_errors=True)
+        report(f"{PROG}: removed {deploy_dir}")
+
+    if following_main:
+        # place_orient_code() (bin/place-orient) left Orient's own code
+        # untouched on this install, deferring to the root deploy step —
+        # which is not started until Orient's own units are confirmed
+        # restarted, near the end of this function. Nothing else would
+        # put Orient's own code under its own account before that first
+        # cycle, so this places it now, before the statement key below
+        # needs Orient's own deploy-area Python to exist.
+        assert deployed_sha is not None
+        place_deployed_commit(privileged_prefix, deployed_sha, orient_name, platform, run=run)
+        report(f"{PROG}: placed {deployed_sha} — the root deploy step's own deployed commit — "
+               f"under {orient_home / DEPLOY_ORIENT_REL}, since nothing else would before its "
+               f"first cycle after this migration")
+
+    installed_record = privileged_prefix / "src" / "installed"
+    record_text = None
+    try:
+        record_text = installed_record.read_text(encoding="utf-8")
+    except OSError:
+        pass
+    sha = None
+    if record_text:
+        for line in record_text.splitlines():
+            fields = line.split()
+            if len(fields) == 2 and fields[0] == "convivy-orient":
+                sha = fields[1]
+    orient_key_line = ""
+    if sha is None:
+        report(f"{PROG}: migrated the account and its data, but could not find Orient's own "
+               f"placed tree to run orient-make-statement-key from. Run it by hand once "
+               f"{installed_record} names a convivy-orient commit.")
+    else:
+        # The release's own convivy-orient tree, which the installer always
+        # extracts, never the followed repository's: on a follow-main install
+        # src/installed can name a followed commit root never extracted.
+        tree = privileged_prefix / "src" / f"convivy-orient@{sha}"
+        # Orient's own deploy area, not root's system Python: the tool
+        # needs cryptography, which root's system interpreter does not
+        # carry and which only Orient's own venv does, placed either by
+        # place_orient_code() above or, on a follow-main install, by
+        # place_deployed_commit() just above.
+        python = orient_home / DEPLOY_ORIENT_REL / ".venv" / "bin" / "python"
+        orient_key_line = run_orient_make_statement_key(orient_home, orient_ids, tree, python, run=run)
+        if orient_key_line:
+            report(f"{PROG}: created Orient's own statement key")
+        place_statement_key_in_verifier(Path(operator_home_str), operator_ids, orient_key_line)
+        report(f"{PROG}: placed the statement key's public half under orient_statement_key "
+               f"in {Path(operator_home_str) / KB_VERIFIER_REL}")
+
+    if person_save_sources is None:
+        report(f"{PROG}: migrated, but the Library's person-save inputs were not placed: pass "
+               f"--root-ca, --app-key, --app-config and --persons to place them. Until they are "
+               f"placed, the Library refuses every person-save, Orient-signed or Deck-signed.")
+    else:
+        root_ca, app_key, app_config, persons = person_save_sources
+        try:
+            placed = place_library_person_save_inputs(
+                library_home, library_ids, root_ca, app_key, app_config, persons,
+                key=orient_key_line or None)
+        except Refused as exc:
+            report(f"{PROG}: migrated, but the Library's person-save inputs were not placed: {exc}")
+        else:
+            for name, what in placed:
+                report(f"{PROG}: person-save {name}: {what}")
+
+    agent_platform_tree = None
+    if record_text:
+        for line in record_text.splitlines():
+            fields = line.split()
+            if len(fields) == 2 and fields[0] == "agent-platform":
+                agent_platform_tree = privileged_prefix / "src" / f"agent-platform@{fields[1]}"
+    orient_group = "staff" if platform != "macos" else "_orient"
+    try:
+        orient_gid = orient_ids[1]
+        import grp
+        orient_group = grp.getgrgid(orient_gid).gr_name
+    except (KeyError, ImportError, OSError):
+        pass
+    if agent_platform_tree is None:
+        report(f"{PROG}: migrated, but could not find agent-platform's own placed tree to "
+               f"install the document service from. Install it by hand once "
+               f"{installed_record} names an agent-platform commit.")
+    else:
+        try:
+            install_agent_platform_shared(agent_platform_tree, agents_home, platform, run=run)
+        except Refused as exc:
+            report(f"{PROG}: migrated the account and its data, but the shared agent-platform "
+                   f"area was not deployed, so the document service was not installed either: "
+                   f"{exc}")
+        else:
+            report(f"{PROG}: deployed the shared agent-platform area under "
+                   f"{agents_home / AGENT_PLATFORM_SHARED_REL}")
+            try:
+                install_document_service(agent_platform_tree, orient_group, orient_gid,
+                                          agents_home, agents_ids[0], platform,
+                                          socket_dir=document_socket_dir, system_dir=actual_system_dir,
+                                          dir_ops=document_dir_ops, run=run)
+            except Refused as exc:
+                report(f"{PROG}: migrated the account and its data, but the document service was "
+                       f"not installed: {exc}")
+            else:
+                if orient_job_declares_document_socket(jobs_dir):
+                    report(f"{PROG}: installed the document service with --client-group {orient_group}, "
+                           f"its socket directory, and its LaunchDaemon")
+                else:
+                    report(f"{PROG}: installed the document service, but jobs/orient.toml names no "
+                           f"ORIENT_KB_DOCUMENT_SOCKET in its own [account-environment], so Orient's "
+                           f"restart will leave document saves dark. Add the variable there and "
+                           f"restart Orient by hand.")
+
+    # Render Orient's own units from the root tree's declarations before
+    # starting them: the agents' units were removed above, and
+    # install-jobs --start only activates a unit already on disk, so
+    # nothing would be there to start without this. Every declared label,
+    # not existing_orient_labels() — see start_orient_units and
+    # render_orient_units.
+    restart_problem = render_orient_units(str(agents_home), root, platform, privileged_prefix, run=run)
+    if restart_problem is not None:
+        restart_problem = f"could not render its units: {restart_problem}"
+    else:
+        restart_problem = start_orient_units(str(agents_home), root, platform, ORIENT_UNIT_LABELS, run=run)
+    if restart_problem:
+        report(f"{PROG}: migrated, but could not restart Orient: {restart_problem}. "
+               f"Start it by hand.")
+    else:
+        report(f"{PROG}: restarted Orient")
+        # Only now, with Orient's own units confirmed running again, does
+        # this start the root deploy step — see the early check this
+        # function already made, before anything was rotated, and the
+        # module docstring's own note on why starting it this early fails
+        # when Orient main is ahead of the deployed commit. This is already
+        # past the point of no return, so a failure here is reported, not
+        # rolled back, and never leaves the timer or the service running.
+        try:
+            start_root_deploy_step(platform, run=run)
+        except Refused as exc:
+            stop_root_deploy_step(platform, run=run)
+            start_by_hand = (f"sudo launchctl kickstart -k system/{ROOT_DEPLOY_UNIT_LABEL}"
+                             if platform == "macos"
+                             else f"sudo systemctl start {ROOT_DEPLOY_UNIT_LABEL}.timer")
+            report(f"{PROG}: migrated and restarted Orient, but {ROOT_DEPLOY_UNIT_LABEL} could "
+                   f"not be started: {exc} Once Orient is confirmed serving, start it by hand: "
+                   f"{start_by_hand}")
+        else:
+            report(f"{PROG}: started {ROOT_DEPLOY_UNIT_LABEL}")
+
+
+def person_save_flags_problem(root_ca: str | None, app_key: str | None, app_config: str | None,
+                               persons: str | None) -> str | None:
+    """None when `--root-ca`, `--app-key`, `--app-config` and `--persons` are
+    all given or none is; otherwise names which of the four are still
+    missing, for `main()` to refuse with before anything changes or any job
+    stops. `orient-statement-key.json` needs all four (step 14), so a
+    partial set is refused here rather than treated as none, the way
+    `person_save_sources` below already treats a missing fourth."""
+    values = {"--root-ca": root_ca, "--app-key": app_key, "--app-config": app_config,
+              "--persons": persons}
+    given = [name for name, value in values.items() if value]
+    if not given or len(given) == len(values):
+        return None
+    missing = [name for name in values if name not in given]
+    return ", ".join(missing)
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Move an existing install's Orient to its own service account, rotating "
+                    "its two Library tokens.",
+    )
+    parser.add_argument("--shape", required=True, choices=("two", "three"))
+    parser.add_argument("--operator", help="the operator's login (default: the user who ran sudo)")
+    parser.add_argument("--cloudflared-label", default=DEFAULT_CLOUDFLARED_LABEL,
+                        help=f"the operator's cloudflared job label (default: {DEFAULT_CLOUDFLARED_LABEL})")
+    parser.add_argument("--system-dir", help="where a system-scope job's unit lives, "
+                        "instead of /Library/LaunchDaemons or /etc/systemd/system")
+    parser.add_argument("--deploy-signals-bound", action="store_true",
+                        help="assert that Orient's crew has already bound the instruction "
+                             "block reading deploy_failure and deploy_stall to its own "
+                             "sessions (spec step 7). Required for a real run; this script "
+                             "cannot verify it itself.")
+    parser.add_argument("--root-ca", help="Deck's root certificate (PEM), for the Library's "
+                        "person-save inputs")
+    parser.add_argument("--app-key", help="the Library App's RSA private key (PEM), for the "
+                        "Library's person-save inputs")
+    parser.add_argument("--app-config", help="JSON naming the Library App's app_id and its "
+                        "repo, for the Library's person-save inputs")
+    parser.add_argument("--persons", help="comma-separated emails allowed to sign a person-save, "
+                        "for the Library's person-save inputs")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="say what would happen, change nothing")
+    mode.add_argument("--check", action="store_true", help="report only; 1 if migration is pending")
+    mode.add_argument("--status", action="store_true", help="the same report, changing nothing")
+    args = parser.parse_args(argv)
+
+    problem = person_save_flags_problem(args.root_ca, args.app_key, args.app_config, args.persons)
+    if problem:
+        print(f"{PROG}: refusing — missing {problem}; give --root-ca, --app-key, --app-config "
+              f"and --persons together, or omit them all to skip placing the Library's "
+              f"person-save inputs. Nothing was migrated.", file=sys.stderr)
+        return 2
+
+    if os.geteuid() != 0:
+        print(f"{PROG}: refusing — this needs root, to stop Orient's units and move both "
+              f"accounts' files. Nothing was migrated.", file=sys.stderr)
+        return 2
+    # Root starts in `/`, as stand-up-backend does. Every `sudo -u <account>`
+    # child below inherits this directory, and the operator's own is one the
+    # service accounts cannot read on macOS (home directories are 0750 there).
+    # The r44 macOS rehearsal stopped on exactly that: install-backend, run as
+    # `_orient` from the operator's own home, failed at pip's own os.getcwd(), after
+    # both tokens had rotated. A relative --system-dir still names what the
+    # operator typed, so it is resolved before the move.
+    if args.system_dir:
+        args.system_dir = os.path.abspath(args.system_dir)
+    os.chdir("/")
+
+    platform = "macos" if sys.platform == "darwin" else "linux"
+    agents_home_str = account_home(AGENTS)
+    if agents_home_str is None:
+        print(f"{PROG}: no {AGENTS} account on this machine — nothing to migrate.")
+        return 0
+    agents_home = Path(agents_home_str)
+
+    pending = needs_migration(agents_home)
+
+    if args.check or args.status:
+        if pending:
+            print(f"{PROG}: Orient's state is still under {AGENTS} — migration is pending")
+        else:
+            print(f"{PROG}: nothing pending — Orient is not running as {AGENTS}")
+        return 1 if (args.check and pending) else 0
+
+    if args.dry_run:
+        if pending:
+            print(f"{PROG}: would stop {', '.join(ORIENT_UNIT_LABELS)}, remove "
+                  f"{OLD_DEPLOY_WATCH_LABEL}, place Orient's code, rotate "
+                  f"{' and '.join(ORIENT_TOKEN_NAMES)}, move "
+                  f"{agents_orient_control(agents_home)} and {agents_home / ORIENT_CONFIG_REL} "
+                  f"to the {orient_account_name(platform)} account, create its statement key, "
+                  f"install the document service, restart Orient, start "
+                  f"{ROOT_DEPLOY_UNIT_LABEL}, and repoint cloudflared")
+        else:
+            print(f"{PROG}: nothing to do — Orient is not running as {AGENTS}")
+        return 0
+
+    # Checked here, in the real-run path alone, before anything changes —
+    # never for --check/--status/--dry-run, which read and change nothing
+    # regardless of where this copy sits. A run from outside its own
+    # extracted tree gets past every check below (cloudflared, the two
+    # token rotations, every file move) and used to only fail once
+    # place_deployed_commit() loaded install-privileged, whose own
+    # load-time guard refuses past the point of no return. See CQ·131.
+    # Loading that sibling here, too, through
+    # _install_privileged_for_extract(), brings its ownership check of
+    # the extracted tree forward to this same point, before
+    # place_deployed_commit() needs to load it for real.
+    problem = script_location_problem(HERE_FILE)
+    if not problem:
+        try:
+            _install_privileged_for_extract()
+        except SystemExit as exc:
+            problem = ("install-privileged's own location check refused loading it "
+                       f"(exit {exc.code})")
+    if problem:
+        print(f"{PROG}: refusing to run from {HERE_FILE}: {problem}. Run "
+              f"sudo {root_interpreter(platform)} -I "
+              f"<prefix>/src/shipwright@<sha>/bin/{PROG} --shape {args.shape} "
+              f"--deploy-signals-bound instead. Nothing was migrated.", file=sys.stderr)
+        return 2
+
+    if not pending:
+        print(f"{PROG}: nothing to migrate — Orient is not running as {AGENTS}")
+        return 0
+
+    if not args.deploy_signals_bound:
+        print(f"{PROG}: refusing — pass --deploy-signals-bound once Orient's crew has bound "
+              f"the instruction block that reads deploy_failure and deploy_stall to its own "
+              f"sessions. This script cannot verify that binding itself. Nothing was "
+              f"migrated.",
+              file=sys.stderr)
+        return 2
+
+    operator = args.operator or os.environ.get("SUDO_USER")
+    if not operator:
+        print(f"{PROG}: refusing — could not determine the operator's login; pass --operator. "
+              f"Nothing was migrated.", file=sys.stderr)
+        return 2
+
+    person_save_sources = None
+    if args.root_ca and args.app_key and args.app_config and args.persons:
+        person_save_sources = (args.root_ca, args.app_key, args.app_config,
+                               [p.strip() for p in args.persons.split(",")])
+
+    try:
+        migrate(agents_home, args.shape, platform, operator=operator,
+               cloudflared_label=args.cloudflared_label, system_dir=args.system_dir,
+               person_save_sources=person_save_sources)
+    except Refused as exc:
+        print(f"{PROG}: refusing — {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

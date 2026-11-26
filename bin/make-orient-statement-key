@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""make-orient-statement-key — make Orient's own statement key and place its
+public half where the document service and the Library verify it, on an
+install that gives Orient its own account.
+
+    sudo bin/make-orient-statement-key --persons <emails>     make it, as Orient, and place it
+    sudo bin/make-orient-statement-key --operator <login> --persons <emails>
+    sudo bin/make-orient-statement-key                       without --persons: make nothing, say so
+    sudo bin/make-orient-statement-key --dry-run              say what would happen, change nothing
+    sudo bin/make-orient-statement-key --check                report only; 1 if only part of it is placed
+    sudo bin/make-orient-statement-key --status                the same report, changing nothing
+
+**THE PROBLEM THIS CLOSES.** Orient's own save path
+(`convivy-orient`'s `kb_commit._service_commit_document`) raises
+`CommitUnavailable` whenever `ORIENT_CONFIG_ROOT/kb-statement-key.pem` is
+missing, the document service verifies against `orient_statement_key` in the
+operator's own `kb-verifier.json`, and the Library verifies an Orient-signed
+save against its own `.library/person-save/orient-statement-key.json`, which
+also names the `persons` who may sign one. Before this tool, only
+`bin/migrate-orient-account`'s own real run ever made any of the three, so a
+fresh two- or three-account install — which never runs that migration, since
+there is nothing on it to migrate — never got them, and Orient could never
+save a document.
+
+**THE KEY IS MADE ONLY IN THE RUN THAT ALSO GETS `--persons`.** The public
+line goes into both files unchanged from `orient-make-statement-key`'s own
+stdout, held in memory, and is never read back from `kb-verifier.json` or any
+other file outside the Library's account, because whoever could write that
+file before the copy would choose the key the Library trusts. That line exists only in
+the run that makes the key, and the Library's file needs `persons`, which only
+the operator can name. So without `--persons` this makes nothing and exits 0,
+the same way `place-person-save --as-library` skips when the operator has not
+given its sources yet. A key that already exists while the Library holds no
+copy of it is refused, naming how to make a new one: this never deletes a key
+itself.
+
+**THE LIBRARY'S COPY IS WRITTEN AS THE LIBRARY'S ACCOUNT.** Root drops a child
+to the Library account's own uid and gid, and that child writes the file with
+`bin/place-person-save`'s own `write_orient_key()`, so root opens nothing in
+that mode-700 home, the way `bin/migrate-orient-account` places the same file.
+
+**IT REIMPLEMENTS NOTHING.** `run_orient_make_statement_key()` and
+`place_statement_key_in_verifier()` stay exactly where they are, in
+`bin/migrate-orient-account`, loaded here as a sibling module the same way
+`bin/install-document-service` already loads it. This tool resolves the
+same arguments `migrate()` itself derives for those two calls, and hands
+them over unchanged.
+
+**IDEMPOTENT, THE WAY THE MIGRATION ALREADY TREATS AN EXISTING KEY.**
+`run_orient_make_statement_key()` treats `orient-make-statement-key`'s
+"already exists" refusal as already done, returning `""`. A second run that
+finds the key and the Library's copy both in place leaves both, and leaves
+the verifier entry as it is.
+
+**SAME ON LINUX AS ON MACOS.** Unlike the document service, Orient's
+statement key has no platform-specific shape: `run_orient_make_statement_key()`
+only ever runs Orient's own account's interpreter under `sudo -u`, which
+works identically on both.
+
+**NOTHING TO DO BEFORE ORIENT'S OWN ACCOUNT EXISTS.** On the single-account
+shape, or on a two- or three-account install before `provision-accounts`
+has made Orient's own account, this reports nothing to do rather than
+refusing.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pwd
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+PROG = "make-orient-statement-key"
+REPO = Path(__file__).resolve().parent.parent
+
+# Duplicated from `bin/migrate-orient-account`'s own constants, the same way
+# `bin/install-document-service` already duplicates its own subset of them.
+ORIENT_ACCOUNT_NAMES = {"macos": "_orient", "linux": "orient"}
+ORIENT_CONFIG_REL = Path(".local", "state", "orient")
+DEPLOY_ORIENT_REL = Path(".local", "deploy", "convivy-orient")
+STATEMENT_KEY_NAME = "kb-statement-key.pem"
+KB_VERIFIER_REL = Path(".config", "convivy", "kb-verifier.json")
+
+PRIVILEGED_PREFIX = Path("/opt/builder")
+INSTALLED_RECORD = PRIVILEGED_PREFIX / "src" / "installed"
+SHA = re.compile(r"[0-9a-f]{40}")
+
+
+def _load_sibling(module_name: str, filename: str):
+    """`filename`, from this file's own directory, loaded under
+    `module_name` rather than `import`ed by path. Mirrors `bin/install-
+    document-service`'s own helper of the same name — this loads THAT
+    script's own sibling, `bin/migrate-orient-account`."""
+    loader = importlib.machinery.SourceFileLoader(module_name, str(REPO / "bin" / filename))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(module_name, loader))
+    sys.modules[module_name] = module
+    loader.exec_module(module)
+    return module
+
+
+_migrate_orient_account = None
+
+
+def moa():
+    """`bin/migrate-orient-account`, loaded on first use rather than at
+    import — the same reasoning `bin/install-document-service`'s own `moa()`
+    gives, even though this tool has no Linux path that needs to avoid it."""
+    global _migrate_orient_account
+    if _migrate_orient_account is None:
+        _migrate_orient_account = _load_sibling(
+            "migrate_orient_account_for_make_orient_statement_key", "migrate-orient-account")
+    return _migrate_orient_account
+
+
+def platform_name() -> str:
+    return "macos" if sys.platform == "darwin" else "linux"
+
+
+def orient_account_name(platform: str | None = None) -> str:
+    return ORIENT_ACCOUNT_NAMES[platform or platform_name()]
+
+
+def account_ids(name: str) -> tuple[int, int] | None:
+    try:
+        entry = pwd.getpwnam(name)
+    except KeyError:
+        return None
+    return entry.pw_uid, entry.pw_gid
+
+
+def account_home(name: str) -> str | None:
+    try:
+        return pwd.getpwnam(name).pw_dir
+    except KeyError:
+        return None
+
+
+def _read_record(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def installed_sha(record_text: str | None, name: str) -> str | None:
+    if record_text is None:
+        return None
+    for line in record_text.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0] == name and SHA.fullmatch(fields[1]):
+            return fields[1]
+    return None
+
+
+def convivy_orient_tree(record_text: str | None) -> Path:
+    """The root-owned tree `install-privileged` extracted convivy-orient's
+    commit into — refused, naming the fix, when the record has no line for
+    it. `orient-make-statement-key` is run from this tree's own `bin/`."""
+    sha = installed_sha(record_text, "convivy-orient")
+    if sha is None:
+        raise moa().Refused(
+            f"{INSTALLED_RECORD} names no convivy-orient commit, so there is no tree to "
+            f"run orient-make-statement-key from. Run `sudo bin/install-privileged "
+            f"--shape three`, which extracts and records one. Nothing was made.")
+    return PRIVILEGED_PREFIX / "src" / f"convivy-orient@{sha}"
+
+
+SUDO = "/usr/bin/sudo"
+
+
+def make_config_root(orient_name: str, config_root: Path) -> None:
+    """Make Orient's config root, as Orient's own account, when it is not there yet.
+
+    **A FRESH LINUX INSTALL HAS NO `~/.local/state/orient` YET** when this runs:
+    nothing creates it before `supervise` starts Orient's job, and
+    `orient-make-statement-key` creates only the key file, so it fails with
+    "No such file or directory" (a fresh Debian 12 rehearsal, 2026-11-24).
+    `mkdir -p` runs as Orient's own account, never as root, so root never
+    writes inside Orient's home. Raises `moa().Refused` when it fails."""
+    done = subprocess.run([SUDO, "-u", orient_name, "-H", "/bin/mkdir", "-p", "-m", "700",
+                           str(config_root)], capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        raise moa().Refused(f"could not make {config_root} as {orient_name}: "
+                            f"{(done.stderr or done.stdout).strip()}. Nothing further was changed.")
+
+
+def library_person_save_dir() -> tuple[tuple[int, int], Path]:
+    """The Library account's ids and its `.library/person-save` directory, or
+    `moa().Refused` naming the account when it does not exist."""
+    m = moa()
+    name = m.library_account_name(platform_name())
+    ids, home = account_ids(name), account_home(name)
+    if ids is None or home is None:
+        raise m.Refused(f"there is no {name} account to place the Library's copy of the key "
+                        f"under. Nothing further was changed.")
+    return ids, Path(home).joinpath(*m.place_person_save.SUBDIR)
+
+
+def library_has_key() -> bool:
+    """Whether the Library's own `orient-statement-key.json` exists, read by a
+    child dropped to the Library account. False when there is no Library
+    account."""
+    try:
+        ids, d = library_person_save_dir()
+    except moa().Refused:
+        return False
+    target = d / "orient-statement-key.json"
+    return bool(moa().run_as_account(*ids, lambda: target.is_file() and not target.is_symlink()))
+
+
+def place_library_key(key_line: str, persons: list[str]) -> int:
+    """Write the Library's own `orient-statement-key.json` from `key_line`, the
+    line held in memory, and `persons`, through a child dropped to the Library
+    account. Returns how many persons it names. Raises `moa().Refused`."""
+    ids, d = library_person_save_dir()
+    pps = moa().place_person_save
+
+    def _write() -> int:
+        if d.is_symlink() or (d.exists() and not d.is_dir()):
+            raise pps.Refused(f"{d} exists and is not a directory. Nothing was placed.")
+        d.mkdir(parents=True, exist_ok=True)
+        os.chmod(d, 0o700)
+        return len(pps.write_orient_key(d, key_line, persons))
+
+    return moa().run_as_account(*ids, _write)
+
+
+def verifier_has_key(verifier_path: Path) -> bool:
+    """Whether `verifier_path` holds a truthy `orient_statement_key` entry."""
+    try:
+        text = verifier_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return False
+    return isinstance(data, dict) and bool(data.get("orient_statement_key"))
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Make Orient's own statement key and place its public half in the "
+                    "operator's kb-verifier.json and in the Library's orient-statement-key.json. "
+                    "Without --persons it makes nothing.",
+    )
+    parser.add_argument("--operator", help="the operator's login (default: the user who ran sudo)")
+    parser.add_argument("--persons", default=None,
+                        help="comma-separated emails allowed to sign a person-save, written into "
+                             "the Library's copy of the key; without it, nothing is made")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--dry-run", action="store_true", help="say what would happen, change nothing")
+    group.add_argument("--check", action="store_true",
+                       help="report only; 1 if only part of it is placed")
+    group.add_argument("--status", action="store_true", help="the same report, changing nothing")
+    args = parser.parse_args(argv)
+    mode = "dry-run" if args.dry_run else "check" if args.check else "status" if args.status else None
+
+    if os.geteuid() != 0:
+        print(f"{PROG}: refusing — this needs root, to run Orient's own account, write "
+              f"the operator's kb-verifier.json and write the Library's copy as the Library's "
+              f"account. Nothing was changed.", file=sys.stderr)
+        return 2
+
+    platform = platform_name()
+    orient_name = orient_account_name(platform)
+    orient_ids = account_ids(orient_name)
+    if orient_ids is None:
+        print(f"{PROG}: no {orient_name} account on this machine — nothing to make. Either "
+              f"this is the single-account shape, where Orient runs as the operator, or "
+              f"Orient's own account has not been provisioned yet.")
+        return 0
+    orient_home_str = account_home(orient_name)
+    assert orient_home_str is not None  # just resolved by name above
+    orient_home = Path(orient_home_str)
+
+    operator = args.operator or os.environ.get("SUDO_USER")
+    if not operator:
+        print(f"{PROG}: refusing — could not determine the operator's login; pass "
+              f"--operator. Nothing was changed.", file=sys.stderr)
+        return 2
+    operator_home_str = account_home(operator)
+    operator_ids = account_ids(operator)
+    if operator_home_str is None or operator_ids is None:
+        print(f"{PROG}: refusing — could not resolve the operator account ({operator!r}). "
+              f"Nothing was changed.", file=sys.stderr)
+        return 2
+    operator_home = Path(operator_home_str)
+
+    key_path = orient_home / ORIENT_CONFIG_REL / STATEMENT_KEY_NAME
+    verifier_path = operator_home / KB_VERIFIER_REL
+
+    if mode in ("dry-run", "check", "status"):
+        try:
+            library_present = library_has_key()
+        except moa().Refused as exc:
+            print(f"{PROG}: could not read the Library's copy of the key: {exc}", file=sys.stderr)
+            return 1 if mode in ("check", "status") else 0
+        parts = ((str(key_path), key_path.is_file()),
+                 (f"orient_statement_key in {verifier_path}", verifier_has_key(verifier_path)),
+                 ("the Library's orient-statement-key.json", library_present))
+        if all(present for _, present in parts):
+            print(f"{PROG}: Orient's statement key exists, and its public half is placed in "
+                  f"{verifier_path} and in the Library's orient-statement-key.json")
+            return 0
+        if not any(present for _, present in parts):
+            print(f"{PROG}: Orient's statement key has not been made. A real run given --persons "
+                  f"makes it; until then nothing is missing.")
+            return 0
+        missing = [name for name, present in parts if not present]
+        print(f"{PROG}: missing {', '.join(missing)}")
+        return 1 if mode in ("check", "status") else 0
+
+    if not args.persons:
+        print(f"{PROG}: no --persons given, so Orient's statement key was not made. Run this "
+              f"again with --persons naming who may sign a person-save; until then the Library "
+              f"refuses every save Orient signs.")
+        return 0
+    persons = [p.strip() for p in args.persons.split(",")]
+
+    try:
+        # Both checked before the key exists, so a mistyped list or a missing Library
+        # account never leaves a key the Library holds no copy of.
+        moa().place_person_save._normalize_persons(persons)
+        library_person_save_dir()
+        tree = convivy_orient_tree(_read_record(INSTALLED_RECORD))
+        python = orient_home / DEPLOY_ORIENT_REL / ".venv" / "bin" / "python"
+        make_config_root(orient_name, orient_home / ORIENT_CONFIG_REL)
+        key_line = moa().run_orient_make_statement_key(orient_home, orient_ids, tree, python)
+        if not key_line:
+            if library_has_key():
+                print(f"{PROG}: {key_path} already exists and the Library holds its copy — left "
+                      f"both, and left {verifier_path} as it is")
+                return 0
+            raise moa().Refused(
+                f"{key_path} already exists, but the Library holds no copy of it, and its public "
+                f"line is never read back from a file. Remove {key_path} as root and run this "
+                f"again with --persons to make a new key. Nothing further was changed.")
+        moa().place_statement_key_in_verifier(operator_home, operator_ids, key_line)
+        count = place_library_key(key_line, persons)
+    except (moa().Refused, moa().place_person_save.Refused) as exc:
+        print(f"{PROG}: refusing — {fresh_install_reason(str(exc))}", file=sys.stderr)
+        return 2
+    print(f"{PROG}: made Orient's own statement key and placed its public half in "
+          f"{verifier_path} and in the Library's orient-statement-key.json, naming {count} "
+          f"person(s)")
+    return 0
+
+
+# The migration-only sentences `bin/migrate-orient-account`'s two functions end
+# their refusals with, and what each says instead on this tool's own path, where
+# no Library token is ever rotated and nothing is migrated. The first is that
+# module's own `_ALREADY_ROTATED`; its test checks the two stay equal.
+MIGRATION_ONLY_SENTENCES = (
+    ("The two Library tokens were already rotated; the statement key was not placed.",
+     "Its public half was not placed in the operator's kb-verifier.json."),
+    ("The two Library tokens were already rotated.", ""),
+    ("Nothing further was migrated.", "Nothing further was changed."),
+)
+
+
+def fresh_install_reason(text: str) -> str:
+    """`text`, a refusal from `bin/migrate-orient-account`, with each sentence
+    that is true only during a migration replaced by what is true here."""
+    for migration, here in MIGRATION_ONLY_SENTENCES:
+        text = text.replace(f" {migration}", f" {here}" if here else "")
+    return text
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

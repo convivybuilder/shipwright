@@ -169,6 +169,24 @@ class Job:
     # The account a system-scope job runs as, instead of root. See FORMAT.md,
     # "account".
     account: str | None = None
+    # The account's name on macOS alone, where it differs from `account`
+    # (company decision 0025 point 5: macOS's own convention for a daemon
+    # account's name). See FORMAT.md, "account".
+    account_macos: str | None = None
+    # What `{root}` resolves to for this job alone, in place of the install's
+    # own root, while the job's account is in force. See FORMAT.md, "own-root".
+    own_root: str | None = None
+    # Entries added to `environment` only while the job's account is in force.
+    # See FORMAT.md, "account-environment".
+    account_environment: dict[str, str] = field(default_factory=dict)
+    # Steps added to `prepare` only while the job's account is in force. See
+    # FORMAT.md, "account-prepare".
+    account_prepare: tuple[PrepareStep, ...] = ()
+    # Whether this job is left out entirely under `--single-account`, rather
+    # than converted to a user-scope job of the operator the way
+    # `as_invoker` converts every other job that names an account. See
+    # FORMAT.md, "account-only".
+    account_only: bool = False
     source: str = "<memory>"
 
     def __post_init__(self) -> None:
@@ -208,9 +226,18 @@ class Job:
                 _check_no_control_characters(self.source, f"prepare[{index}][{position}]", part)
             if step.creates is not None:
                 _check_no_control_characters(self.source, f"prepare[{index}].creates", step.creates)
+        for index, step in enumerate(self.account_prepare):
+            for position, part in enumerate(step.argv):
+                _check_no_control_characters(self.source, f"account-prepare[{index}][{position}]", part)
+            if step.creates is not None:
+                _check_no_control_characters(self.source, f"account-prepare[{index}].creates", step.creates)
         for key, value in self.environment.items():
             _check_no_control_characters(self.source, f"environment key {key!r}", key)
             _check_no_control_characters(self.source, f"environment[{key}]", value)
+            _check_environment_key(self.source, key)
+        for key, value in self.account_environment.items():
+            _check_no_control_characters(self.source, f"account-environment key {key!r}", key)
+            _check_no_control_characters(self.source, f"account-environment[{key}]", value)
             _check_environment_key(self.source, key)
         for program in self.programs:
             if not isinstance(program, str) or not PROGRAM.match(program):
@@ -247,6 +274,70 @@ class Job:
             # `User=` and `Group=` are written unquoted, like the working directory.
             _check_no_control_characters(self.source, "account", self.account)
             _check_no_backslash(self.source, "account", self.account)
+        if self.account_macos is not None:
+            if not isinstance(self.account_macos, str) or not self.account_macos:
+                raise DeclarationError(self.source, "account-macos must be a non-empty string")
+            if self.account is None:
+                raise DeclarationError(
+                    self.source,
+                    "account-macos overrides the account on macOS, so it needs "
+                    "account too",
+                )
+            if "macos" not in self.platforms:
+                raise DeclarationError(
+                    self.source,
+                    "account-macos is for a job whose platforms include \"macos\"; "
+                    "without macos in platforms it would never take effect",
+                )
+            _check_no_control_characters(self.source, "account-macos", self.account_macos)
+            _check_no_backslash(self.source, "account-macos", self.account_macos)
+        if self.own_root is not None:
+            if not isinstance(self.own_root, str) or not self.own_root:
+                raise DeclarationError(self.source, "own-root must be a non-empty string")
+            if self.account is None:
+                raise DeclarationError(
+                    self.source,
+                    "own-root replaces {root} only while a job's account is in force, "
+                    "so it needs account too; without one it could never take effect",
+                )
+            _check_no_control_characters(self.source, "own-root", self.own_root)
+            _check_no_backslash(self.source, "own-root", self.own_root)
+            if "{root}" in self.own_root:
+                raise DeclarationError(
+                    self.source,
+                    "own-root cannot use {root}; own-root is what {root} resolves to "
+                    "for this job, so a value naming {root} would need its own answer "
+                    "before it has one",
+                )
+        if self.account_environment:
+            if self.account is None:
+                raise DeclarationError(
+                    self.source,
+                    "account-environment applies only while a job's account is in "
+                    "force, so it needs account too; without one it could never "
+                    "take effect",
+                )
+            overlap = sorted(set(self.account_environment) & set(self.environment))
+            if overlap:
+                raise DeclarationError(
+                    self.source,
+                    f"account-environment names {', '.join(overlap)}, which "
+                    f"environment also names; a declaration should not say two "
+                    f"things about the same variable",
+                )
+        if self.account_prepare and self.account is None:
+            raise DeclarationError(
+                self.source,
+                "account-prepare applies only while a job's account is in force, "
+                "so it needs account too; without one it could never take effect",
+            )
+        if self.account_only and self.account is None:
+            raise DeclarationError(
+                self.source,
+                "account-only says this job is left out entirely under "
+                "--single-account, so it needs account too; without one there "
+                "would be no account for --single-account to drop",
+            )
         # Here with the other fences because `import_launchd` builds a job from
         # a plist's `ExitTimeOut` without going through `parse` (security review).
         stop = self.stop_timeout_seconds
@@ -268,6 +359,21 @@ class Job:
 
     def runs_on(self, platform: str) -> bool:
         return platform in self.platforms
+
+
+def effective_account(job, platform: str) -> str | None:
+    """The account `job` actually runs as on `platform`: its own
+    `account_macos` on macOS when it names one, `account` otherwise.
+
+    A FUNCTION RATHER THAN A `Job` METHOD, so a duck-typed stand-in used in a
+    test for `prepare_jobs` or `resolve` — one that carries `account` but
+    never had a reason to carry `account_macos` — reads as naming no override,
+    through `getattr`'s default, rather than raising `AttributeError`.
+    """
+    account_macos = getattr(job, "account_macos", None)
+    if platform == "macos" and account_macos:
+        return account_macos
+    return job.account
 
 
 def _require(table: dict, key: str, source: str, kind: type):
@@ -494,6 +600,12 @@ def parse(text: str, source: str = "<memory>") -> Job:
     ):
         raise DeclarationError(source, "environment must be a table of string to string")
 
+    account_environment = table.get("account-environment", {})
+    if not isinstance(account_environment, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in account_environment.items()
+    ):
+        raise DeclarationError(source, "account-environment must be a table of string to string")
+
     log = table.get("log", {})
     if not isinstance(log, dict):
         raise DeclarationError(source, "log must be a table")
@@ -603,6 +715,11 @@ def parse(text: str, source: str = "<memory>") -> Job:
         "programs",
         "macos",
         "account",
+        "account-macos",
+        "own-root",
+        "account-environment",
+        "account-prepare",
+        "account-only",
     }
     if unknown_top:
         raise DeclarationError(
@@ -630,6 +747,12 @@ def parse(text: str, source: str = "<memory>") -> Job:
     if not isinstance(raw_prepare, list):
         raise DeclarationError(source, "prepare must be a list of commands")
     prepare = [_parse_prepare_step(entry, index, source) for index, entry in enumerate(raw_prepare)]
+    raw_account_prepare = table.get("account-prepare", [])
+    if not isinstance(raw_account_prepare, list):
+        raise DeclarationError(source, "account-prepare must be a list of commands")
+    account_prepare = [
+        _parse_prepare_step(entry, index, source) for index, entry in enumerate(raw_account_prepare)
+    ]
     # A PREPARE STEP RUNS SOMEWHERE THE JOB NAMES, AS THE ACCOUNT THAT RUNS THE
     # JOB. Without a working-directory it would run wherever the installer
     # happened to be invoked from. A system-scope job with no `account` is
@@ -644,7 +767,7 @@ def parse(text: str, source: str = "<memory>") -> Job:
             "jobs that name an account; a system-scope job with no account is "
             "installed as root, and its steps would run as root",
         )
-    if prepare and not working_directory:
+    if (prepare or account_prepare) and not working_directory:
         raise DeclarationError(
             source,
             "prepare needs a working-directory, so each step runs where the job "
@@ -685,6 +808,15 @@ def parse(text: str, source: str = "<memory>") -> Job:
     account = table.get("account")
     if account is not None and not isinstance(account, str):
         raise DeclarationError(source, "account must be a string")
+    account_macos = table.get("account-macos")
+    if account_macos is not None and not isinstance(account_macos, str):
+        raise DeclarationError(source, "account-macos must be a string")
+    own_root = table.get("own-root")
+    if own_root is not None and not isinstance(own_root, str):
+        raise DeclarationError(source, "own-root must be a string")
+    account_only = table.get("account-only", False)
+    if not isinstance(account_only, bool):
+        raise DeclarationError(source, "account-only must be true or false")
 
     # NO STRING FENCE RUNS HERE. They live on Job itself, so they hold for every
     # way a Job is built rather than only for this one — see Job.__post_init__,
@@ -715,6 +847,11 @@ def parse(text: str, source: str = "<memory>") -> Job:
         programs=tuple(programs),
         abandon_process_group=abandon,
         account=account,
+        account_macos=account_macos,
+        own_root=own_root,
+        account_environment=dict(account_environment),
+        account_prepare=tuple(account_prepare),
+        account_only=account_only,
         source=source,
     )
 

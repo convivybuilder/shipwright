@@ -1,0 +1,905 @@
+#!/usr/bin/env python3
+"""orient-deploy — root's deploy step for an install that follows Orient's `main`.
+
+    sudo /opt/builder/libexec/orient-deploy                 one cycle; what the root job runs
+    sudo /opt/builder/libexec/orient-deploy --accept <sha>  a person accepts and places <sha>
+    sudo /opt/builder/libexec/orient-deploy --accept <fix> --accept <unservable>
+                                                             a person names more than one commit;
+                                                             see "A COMMIT NO MERGE MADE HALTS
+                                                             DEPLOYS" below
+    sudo /opt/builder/libexec/orient-deploy --enable --bypass-list-confirmed
+    sudo /opt/builder/libexec/orient-deploy --disable
+
+**OFF UNLESS A PERSON TURNS IT ON.** Every mode but `--enable` does nothing on
+an install whose `install.json` does not hold `"follow_orient_main": true`, and
+only `--enable` writes that key. A fresh install never holds it. Such an install
+places the commit its signed manifest names, and nothing here runs.
+
+**WHAT A CYCLE DOES.** The root job (`jobs/follow-orient-main/orient-deploy.toml`,
+installed only by `--enable`) runs this every 300 seconds from
+`libexec/orient-deploy`, which `install-privileged` points at the newest tree it
+installed. Each cycle:
+
+1. mints a short-lived read token from an App key only root can read (the
+   approver App's on the three-account shape; on the two-account shape, the
+   Orient read App's that `github-gate --place-key --orient-read` placed),
+   fetches `refs/heads/main` alone into the root-owned bare copy under
+   `src/`, and revokes the token, as `install-privileged` does;
+2. accepts the fetched tip only when it descends from the deployed commit and
+   every commit on the first-parent path from the deployed commit to the tip,
+   the tip included, is a merge commit whose committer is GitHub and whose
+   signature `git verify-commit` accepts against a keyring holding GitHub's
+   web-flow key and nothing else (`etc/github-web-flow.asc`, which the install
+   places from the payload);
+3. extracts an accepted commit with `git archive` into its own root-owned tree,
+   places it with `install-backend --from-tree` as Orient's own account (the
+   command `place-orient` builds), writes `run/orient-deploy/state.json` with
+   the fetched tip and the not-yet-placed deployed commit so a restarted
+   Orient does not poll a stale record, restarts Orient's job, and waits for
+   `orient-serving-commit` to name the commit and Orient's socket to accept a
+   connection;
+4. on a server that does not come up, places the previous commit's tree again
+   and restarts, so the site serves what it served before. A commit that does
+   not come up, or whose build fails to place, is recorded as failed under
+   `var/orient-deploy/`, and no later cycle places it or restarts Orient onto
+   it while it is still main's tip. Once main moves past it, a cycle places
+   the new tip as usual, and a person can retry the failed commit sooner with
+   `--accept <sha>`;
+5. writes `run/orient-deploy/state.json`, and posts one `deploy_failure` signal
+   per commit and reason through a child dropped to Orient's account, which
+   presents Orient's `capture-token`. Root opens no Library credential.
+
+**A COMMIT NO MERGE MADE HALTS DEPLOYS.** While such a commit sits on the path
+from the deployed commit to the tip, every later tip carries it, so every cycle
+refuses and the site keeps serving the deployed commit. Deploys resume when a
+person removes the commit from `main`, or accepts it with `--accept <sha>`,
+which places that commit and records who accepted it in
+`var/orient-deploy/accepted`. A commit whose own start script never serves
+cannot be accepted on its own: accepting places it and then waits for it to
+serve, and swaps back when it does not. Name a later, servable commit too,
+with `--accept <fix> --accept <unservable>`: the newest of the names, by
+main's first-parent order, is the one placed, every other name must lie on
+the first-parent path from the deployed commit to it, and every one named is
+spared the signed-merge check along with the newest.
+
+**EVERY ERROR FAILS CLOSED.** An error anywhere in a cycle deploys nothing,
+leaves the running version in place, and is written to the state file and
+signalled like any refusal.
+
+**THE OPERATOR CONFIRMS THE BYPASS LIST FIRST.** The deploy step places what is
+on Orient's `main` as GitHub reports it, so it is exactly as safe as the rule
+that decides who can move `main`. `--enable` refuses without
+`--bypass-list-confirmed`, which says the operator read the ruleset that guards
+Orient's `main` with their own credential and found no App on its bypass list
+that can act on Orient's repository.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import os
+import platform as platform_mod
+import re
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+PROG = "orient-deploy"
+
+
+def _load_sibling(module_name: str, filename: str):
+    loader = importlib.machinery.SourceFileLoader(module_name, str(HERE / filename))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(module_name, loader))
+    sys.modules[module_name] = module
+    loader.exec_module(module)
+    return module
+
+
+# `install-privileged` refuses, before anything else loads, unless it sits in
+# root's own extracted tree, so loading it checks this tree too. Its bare-copy,
+# token, fetch, ancestry, extraction and atomic-write code is reused as it is.
+ip = _load_sibling("install_privileged", "install-privileged")
+gg = ip.gg
+Refused = ip.Refused
+# Orient's account name, `sudo -u` placement command and dropped-child runner.
+po = _load_sibling("place_orient", "place-orient")
+sys.path.insert(0, str(HERE.parent / "tools"))
+
+FOLLOW_KEY = ip.FOLLOW_ORIENT_MAIN_KEY
+SHA = re.compile(r"[0-9a-f]{40}")
+
+# Root's own records, under the root-owned prefix.
+RECORD_DIR = ("var", "orient-deploy")
+DEPLOYED = "deployed"          # the commit this step last placed and saw serving
+ACCEPTED = "accepted"          # one line per commit a person accepted
+FAILED = "failed"              # the commit and reason of the last placement that did not serve
+SIGNALLED = "signalled.json"   # the commit-and-reason pairs already signalled
+LOCK = "lock"
+SIGNALLED_KEPT = 500
+
+# The state file Orient's server reads: root 644, in a root 755 directory under
+# the root-owned `run`.
+STATE_DIR = ("run", "orient-deploy")
+STATE_NAME = "state.json"
+STATE_FIELDS = ("checked_at", "main_tip", "deployed_commit", "last_refusal")
+
+# Orient's socket, created by provision-accounts on the separated shapes.
+ORIENT_SOCKET = ("run", "orient", "orient.sock")
+# Orient's own markers, under its own home, read only by a child dropped to it.
+SERVING_MARKER = (".orient-control", "orient-serving-commit")
+CAPTURE_TOKEN = (".orient-control", "capture-token")
+# Orient's job declaration in this tree, read for the label to restart.
+ORIENT_JOB = Path("jobs", "orient.toml")
+FOLLOW_JOBS = Path("jobs", "follow-orient-main")
+FOLLOW_LABEL = "com.convivy.orient-deploy"
+
+# The committer GitHub writes on every commit it creates: the name `GitHub`
+# and GitHub's own no-reply address, held as its local part and domain. Split
+# because the shipped tree's address fence refuses any literal address and
+# has no exemption, and this one is GitHub's, naming no person.
+GITHUB_COMMITTER_NAME = "GitHub"
+GITHUB_COMMITTER_ADDRESS = ("noreply", "github.com")
+# The OpenPGP verifier root runs. git picks a verifier from the signature's
+# own armour, so the SSH and X.509 verifiers are pointed at `false`: only an
+# OpenPGP signature can pass, and only against the web-flow keyring.
+GPG_PROGRAMS = {"Darwin": "/opt/homebrew/bin/gpg", "Linux": "/usr/bin/gpg"}
+FALSE = "/usr/bin/false"
+GPGCONF_ARGS = ("--batch", "--no-tty", "--quiet")
+
+# How long a placed commit gets to come up, and how often it is asked.
+SERVE_TIMEOUT_SECONDS = 180
+SERVE_POLL_SECONDS = 2
+
+# Where the Library takes signals, as tools/record-releases posts them.
+LIBRARY_URL = "http://127.0.0.1:8100"
+SIGNAL_SOURCE = "orient-deploy"
+SIGNAL_KIND = "deploy_failure"
+SIGNAL_PRODUCT = "convivy-orient"
+
+
+class Refusal(Exception):
+    """A cycle that deployed nothing: its reason (a short code), the commit it
+    concerns, and a sentence a person reads."""
+
+    def __init__(self, reason: str, commit: str | None, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.commit = commit
+        self.message = message
+
+    def as_state(self) -> dict:
+        return {"reason": self.reason, "commit": self.commit, "message": self.message}
+
+
+def utc_stamp(now: float) -> str:
+    """ISO-8601 with an explicit `Z`. A stamp with no zone is a defect: Orient's
+    stall check subtracts it from an aware UTC time."""
+    return datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def follows_main(stored: dict) -> bool:
+    """Only the JSON value `true` turns the step on; anything else is off."""
+    return stored.get(FOLLOW_KEY) is True
+
+
+# --- git ---------------------------------------------------------------------
+
+
+def git(bare: str, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+    full_env = dict(ip.CLEAN_ENV)
+    if env:
+        full_env.update(env)
+    return subprocess.run([ip.GIT, "-c", "credential.helper=", f"--git-dir={bare}", *args],
+                          env=full_env, cwd="/", capture_output=True, check=False)
+
+
+def commit_facts(bare: str, sha: str) -> tuple[list[str], str, str]:
+    """`sha`'s parents, committer name and committer email, read from the raw
+    commit object."""
+    done = git(bare, "cat-file", "commit", sha)
+    if done.returncode:
+        raise Refused(f"git could not read commit {sha}: {ip.tail(done.stderr)}")
+    header = done.stdout.split(b"\n\n", 1)[0].decode("utf-8", "replace")
+    parents: list[str] = []
+    name = email = ""
+    for line in header.split("\n"):
+        if line.startswith("parent "):
+            parents.append(line[len("parent "):].strip())
+        elif line.startswith("committer "):
+            m = re.fullmatch(r"committer (.*) <([^>]*)> \d+ [+-]\d{4}", line)
+            if m:
+                name, email = m.group(1), m.group(2)
+    return parents, name, email
+
+
+def first_parent_path(bare: str, deployed: str, tip: str) -> list[str]:
+    """Every commit on the first-parent path from `deployed` (excluded) to
+    `tip` (included), tip first. Refused unless the walk lands exactly on
+    `deployed`: a tip that descends from it only through a second parent did not
+    reach `main` by a merge onto it."""
+    done = git(bare, "rev-list", "--first-parent", tip, f"^{deployed}")
+    if done.returncode:
+        raise Refused(f"git could not walk {deployed}..{tip}: {ip.tail(done.stderr)}")
+    path = done.stdout.decode().split()
+    if not path or path[0] != tip:
+        raise Refusal("off-first-parent", tip,
+                      f"{tip} is not reached from {deployed} along main's first parents.")
+    for here, below in zip(path, path[1:] + [deployed]):
+        parents, _, _ = commit_facts(bare, here)
+        if not parents or parents[0] != below:
+            raise Refusal(
+                "off-first-parent", here,
+                f"{here} is on main between {deployed} and {tip}, and its first parent is not "
+                f"{below}, so the deployed commit is not on main's first-parent path.")
+    return path
+
+
+class Keyring:
+    """A throwaway GnuPG home holding the placed web-flow key and nothing else.
+
+    Built afresh for each cycle under root's own record directory, from the
+    root-owned file the install placed, and removed afterwards, so nothing
+    another account writes can add a key to it."""
+
+    def __init__(self, ctx: "Context") -> None:
+        self.ctx = ctx
+        self.home: str | None = None
+
+    def __enter__(self) -> "Keyring":
+        ctx = self.ctx
+        path = os.path.join(ctx.prefix, ip.WEB_FLOW_KEYRING)
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            raise Refusal("keyring", None, f"there is no web-flow keyring at {path}. Re-run the "
+                                           f"install, which places it. Nothing was deployed.")
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != gg.ROOT_UID or st.st_mode & 0o022:
+            raise Refusal("keyring", None, f"{path} is not a root-owned file only root can write. "
+                                           f"Nothing was deployed.")
+        gpg = ctx.gpg_program()
+        if not os.access(gpg, os.X_OK):
+            raise Refusal("keyring", None, f"there is no gpg at {gpg} to verify signatures with. "
+                                           f"Nothing was deployed.")
+        self.home = tempfile.mkdtemp(prefix="gnupg-", dir=ctx.record_dir())
+        os.chmod(self.home, 0o700)
+        # NO AGENT. Import and verify need none, and gpg otherwise starts one
+        # per home: every cycle would leave a gpg-agent running over a
+        # directory this then deletes. In gpg.conf rather than on the command
+        # line, so the gpg git runs for `verify-commit` reads it too.
+        with open(os.path.join(self.home, "gpg.conf"), "w", encoding="utf-8") as conf:
+            conf.write("no-autostart\n")
+        done = subprocess.run([gpg, "--homedir", self.home, *GPGCONF_ARGS, "--import", path],
+                              env=ip.CLEAN_ENV, cwd="/", capture_output=True, check=False)
+        if done.returncode:
+            raise Refusal("keyring", None, f"gpg could not import {path}: {ip.tail(done.stderr)}. "
+                                           f"Nothing was deployed.")
+        listed = subprocess.run([gpg, "--homedir", self.home, *GPGCONF_ARGS, "--with-colons",
+                                 "--list-keys"],
+                                env=ip.CLEAN_ENV, cwd="/", capture_output=True, check=False)
+        keys = [line for line in listed.stdout.decode("utf-8", "replace").splitlines()
+                if line.startswith("pub:")]
+        if listed.returncode or len(keys) != 1:
+            raise Refusal("keyring", None, f"{path} holds {len(keys)} public keys, and the "
+                                           f"web-flow keyring must hold exactly one. "
+                                           f"Nothing was deployed.")
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self.home is not None:
+            shutil.rmtree(self.home, ignore_errors=True)
+
+    def accepts(self, bare: str, sha: str) -> bool:
+        done = git(bare, "-c", f"gpg.program={self.ctx.gpg_program()}",
+                   "-c", f"gpg.ssh.program={FALSE}", "-c", f"gpg.x509.program={FALSE}",
+                   "verify-commit", sha, env={"GNUPGHOME": self.home})
+        return done.returncode == 0
+
+
+def commit_problem(bare: str, keyring: Keyring, sha: str) -> str | None:
+    """Why `sha` is not a signed merge GitHub made, or None when it is."""
+    parents, name, email = commit_facts(bare, sha)
+    problems = []
+    if len(parents) < 2:
+        problems.append(f"it has {len(parents)} parent(s), so it is not a merge")
+    local, at, domain = email.rpartition("@")
+    if name != GITHUB_COMMITTER_NAME or not at or (local, domain) != GITHUB_COMMITTER_ADDRESS:
+        problems.append(f"its committer is {name!r}, not GitHub")
+    if not keyring.accepts(bare, sha):
+        problems.append("git verify-commit does not accept its signature against the web-flow key")
+    return "; ".join(problems) or None
+
+
+# --- the host: everything that reaches outside this tree's own files ---------
+
+
+class Host:
+    """The side effects a cycle has on the machine: the token, the placement, the
+    restart, Orient's own markers and socket, and the signal. Tests replace it."""
+
+    def __init__(self, ctx: "Context") -> None:
+        self.ctx = ctx
+        self._label: str | None = None
+
+    # Orient's account, resolved when first needed.
+    def orient(self) -> tuple[str, Path, int, int]:
+        name = po.orient_account_name()
+        home = po.account_home(name)
+        ids = po.account_ids(name)
+        if home is None or ids is None:
+            raise Refused(f"there is no {name} account on this machine, so there is no Orient "
+                          f"account to place into.")
+        if not po.owned_by(home, ids[0]):
+            raise Refused(f"{home} (home of {name}) is not owned by its own account.")
+        return name, Path(home), ids[0], ids[1]
+
+    def read_token(self) -> tuple[str, object]:
+        cfg = self.ctx.cfg
+        key_path, app_id = gg.placed_key(self.ctx.prefix, orient_read=cfg["shape"] == "two")
+        gh = gg.GitHub(api=cfg["api_base"])
+        value = ip.read_token(gh, gg.app_jwt(key_path, app_id), cfg["org"], self.ctx.repo)
+        return value, gh.revoke
+
+    def place(self, tree: str, sha: str) -> None:
+        name, _home, _uid, _gid = self.orient()
+        full, shown = po.place_argv(Path(tree), sha, None, name, sys.executable)
+        print(f"→ place: {' '.join(shown)}")
+        done = subprocess.run(full, env=ip.CLEAN_ENV, cwd="/", check=False)
+        if done.returncode != 0:
+            raise Refused(f"install-backend exited {done.returncode} placing {sha}")
+
+    def label(self) -> str:
+        """Orient's job label, read from this tree's own declaration. Imported
+        here, when a restart needs it: the reader needs `tomllib`, so a root
+        interpreter older than 3.11 fails the restart, which swaps back, rather
+        than every cycle."""
+        if self._label is None:
+            from jobs import declaration
+            self._label = declaration.load(HERE.parent / ORIENT_JOB).label
+        return self._label
+
+    def restart(self) -> None:
+        if sys.platform == "darwin":
+            argv = ["/bin/launchctl", "kickstart", "-k", f"system/{self.label()}"]
+        else:
+            argv = ["/usr/bin/systemctl", "restart", f"{self.label()}.service"]
+        done = subprocess.run(argv, env=ip.CLEAN_ENV, cwd="/", capture_output=True, check=False)
+        if done.returncode != 0:
+            raise Refused(f"{' '.join(argv)} exited {done.returncode}: {ip.tail(done.stderr)}")
+
+    def serving_commit(self) -> str | None:
+        _name, home, uid, gid = self.orient()
+
+        def read() -> str | None:
+            data = ip.read_beneath(str(home), SERVING_MARKER)
+            return data.decode("utf-8", "replace").strip() if data is not None else None
+
+        return po.run_as_account(uid, gid, read)
+
+    def socket_accepts(self) -> bool:
+        path = os.path.join(self.ctx.prefix, *ORIENT_SOCKET)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(2)
+            try:
+                sock.connect(path)
+            except OSError:
+                return False
+        return True
+
+    def post_signal(self, payload: dict) -> None:
+        _name, home, uid, gid = self.orient()
+        url = f"{self.ctx.cfg.get('library_url') or LIBRARY_URL}/signals"
+
+        def post() -> int:
+            token = ip.read_beneath(str(home), CAPTURE_TOKEN, one_name=True)
+            if not token or not token.strip():
+                raise Refused(f"Orient's account holds no capture-token under {home}.")
+            request = urllib.request.Request(
+                url, data=json.dumps(payload).encode("utf-8"), method="POST",
+                headers={"Content-Type": "application/json", "Library-Protocol": "1",
+                         "Authorization": f"Bearer {token.decode('utf-8', 'replace').strip()}"})
+            try:
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    status = response.status
+            except urllib.error.HTTPError as exc:
+                status = exc.code
+            if status not in (200, 201):
+                raise Refused(f"the Library answered {status} to the signal")
+            return status
+
+        po.run_as_account(uid, gid, post)
+
+    def now(self) -> float:
+        return time.time()
+
+    def monotonic(self) -> float:
+        return time.monotonic()
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+
+class Context:
+    """One run's settings, paths and host."""
+
+    def __init__(self, prefix: str, cfg: dict, stored: dict, host_factory=Host) -> None:
+        self.prefix = prefix
+        self.cfg = cfg
+        self.stored = stored
+        self.repo = cfg["convivy_orient_repo"]
+        self.bare = os.path.join(prefix, "src", f"{self.repo}.git")
+        self.url = f"{cfg['github_base'].rstrip('/')}/{cfg['org']}/{self.repo}"
+        self.serve_timeout = SERVE_TIMEOUT_SECONDS
+        self.serve_poll = SERVE_POLL_SECONDS
+        self.host = host_factory(self)
+
+    @classmethod
+    def load(cls, prefix: str, host_factory=Host) -> "Context":
+        stored = ip.load_config(prefix)
+        fixtures = ip.fixture_settings(prefix)
+        cfg = {**ip.DEFAULTS, **{k: stored[k] for k in ip.PERSISTED if k in stored}, **fixtures}
+        return cls(prefix, cfg, stored, host_factory)
+
+    def gpg_program(self) -> str:
+        return GPG_PROGRAMS.get(platform_mod.system(), GPG_PROGRAMS["Linux"])
+
+    def record_dir(self) -> str:
+        var = os.path.join(self.prefix, "var")
+        ip.make_dir(var, 0o755)
+        path = os.path.join(var, *RECORD_DIR[1:])
+        ip.make_dir(path, 0o755)
+        return path
+
+    def record_path(self, name: str) -> str:
+        return os.path.join(self.record_dir(), name)
+
+    def read_record(self, name: str) -> bytes | None:
+        self.record_dir()
+        return ip.read_beneath(self.prefix, (*RECORD_DIR, name))
+
+    def check_settings(self) -> None:
+        if self.cfg.get("shape") not in ("two", "three"):
+            raise Refused(f"{ip.CONFIG} names shape {self.cfg.get('shape')!r}; the deploy step "
+                          f"runs on the two- and three-account shapes only.")
+        if not self.cfg.get("org") or not ip.ORG.fullmatch(str(self.cfg["org"])):
+            raise Refused(f"{ip.CONFIG} names no GitHub organisation.")
+
+
+@contextlib.contextmanager
+def locked(ctx: Context, wait: bool):
+    """Root's lock over a cycle or an acceptance, so a person's `--accept` and
+    the job never place at once. Yields False when `wait` is false and another
+    run holds it."""
+    fd = os.open(ctx.record_path(LOCK), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+    finally:
+        os.close(fd)
+
+
+# --- the records -------------------------------------------------------------
+
+
+def deployed_commit(ctx: Context) -> str | None:
+    """The commit this step last placed; on the first cycle, the commit root's
+    install record names for Orient. None when neither names one."""
+    data = ctx.read_record(DEPLOYED)
+    if data is not None:
+        sha = data.decode("ascii", "replace").strip()
+        if not SHA.fullmatch(sha):
+            raise Refused(f"{ctx.record_path(DEPLOYED)} does not hold a commit.")
+        return sha
+    records = ip.read_beneath(ctx.prefix, ("src", "installed"))
+    return ip.last_recorded_commit(records.decode("utf-8") if records else "", ctx.repo)
+
+
+def write_deployed(ctx: Context, sha: str) -> None:
+    ip.write_atomic(ctx.record_path(DEPLOYED), f"{sha}\n".encode("ascii"), 0o644)
+
+
+def read_failed(ctx: Context) -> dict | None:
+    """The commit and reason of the last placement that did not serve, None
+    when none did or a later cycle or acceptance cleared it."""
+    data = ctx.read_record(FAILED)
+    if data is None:
+        return None
+    try:
+        record = json.loads(data.decode("utf-8"))
+    except ValueError:
+        raise Refused(f"{ctx.record_path(FAILED)} does not hold JSON.")
+    if not isinstance(record, dict) or not SHA.fullmatch(str(record.get("commit"))) \
+            or not record.get("reason"):
+        raise Refused(f"{ctx.record_path(FAILED)} does not hold a commit and a reason.")
+    return record
+
+
+def write_failed(ctx: Context, sha: str, reason: str) -> None:
+    data = (json.dumps({"commit": sha, "reason": reason}) + "\n").encode("utf-8")
+    ip.write_atomic(ctx.record_path(FAILED), data, 0o644)
+
+
+def clear_failed(ctx: Context) -> None:
+    ip.remove(ctx.record_path(FAILED))
+
+
+def record_acceptance(ctx: Context, sha: str, who: str) -> None:
+    previous = ctx.read_record(ACCEPTED) or b""
+    line = f"{utc_stamp(ctx.host.now())} accepted {sha} by {who}\n".encode("utf-8")
+    ip.write_atomic(ctx.record_path(ACCEPTED), previous + line, 0o644)
+
+
+def write_state(ctx: Context, state: dict) -> None:
+    """`run/orient-deploy/state.json`: exactly STATE_FIELDS, root 644, in a root
+    755 directory, written to a temporary name there and renamed into place."""
+    assert tuple(state) == STATE_FIELDS
+    run = os.path.join(ctx.prefix, STATE_DIR[0])
+    ip.make_dir(run, 0o755)
+    directory = os.path.join(run, *STATE_DIR[1:])
+    ip.make_dir(directory, 0o755)
+    os.chmod(directory, 0o755)
+    data = (json.dumps(state, indent=2) + "\n").encode("utf-8")
+    ip.write_atomic(os.path.join(directory, STATE_NAME), data, 0o644)
+
+
+def signal_once(ctx: Context, refusal: Refusal) -> None:
+    """Post one `deploy_failure` for this commit and reason, unless one was
+    already posted. A post that fails is not recorded, so the next cycle tries
+    again; the dedup key keeps the Library from holding two."""
+    key = f"{refusal.commit or '-'} {refusal.reason}"
+    raw = ctx.read_record(SIGNALLED)
+    try:
+        sent = json.loads(raw.decode("utf-8")) if raw else []
+    except ValueError:
+        sent = []
+    if not isinstance(sent, list):
+        sent = []
+    if key in sent:
+        return
+    commit = refusal.commit or "-"
+    payload = {
+        "source": SIGNAL_SOURCE,
+        "actor": SIGNAL_SOURCE,
+        "stream": SIGNAL_SOURCE,
+        "kind": SIGNAL_KIND,
+        "product": SIGNAL_PRODUCT,
+        "body": (f"kind={SIGNAL_KIND} product={SIGNAL_PRODUCT} component={SIGNAL_PRODUCT} "
+                 f"commit={commit} reason={refusal.reason} {refusal.message}"),
+        "dedup_key": f"{SIGNAL_KIND}:{SIGNAL_PRODUCT}:{commit}:{refusal.reason}",
+    }
+    try:
+        ctx.host.post_signal(payload)
+    except Exception as exc:
+        print(f"{PROG}: could not post the deploy_failure signal for {key}: {exc}", file=sys.stderr)
+        return
+    sent = (sent + [key])[-SIGNALLED_KEPT:]
+    ip.write_atomic(ctx.record_path(SIGNALLED), (json.dumps(sent) + "\n").encode("utf-8"), 0o644)
+
+
+# --- fetching, checking, placing ---------------------------------------------
+
+
+def fetch_tip(ctx: Context, concerns: str | None) -> str:
+    """Fetch Orient's `main` with a token minted for this fetch alone, revoked
+    whatever happens, and return its tip."""
+    ip.ensure_bare(ctx.bare)
+    try:
+        value, revoke = ctx.host.read_token()
+    except Exception as exc:
+        raise Refusal("fetch-failed", concerns, f"no read token for {ctx.repo}: {exc}")
+    try:
+        ip.fetch_main(ctx.bare, ctx.url, value)
+    except Exception as exc:
+        raise Refusal("fetch-failed", concerns, str(exc))
+    finally:
+        revoke(value)
+    return ip.main_head(ctx.bare)
+
+
+def check_path(ctx: Context, deployed: str, tip: str, *, spare: frozenset[str] = frozenset()) -> None:
+    """Refuse unless `tip` descends from `deployed` and every commit on the
+    first-parent path between them is a signed merge GitHub made. `spare`, the
+    commits a person is accepting, are left unchecked."""
+    if not ip.is_ancestor(ctx.bare, deployed, tip):
+        raise Refusal("not-a-descendant", tip,
+                      f"main's tip {tip} does not descend from the deployed commit {deployed}, "
+                      f"so placing it would move the site backward or sideways.")
+    path = first_parent_path(ctx.bare, deployed, tip)
+    with Keyring(ctx) as keyring:
+        for sha in reversed(path):
+            if sha in spare:
+                continue
+            problem = commit_problem(ctx.bare, keyring, sha)
+            if problem:
+                raise Refusal(
+                    "not-a-signed-merge", sha,
+                    f"main holds {sha}, which no merge on GitHub made: {problem}. Deploys stay "
+                    f"halted while it is between the deployed commit and main's tip, until a "
+                    f"person removes it from main or accepts it with `{PROG} --accept {sha}`.")
+
+
+def wait_serving(ctx: Context, sha: str) -> bool:
+    deadline = ctx.host.monotonic() + ctx.serve_timeout
+    while True:
+        try:
+            if ctx.host.serving_commit() == sha and ctx.host.socket_accepts():
+                return True
+        except Exception as exc:
+            print(f"{PROG}: asking whether {sha} is serving: {exc}", file=sys.stderr)
+        if ctx.host.monotonic() >= deadline:
+            return False
+        ctx.host.sleep(ctx.serve_poll)
+
+
+def place_and_confirm(ctx: Context, previous: str | None, sha: str) -> None:
+    """Place `sha` from its own root-owned tree, restart Orient, and wait for it
+    to serve. A failed build leaves the running version alone; a server that
+    does not come up is swapped back to `previous`."""
+    try:
+        tree = ip.extract(ctx.prefix, ctx.bare, ctx.repo, sha)
+        ctx.host.place(tree, sha)
+    except Exception as exc:
+        raise Refusal("build-failed", sha, f"placing {sha} failed ({exc}). The site still "
+                                           f"serves {previous or 'what it served'}.")
+    try:
+        ctx.host.restart()
+    except Exception as exc:
+        failed = f"restarting Orient on {sha} failed ({exc})"
+        up = False
+    else:
+        up = wait_serving(ctx, sha)
+        failed = f"{sha} did not come up within {ctx.serve_timeout} seconds"
+    if up:
+        return
+    if previous is None:
+        raise Refusal("not-serving", sha, f"{failed}, and there is no earlier commit to swap back to.")
+    try:
+        ctx.host.place(ip.extract(ctx.prefix, ctx.bare, ctx.repo, previous), previous)
+    except Exception as exc:
+        how = f"swapping back to {previous} failed too ({exc})"
+    else:
+        try:
+            ctx.host.restart()
+        except Exception as exc:
+            how = f"restarting Orient on {previous} failed too ({exc})"
+        else:
+            back = wait_serving(ctx, previous)
+            how = f"swapped back to {previous}, which is serving again" if back else (
+                f"swapped back to {previous}, which has not come up either")
+    raise Refusal("not-serving", sha, f"{failed}; {how}.")
+
+
+# --- the modes ---------------------------------------------------------------
+
+
+def cycle(ctx: Context) -> int:
+    """One cycle: 0 when the tip is serving, 1 when this cycle refused."""
+    state = {"checked_at": utc_stamp(ctx.host.now()), "main_tip": None,
+             "deployed_commit": None, "last_refusal": None}
+    refusal: Refusal | None = None
+    try:
+        ctx.check_settings()
+        deployed = deployed_commit(ctx)
+        state["deployed_commit"] = deployed
+        tip = fetch_tip(ctx, deployed)
+        state["main_tip"] = tip
+        if deployed is None:
+            raise Refusal("no-deployed-commit", tip,
+                          f"nothing records which commit of {ctx.repo} is deployed, so there is "
+                          f"nothing to check main against. A person names the commit to start "
+                          f"from with `{PROG} --accept <sha>`.")
+        if tip != deployed:
+            check_path(ctx, deployed, tip)
+            failed = read_failed(ctx)
+            if failed is not None and failed["commit"] == tip:
+                raise Refusal(failed["reason"], tip,
+                              f"{tip} already failed on an earlier cycle ({failed['reason']}), and "
+                              f"main has not moved past it, so it is not placed again. The "
+                              f"site still serves {deployed}. A person can retry it sooner with "
+                              f"`{PROG} --accept {tip}`.")
+            # Orient polls this file and restarts inside place_and_confirm, so a
+            # fresh record has to exist before the restart, naming the fetched
+            # tip and the not-yet-placed deployed commit; the final record below
+            # overwrites it once placing has finished.
+            write_state(ctx, dict(state))
+            try:
+                place_and_confirm(ctx, deployed, tip)
+            except Refusal as exc:
+                write_failed(ctx, tip, exc.reason)
+                raise
+            state["deployed_commit"] = tip
+            clear_failed(ctx)
+            print(f"{PROG}: deployed {tip}")
+        if ctx.read_record(DEPLOYED) is None or tip != deployed:
+            write_deployed(ctx, tip)
+    except Refusal as exc:
+        refusal = exc
+    except Exception as exc:
+        refusal = Refusal("error", state["main_tip"] or state["deployed_commit"],
+                          f"{type(exc).__name__}: {exc}. Nothing was deployed.")
+    if refusal is not None:
+        print(f"{PROG}: {refusal.reason}: {refusal.message}", file=sys.stderr)
+        state["last_refusal"] = refusal.as_state()
+        try:
+            signal_once(ctx, refusal)
+        except Exception as exc:
+            print(f"{PROG}: could not record the signal: {exc}", file=sys.stderr)
+    write_state(ctx, state)
+    return 0 if refusal is None else 1
+
+
+def newest_of(ctx: Context, shas: list[str]) -> str:
+    """The one of `shas` that descends from every other, the newest by
+    first-parent order. Refused when two names are on different lines of
+    history, so neither descends from the other."""
+    newest = shas[0]
+    for sha in shas[1:]:
+        if ip.is_ancestor(ctx.bare, newest, sha):
+            newest = sha
+        elif not ip.is_ancestor(ctx.bare, sha, newest):
+            raise Refused(f"{sha} and {newest}, both named with --accept, are not on the same "
+                          f"line of {ctx.repo}'s history. Nothing was placed.")
+    return newest
+
+
+def accept(ctx: Context, shas: list[str], who: str) -> int:
+    """A person accepts one or more commits named with `--accept`, each of which
+    must be on Orient's `main`. The newest of them, by first-parent order, must
+    descend from the deployed commit, and is the one placed; every other name
+    must lie on the first-parent path from the deployed commit to it. Every
+    commit on that path not named here must still pass the cycle's own checks,
+    so each unsigned commit is accepted by name. While nothing records a deployed
+    commit there is no path to check, so exactly one name is taken: the commit to
+    start from."""
+    bad = next((sha for sha in shas if not SHA.fullmatch(sha)), None)
+    if bad is not None:
+        raise Refused(f"--accept takes a full 40-character commit, and {ip.printable(bad)!r} is not one.")
+    ctx.check_settings()
+    deployed = deployed_commit(ctx)
+    if deployed is None and len(shas) > 1:
+        # With nothing deployed there is no path to check, so a second name
+        # would spare nothing and only land unchecked in the accepted record.
+        raise Refused("nothing records a deployed commit yet, so --accept names only the "
+                      "commit to start from, once. Nothing was placed.")
+    try:
+        tip = fetch_tip(ctx, deployed)
+        for sha in shas:
+            if not ip.is_ancestor(ctx.bare, sha, tip):
+                raise Refused(f"{sha} is not on {ctx.repo}'s main, whose tip is {tip}. Nothing was placed.")
+        newest = newest_of(ctx, shas)
+        if deployed == newest:
+            print(f"{PROG}: {newest} is already deployed; nothing to accept.")
+            return 0
+        if deployed is not None:
+            path = first_parent_path(ctx.bare, deployed, newest)
+            off_path = next((sha for sha in shas if sha != newest and sha not in path), None)
+            if off_path is not None:
+                raise Refused(f"{off_path} does not lie on main's first-parent path from the "
+                              f"deployed commit {deployed} to {newest}. Nothing was placed.")
+            check_path(ctx, deployed, newest, spare=frozenset(shas))
+        # Same reason as in cycle(): a fresh record before the restart, so a
+        # restarted Orient does not poll a stale one.
+        write_state(ctx, {"checked_at": utc_stamp(ctx.host.now()), "main_tip": tip,
+                          "deployed_commit": deployed, "last_refusal": None})
+        try:
+            place_and_confirm(ctx, deployed, newest)
+        except Refusal as exc:
+            # The record just written says nothing was refused. Leaving it would
+            # tell Orient a failed acceptance is healthy until the next cycle, so
+            # record the refusal before raising, as cycle() does. A person asked
+            # for this placement by name, so the failed record is updated, not
+            # left as it was.
+            write_failed(ctx, newest, exc.reason)
+            write_state(ctx, {"checked_at": utc_stamp(ctx.host.now()), "main_tip": tip,
+                              "deployed_commit": deployed, "last_refusal": exc.as_state()})
+            raise
+    except Refusal as exc:
+        raise Refused(f"{exc.reason}: {exc.message}")
+    clear_failed(ctx)
+    write_deployed(ctx, newest)
+    for sha in shas:
+        record_acceptance(ctx, sha, who)
+    write_state(ctx, {"checked_at": utc_stamp(ctx.host.now()), "main_tip": tip,
+                      "deployed_commit": newest, "last_refusal": None})
+    print(f"{PROG}: accepted and deployed {newest}; recorded in {ctx.record_path(ACCEPTED)}")
+    return 0
+
+
+def write_config(ctx: Context, stored: dict) -> None:
+    data = (json.dumps(stored, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    ip.write_atomic(os.path.join(ctx.prefix, ip.CONFIG), data, 0o644)
+
+
+def install_jobs_argv(ctx: Context, *flags: str) -> list[str]:
+    """Root's own copy of install-jobs, from this tree, over the follow-main
+    declarations alone, with its record under the root-owned prefix."""
+    return [sys.executable, "-I", str(HERE / "install-jobs"),
+            "--jobs", str(HERE.parent / FOLLOW_JOBS),
+            "--record", os.path.join(ctx.prefix, "var", "install-jobs", "orient-deploy-units.json"),
+            *flags]
+
+
+def enable(ctx: Context, confirmed: bool, run=subprocess.run) -> int:
+    if not confirmed:
+        raise Refused(
+            "the deploy step places whatever is on Orient's main, so it is as safe as the rule "
+            "that decides who can move main. Read the ruleset guarding Orient's main with your "
+            "own credential, confirm that no App on its bypass list is installed on Orient's "
+            "repository and that the agents' App is not on it, then run this again with "
+            "--bypass-list-confirmed. Nothing was changed.")
+    ctx.check_settings()
+    stored = dict(ctx.stored)
+    stored[FOLLOW_KEY] = True
+    write_config(ctx, stored)
+    print(f"{PROG}: {ip.CONFIG} now follows Orient's main")
+    return run(install_jobs_argv(ctx, "--activate"), cwd="/", check=False).returncode
+
+
+def disable(ctx: Context, run=subprocess.run) -> int:
+    stored = dict(ctx.stored)
+    stored.pop(FOLLOW_KEY, None)
+    write_config(ctx, stored)
+    print(f"{PROG}: {ip.CONFIG} no longer follows Orient's main; each cycle now does nothing")
+    return run(install_jobs_argv(ctx, "--stop", FOLLOW_LABEL), cwd="/", check=False).returncode
+
+
+def main(argv: list[str] | None = None, host_factory=Host) -> int:
+    parser = argparse.ArgumentParser(prog=PROG, description="Root's deploy step for Orient's main.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--accept", metavar="SHA", action="append",
+                      help="accept and place this commit of Orient's main; give more than once to "
+                           "also name an earlier unservable commit the newest one still depends on")
+    mode.add_argument("--enable", action="store_true", help="follow Orient's main, and start the job")
+    mode.add_argument("--disable", action="store_true", help="stop following Orient's main")
+    parser.add_argument("--bypass-list-confirmed", action="store_true",
+                        help="with --enable: the operator has read the bypass list guarding "
+                             "Orient's main with their own credential")
+    args = parser.parse_args(argv)
+    os.chdir("/")
+    euid = os.geteuid()
+    gg.ROOT_UID, gg.ROOT_GID = (0, 0) if euid == 0 else (euid, os.getegid())
+    try:
+        ctx = Context.load(ip.RUN_PREFIX, host_factory)
+        if euid != 0 and ctx.cfg.get("require_root", True):
+            raise Refused("this places Orient's code and reads a root-only key, so only root may "
+                          "run it. Run it with sudo.")
+        if args.enable:
+            return enable(ctx, args.bypass_list_confirmed)
+        if args.disable:
+            return disable(ctx)
+        if not follows_main(ctx.stored):
+            print(f"{PROG}: this install does not follow Orient's main; nothing to do.")
+            return 0
+        if args.accept:
+            who = os.environ.get("SUDO_USER") or f"uid {os.getuid()}"
+            with locked(ctx, wait=True):
+                return accept(ctx, args.accept, who)
+        with locked(ctx, wait=False) as held:
+            if not held:
+                print(f"{PROG}: another run holds the lock; this cycle does nothing.")
+                return 0
+            return cycle(ctx)
+    except Refused as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

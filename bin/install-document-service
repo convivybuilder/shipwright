@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""install-document-service — install the document service Orient's
+restart turns document saves onto, from root's own placed agent-platform
+tree.
+
+    sudo bin/install-document-service               install it, as agents
+    sudo bin/install-document-service --dry-run      say what would happen, change nothing
+    sudo bin/install-document-service --check        report only; 1 if not yet confirmed deployed
+    sudo bin/install-document-service --status        the same report, changing nothing
+
+**THE PROBLEM THIS CLOSES.** `jobs/orient.toml` always names
+`ORIENT_KB_DOCUMENT_SOCKET`, the socket convivy-orient's own `kb_commit.py`
+reads fresh on every document save, on every install where Orient runs as
+its own account — not only one migrated from an install that ran Orient as
+`agents`. Before this tool, only `bin/migrate-orient-account`'s own
+`install_document_service()` ever installed the service that listens on it,
+so a fresh install's own first run of `jobs/orient.toml` pointed every
+document save at a socket nothing served.
+
+**IT REIMPLEMENTS NOTHING.** `install_document_service()` and the functions
+it calls — `ensure_document_socket_dir()`, `render_daemon_template_values()`
+and `verify_staged_daemon_plist()` — stay exactly where they are, in
+`bin/migrate-orient-account`, loaded here as a sibling module the same way
+that script already loads `bin/place-person-save`'s own functions. This is
+the one other caller; both `bin/stand-up-backend`'s own `document-service`
+step and `payload/bin/builder-update`'s own re-run of it, on every install
+shape that gives Orient its own account, run root's own copy of this tool
+rather than a second copy of what it does.
+
+**ON LINUX IT REPORTS NOTHING TO DO AND EXITS 0.** The document service has
+no Linux shape designed yet, so `install_document_service()` refuses there,
+and `bin/migrate-orient-account` reports that refusal and carries on. This
+tool does the same: a refusal here would stop `bin/stand-up-backend` and
+roll back `builder-update` on every Linux two- or three-account install. It
+returns before loading `bin/migrate-orient-account`, whose import needs
+Python 3.11, which a Linux root interpreter may not have.
+
+**NOTHING TO DO ON THE SINGLE-ACCOUNT SHAPE, OR BEFORE ORIENT'S OWN ACCOUNT
+EXISTS.** Orient runs as the operator there, and the in-process route the
+document service replaces works as-is; this reports nothing to do rather
+than refusing.
+"""
+
+from __future__ import annotations
+
+import argparse
+import grp
+import importlib.machinery
+import importlib.util
+import os
+import pwd
+import re
+import sys
+from pathlib import Path
+
+PROG = "install-document-service"
+REPO = Path(__file__).resolve().parent.parent
+
+# Duplicated from `bin/place-orient`'s own `ORIENT_ACCOUNT_NAMES`, the same
+# way that file already duplicates it from `bin/provision-accounts`.
+ORIENT_ACCOUNT_NAMES = {"macos": "_orient", "linux": "orient"}
+AGENTS = "agents"
+
+PRIVILEGED_PREFIX = Path("/opt/builder")
+INSTALLED_RECORD = PRIVILEGED_PREFIX / "src" / "installed"
+SHA = re.compile(r"[0-9a-f]{40}")
+
+
+def _load_sibling(module_name: str, filename: str):
+    """`filename`, from this file's own directory, loaded under
+    `module_name` rather than `import`ed by path. Mirrors `bin/migrate-
+    orient-account`'s own helper of the same name — this loads THAT
+    script, the same way it loads `bin/place-person-save`'s own."""
+    loader = importlib.machinery.SourceFileLoader(module_name, str(REPO / "bin" / filename))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(module_name, loader))
+    sys.modules[module_name] = module
+    loader.exec_module(module)
+    return module
+
+
+_migrate_orient_account = None
+
+
+def moa():
+    """`bin/migrate-orient-account`, loaded on first use rather than at
+    import, so the Linux path in `main()` never loads it. Loading it does
+    no work and no path check, only function and class definitions, the
+    same reasoning that script's own docstring gives for loading
+    place-orient and place-person-save."""
+    global _migrate_orient_account
+    if _migrate_orient_account is None:
+        _migrate_orient_account = _load_sibling(
+            "migrate_orient_account_for_install_document_service", "migrate-orient-account")
+    return _migrate_orient_account
+
+
+def platform_name() -> str:
+    return "macos" if sys.platform == "darwin" else "linux"
+
+
+def orient_account_name(platform: str | None = None) -> str:
+    return ORIENT_ACCOUNT_NAMES[platform or platform_name()]
+
+
+def account_ids(name: str) -> tuple[int, int] | None:
+    try:
+        entry = pwd.getpwnam(name)
+    except KeyError:
+        return None
+    return entry.pw_uid, entry.pw_gid
+
+
+def account_home(name: str) -> str | None:
+    try:
+        return pwd.getpwnam(name).pw_dir
+    except KeyError:
+        return None
+
+
+def _read_record(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def installed_sha(record_text: str | None, name: str) -> str | None:
+    if record_text is None:
+        return None
+    for line in record_text.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0] == name and SHA.fullmatch(fields[1]):
+            return fields[1]
+    return None
+
+
+def agent_platform_tree(record_text: str | None) -> Path:
+    """The root-owned tree `install-privileged` extracted agent-platform's
+    commit into — refused, naming the fix, when the record has no line for
+    it."""
+    sha = installed_sha(record_text, "agent-platform")
+    if sha is None:
+        raise moa().Refused(
+            f"{INSTALLED_RECORD} names no agent-platform commit, so there is no tree to "
+            f"install the document service from. Run `sudo bin/install-privileged "
+            f"--shape three`, which extracts and records one. Nothing was installed.")
+    return PRIVILEGED_PREFIX / "src" / f"agent-platform@{sha}"
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Install the document service from root's own placed agent-platform tree.",
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--dry-run", action="store_true", help="say what would happen, change nothing")
+    group.add_argument("--check", action="store_true", help="report only; 1 if not yet confirmed deployed")
+    group.add_argument("--status", action="store_true", help="the same report, changing nothing")
+    args = parser.parse_args(argv)
+    mode = "dry-run" if args.dry_run else "check" if args.check else "status" if args.status else None
+
+    if os.geteuid() != 0:
+        print(f"{PROG}: refusing — this needs root, to write the socket directory, the "
+              f"LaunchDaemon and bootstrap it. Nothing was changed.", file=sys.stderr)
+        return 2
+
+    platform = platform_name()
+    if platform != "macos":
+        print(f"{PROG}: nothing to install on Linux — the document service has no Linux "
+              f"shape yet, so document saves stay on Orient's in-process route.")
+        return 0
+    orient_name = orient_account_name(platform)
+    orient_ids = account_ids(orient_name)
+    if orient_ids is None:
+        print(f"{PROG}: no {orient_name} account on this machine — nothing to install. Either "
+              f"this is the single-account shape, where Orient runs as the operator, or "
+              f"Orient's own account has not been provisioned yet.")
+        return 0
+    orient_gid = orient_ids[1]
+    try:
+        orient_group = grp.getgrgid(orient_gid).gr_name
+    except KeyError:
+        orient_group = orient_name
+
+    agents_ids = account_ids(AGENTS)
+    if agents_ids is None:
+        print(f"{PROG}: refusing — the `{AGENTS}` account does not exist. Nothing was installed.",
+              file=sys.stderr)
+        return 2
+    agents_uid = agents_ids[0]
+    agents_home_str = account_home(AGENTS)
+    assert agents_home_str is not None  # just resolved by name above
+
+    try:
+        tree = agent_platform_tree(_read_record(INSTALLED_RECORD))
+    except moa().Refused as exc:
+        print(f"{PROG}: refusing — {exc}", file=sys.stderr)
+        return 2
+
+    if mode in ("dry-run", "check", "status"):
+        tool = tree / "bin" / "install-kb-document-api"
+        if not tool.is_file():
+            print(f"{PROG}: {tool} is missing — the document service has not been installed yet")
+            return 1 if mode in ("check", "status") else 0
+        # The same check install_document_service() makes before it runs
+        # this file as agents: root hands agents nothing it has not checked.
+        problem = moa().ancestry_problem(tool, moa().ROOT_UID, moa().ROOT_TOP)
+        if problem:
+            print(f"{PROG}: refusing — {tool} is not a tree this may run as agents: {problem}. "
+                  f"Nothing was run.", file=sys.stderr)
+            return 2
+        try:
+            moa().confirm_document_service_deployed(tool)
+        except moa().Refused as exc:
+            print(f"{PROG}: not yet confirmed deployed: {exc}")
+            return 1 if mode in ("check", "status") else 0
+        print(f"{PROG}: the document service is installed and confirmed deployed")
+        return 0
+
+    try:
+        moa().install_document_service(
+            tree, orient_group, orient_gid, Path(agents_home_str), agents_uid, platform)
+    except moa().Refused as exc:
+        print(f"{PROG}: refusing — {exc}", file=sys.stderr)
+        return 2
+    print(f"{PROG}: installed the document service with --client-group {orient_group}, its "
+          f"socket directory, and its LaunchDaemon")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

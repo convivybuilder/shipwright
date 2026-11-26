@@ -39,7 +39,9 @@ Do exactly what `/handoff-leave` does, with one change: note the absolute direct
 
 Write `handoff.md` inside that directory, following `/handoff-leave`'s section
 structure. It must be on disk before the next step, because `co-rollover` refuses to
-run without it.
+run without it. Then record it in the Library as `/handoff-leave`'s "Record the handoff
+in the Library" section says; a failed write there does not stop the rollover, since the
+successor is handed the file's path.
 
 **Do not rely on `export`.** Each Bash tool call runs in a fresh shell, and only the
 working directory carries over between calls, so a variable exported in this step is

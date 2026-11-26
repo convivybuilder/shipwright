@@ -3,6 +3,7 @@
 
     bin/github-gate --print-app --org <name>
     sudo bin/github-gate --place-key <file> --app-id <id>
+    sudo bin/github-gate --place-key <file> --app-id <id> --orient-read
     sudo bin/github-gate --ruleset --org <name> [--exclude <repo>]...
     sudo bin/github-gate --check --org <name> [--exclude <repo>]...
 
@@ -16,22 +17,42 @@ requires both checks from that App on every repository except the ones
 excluded. The operator creates the App and the ruleset in the browser; this
 command says exactly what to create, and confirms afterwards by reading.
 
-**It never writes to GitHub.** The only thing it changes is the key slot under
-`/opt/builder/etc`, and only when the operator hands it a key: the install
-never generates or fetches one.
+**It never writes to GitHub.** The only things it changes are the key slot
+under `/opt/builder/etc`, and only when the operator hands it a key (the
+install never generates or fetches one), and, for the approver form of
+`--place-key`, the `approver_app_id` entry in `install.json` beside it.
 
 **A key is placed only after GitHub vouches for it.** `--place-key` signs a
 JWT with the offered key and reads the App back through `GET /app`. A key
 whose App id does not match, or whose App lacks a permission the gate needs,
 is refused and nothing is placed. A slot that already holds a key is refused
-too: replacing a credential is the operator's act, never the install's.
+too: replacing a credential is the operator's act, never the install's. Once
+the slots are written, the approver form also records the App id, a public
+value carried on every check-run response, as `approver_app_id` in
+`install.json`, when that file already exists, so an account that can read
+`install.json` but not the root-only key slot still knows which App to
+expect checks from. On a first install, where the key is placed before
+`install-privileged` has ever run and written `install.json`, that program
+records the id itself, read fresh from the same slot, the first time it
+runs. `--orient-read` writes no such key: its App has no part in the review
+gate.
+
+**`--orient-read` places the two-account shape's Orient read key** in its own
+slot, by the same vouching step. That shape has no approver App, and root's
+deploy step for an install that follows Orient's `main` needs a token that can
+read Orient's private repository. The App must hold `contents: read` and
+`metadata: read` and nothing else, and the operator installs it on Orient's
+repository alone; GitHub's `GET /app` cannot show which repositories an
+installation covers, so that last part is the operator's to confirm.
 
 **`--check` reads everything with the App's own key**, so it needs no
 operator token and no organisation endpoint: the App's permissions from
 `GET /app`, its installation from `GET /app/installations`, the repositories
-from an installation token that can only read metadata, and each repository's
-rulesets. Any field it cannot read fails its row, so a check that saw nothing
-never reads as a gate that holds.
+from an installation token that can only read metadata, each repository's
+rulesets, and "Allow auto-merge" through a GraphQL query (the REST field is
+null to a token without administration, which this App deliberately lacks).
+Any field it cannot read fails its row, so a check that saw nothing never
+reads as a gate that holds.
 
 `--print-app` needs nothing. The other three read the key, so they need root.
 
@@ -76,8 +97,23 @@ PROG = "github-gate"
 PREFIX = "/opt/builder"
 KEY_SLOT = "etc/approver-app.pem"
 ID_SLOT = "etc/approver-app-id"
+# The two-account shape's read key for Orient's repository: placed with
+# `--place-key <file> --app-id <id> --orient-read`, read only by root's
+# `orient-deploy`, which mints a token from it to fetch Orient's `main`. That
+# shape holds no approver key, and Orient's repository is private, so an
+# anonymous fetch cannot reach it.
+ORIENT_READ_KEY_SLOT = "etc/orient-read-app.pem"
+ORIENT_READ_ID_SLOT = "etc/orient-read-app-id"
 # A slot the privileged install created empty carries this beside it.
 NEEDED_SUFFIX = ".needed"
+
+# install.json, written by install-privileged, root-owned mode 644. The
+# approver App's id is public (every check-run response carries app.id), so
+# it is duplicated here, alongside the 0600 id slot, for an account that can
+# read install.json but not the slot. Only the approver form of --place-key
+# writes it; --orient-read's App has no part in the review gate.
+INSTALL_JSON = "install.json"
+APPROVER_APP_ID_KEY = "approver_app_id"
 
 API = "https://api.github.com"
 OPENSSL = "/usr/bin/openssl"
@@ -93,6 +129,12 @@ PERMISSIONS = {
     "pull_requests": "write",
 }
 LEVELS = {"read": 1, "write": 2, "admin": 3}
+# What the Orient read App holds, and nothing beyond it: a key that can write
+# anything is not a read key, whatever the slot is called.
+ORIENT_READ_PERMISSIONS = {
+    "contents": "read",
+    "metadata": "read",
+}
 
 MAIN = "refs/heads/main"
 DEFAULT_BRANCH = "~DEFAULT_BRANCH"
@@ -173,6 +215,10 @@ class GitHub:
     def get(self, path: str, bearer: str) -> tuple[int, object]:
         return self.request("GET", self.api + path, bearer, None)
 
+    def graphql(self, query: str, variables: dict, bearer: str) -> tuple[int, object]:
+        return self.request("POST", self.api + "/graphql", bearer,
+                            {"query": query, "variables": variables})
+
     def pages(self, path: str, bearer: str, key: str | None = None) -> list:
         """Every item of a listing, 100 to a page. `key` names the list inside
         an object answer, as `GET /installation/repositories` gives one."""
@@ -214,6 +260,11 @@ class GitHub:
 def message(payload: object) -> str:
     if isinstance(payload, dict) and payload.get("message"):
         return str(payload["message"])
+    if isinstance(payload, dict) and isinstance(payload.get("errors"), list):
+        texts = [str(e["message"]) for e in payload["errors"]
+                 if isinstance(e, dict) and e.get("message")]
+        if texts:
+            return "; ".join(texts)
     return "no message"
 
 
@@ -253,19 +304,26 @@ def read_app(gh: GitHub, jwt: str, app_id: str) -> dict:
     return app
 
 
-def permission_rows(app: dict) -> Report:
+def permission_rows(app: dict, wanted: dict[str, str] | None = None,
+                    exact: bool = False) -> Report:
+    """One row per permission `wanted` names (the approver App's by default),
+    and one saying the App holds nothing else. With `exact`, a level above the
+    one named fails its row too: a read key that can write is not a read key."""
+    wanted = PERMISSIONS if wanted is None else wanted
     report = Report()
     held = app.get("permissions") or {}
-    for name, needed in PERMISSIONS.items():
+    for name, needed in wanted.items():
         level = held.get(name)
+        enough = (LEVELS.get(level, 0) == LEVELS[needed] if exact
+                  else LEVELS.get(level, 0) >= LEVELS[needed])
         report.add(
             f"the App holds {name}: {needed} (it holds {level or 'nothing'})",
-            LEVELS.get(level, 0) >= LEVELS[needed],
+            enough,
             f"in the App's settings, Permissions, set {name} to {needed}",
         )
-    # Only those four. A permission beyond them is held by a key the gate trusts:
+    # A permission beyond `wanted` is held by a key the gate trusts:
     # `administration: write` alone can edit or delete the ruleset that is the gate.
-    extra = sorted(name for name in held if name not in PERMISSIONS)
+    extra = sorted(name for name in held if name not in wanted)
     report.add(
         f"the App holds no other permission (it also holds "
         f"{', '.join(f'{n}: {held[n]}' for n in extra) or 'nothing'})",
@@ -273,6 +331,18 @@ def permission_rows(app: dict) -> Report:
         f"in the App's settings, Permissions, set {', '.join(extra)} to No access",
     )
     return report
+
+
+def org_only_note(org: str) -> str:
+    """The same warning `--print-app`, `--ruleset` and `--check` give about a
+    person-owned account, so an operator reads it before creating anything."""
+    return (
+        f"This release's three-account install supports organisation-owned "
+        f"repositories only. If {org} is a person's account rather than an "
+        f"organisation, create one (https://github.com/account/organizations/new) "
+        f"and transfer the repositories to it (each repository's Settings, General, "
+        f"Danger Zone, Transfer ownership) first."
+    )
 
 
 def installation_for(gh: GitHub, jwt: str, org: str) -> dict:
@@ -288,9 +358,12 @@ def installation_for(gh: GitHub, jwt: str, org: str) -> dict:
 
 # The key slot.
 
-def slot_paths(prefix: str) -> tuple[str, str, str]:
+def slot_paths(prefix: str, orient_read: bool = False) -> tuple[str, str, str]:
+    """The `etc` directory, the key slot and the App-id slot: the approver
+    App's, or with `orient_read` the Orient read App's."""
     etc = os.path.join(prefix, "etc")
-    return etc, os.path.join(prefix, KEY_SLOT), os.path.join(prefix, ID_SLOT)
+    key, ident = (ORIENT_READ_KEY_SLOT, ORIENT_READ_ID_SLOT) if orient_read else (KEY_SLOT, ID_SLOT)
+    return etc, os.path.join(prefix, key), os.path.join(prefix, ident)
 
 
 def require_root_dir(path: str) -> None:
@@ -336,12 +409,14 @@ def read_slot(path: str) -> bytes | None:
         return f.read()
 
 
-def write_root_file(path: str, data: bytes) -> None:
-    """Write `data` to `path` as root, mode 600, by write-then-rename."""
+def write_root_file(path: str, data: bytes, mode: int = 0o600) -> None:
+    """Write `data` to `path` as root, by write-then-rename. Mode 600 by
+    default, the key and id slots' mode; install.json's rewrite passes 644."""
     tmp = f"{path}.tmp-{secrets.token_hex(8)}"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         os.fchown(fd, ROOT_UID, ROOT_GID)
+        os.fchmod(fd, mode)
         os.write(fd, data)
         os.fsync(fd)
     finally:
@@ -349,12 +424,18 @@ def write_root_file(path: str, data: bytes) -> None:
     os.replace(tmp, path)
 
 
-def placed_key(prefix: str) -> tuple[str, str]:
+def placed_key(prefix: str, orient_read: bool = False) -> tuple[str, str]:
     """The key slot's path and the App id, refused while either is empty."""
-    _, key_path, id_path = slot_paths(prefix)
+    _, key_path, id_path = slot_paths(prefix, orient_read)
     key = read_slot(key_path)
     app_id = read_slot(id_path)
     if not key or not app_id:
+        if orient_read:
+            raise Refused(
+                f"no Orient read key is placed at {key_path}. Create an App that can only "
+                f"read Orient's repository (contents: read, metadata: read), install it on "
+                f"that repository alone, then run: sudo {PROG} --place-key <file> "
+                f"--app-id <id> --orient-read")
         raise Refused(
             f"no approver key is placed at {key_path}. Create the App "
             f"({PROG} --print-app), then run: sudo {PROG} --place-key <file> --app-id <id>"
@@ -365,12 +446,54 @@ def placed_key(prefix: str) -> tuple[str, str]:
     return key_path, app_id_text
 
 
-def place_key(gh: GitHub, prefix: str, source: str, app_id: str) -> list[str]:
-    """Move the operator's key into the slot once GitHub has vouched for it."""
+def read_install_json(prefix: str) -> dict | None:
+    """<prefix>/install.json, parsed, or None when it does not exist yet (a
+    first install may place the key before install-privileged has ever run
+    and created the file). Follows no symlink at the path (refused rather
+    than followed), and refuses by name when install.json exists but is not
+    a regular file or not a JSON object -- checked before place_key touches
+    any slot, so each of those refusals changes nothing at all."""
+    path = os.path.join(prefix, INSTALL_JSON)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise Refused(f"{path} is a symlink, refused rather than followed "
+                      f"({exc.strerror}). Nothing was changed.")
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise Refused(f"{path} is not a regular file. Nothing was changed.")
+        raw = f.read()
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except ValueError as exc:
+        raise Refused(f"{path} is not JSON ({exc}). Nothing was changed.")
+    if not isinstance(data, dict):
+        raise Refused(f"{path} does not hold a JSON object. Nothing was changed.")
+    return data
+
+
+def write_install_json(prefix: str, data: dict) -> None:
+    """`data` to <prefix>/install.json, written atomically (a temp file in
+    the same directory, then rename), root-owned mode 644, as
+    install-privileged writes it."""
+    path = os.path.join(prefix, INSTALL_JSON)
+    out = (json.dumps(data, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    write_root_file(path, out, mode=0o644)
+
+
+def place_key(gh: GitHub, prefix: str, source: str, app_id: str,
+              orient_read: bool = False) -> list[str]:
+    """Move the operator's key into the slot once GitHub has vouched for it.
+
+    With `orient_read`, the slot is the Orient read App's, and the App must
+    hold exactly `ORIENT_READ_PERMISSIONS`."""
     if not app_id.isdigit():
         raise Refused(f"--app-id takes the App's numeric id, shown on its settings "
                       f"page as \"App ID\" (got {app_id!r}).")
-    etc, key_path, id_path = slot_paths(prefix)
+    etc, key_path, id_path = slot_paths(prefix, orient_read)
     if read_slot(key_path):
         raise Refused(
             f"{key_path} already holds a key, and the install never replaces a "
@@ -378,6 +501,11 @@ def place_key(gh: GitHub, prefix: str, source: str, app_id: str) -> list[str]:
             f"page, empty the slot yourself (sudo truncate -s 0 {key_path}), and run "
             f"this again. Nothing was changed."
         )
+    # Read and validated before any slot is touched, so a symlinked or
+    # malformed install.json refuses with nothing changed at all, even
+    # though the actual write comes after the slots below. None when
+    # install.json does not exist yet, which is not a refusal here.
+    install_json = None if orient_read else read_install_json(prefix)
 
     try:
         src_stat = os.lstat(source)
@@ -403,10 +531,12 @@ def place_key(gh: GitHub, prefix: str, source: str, app_id: str) -> list[str]:
     try:
         jwt = app_jwt(trial, app_id)
         app = read_app(gh, jwt, app_id)
-        perms = permission_rows(app)
+        perms = (permission_rows(app, ORIENT_READ_PERMISSIONS, exact=True) if orient_read
+                 else permission_rows(app))
         if perms.failing:
             lines = "\n".join(f"  {r.what}\n    fix: {r.fix}" for r in perms.failing)
-            raise Refused(f"the App lacks what the gate needs:\n{lines}\nNothing was placed.")
+            needs = "a read key needs" if orient_read else "the gate needs"
+            raise Refused(f"the App does not hold exactly what {needs}:\n{lines}\nNothing was placed.")
         os.replace(trial, key_path)
     finally:
         if os.path.lexists(trial):
@@ -414,6 +544,16 @@ def place_key(gh: GitHub, prefix: str, source: str, app_id: str) -> list[str]:
     write_root_file(id_path, f"{app_id}\n".encode())
 
     changed = [f"placed the key for App {app_id} ({app.get('slug', '?')}) at {key_path}"]
+    if not orient_read:
+        if install_json is None:
+            changed.append(f"{os.path.join(prefix, INSTALL_JSON)} does not exist yet; "
+                           f"install-privileged will record App {app_id} as "
+                           f"{APPROVER_APP_ID_KEY} in it on its next run")
+        else:
+            install_json[APPROVER_APP_ID_KEY] = app_id
+            write_install_json(prefix, install_json)
+            changed.append(f"recorded App {app_id} as {APPROVER_APP_ID_KEY} in "
+                           f"{os.path.join(prefix, INSTALL_JSON)}")
     for path in (key_path, id_path):
         marker = path + NEEDED_SUFFIX
         if os.path.lexists(marker):
@@ -513,14 +653,24 @@ def single_problem(rs: dict, checks: list[str]) -> str | None:
     None."""
     if rs.get("enforcement") != "active":
         return f"enforcement is {rs.get('enforcement')!r}, not 'active'"
-    # The literal ref, as `gate_problem` requires. `~DEFAULT_BRANCH` means main
-    # only on a repository whose default branch is main, and this check never
-    # reads the default branch, so accepting it would pass a ruleset that
-    # protects some other branch. `single_ruleset` prints the literal ref.
-    if MAIN not in ref_includes(rs):
-        return f"conditions.ref_name.include is {ref_includes(rs)}, which does not name {MAIN}"
-    if MAIN in ref_excludes(rs):
-        return f"conditions.ref_name.exclude names {MAIN}"
+    # default_branch=None throughout: `~DEFAULT_BRANCH` means main only on a
+    # repository whose default branch is main, and this check never reads
+    # the default branch, so it cannot resolve that special value and, by
+    # the same fail-closed rule as every other uncertain condition here,
+    # does not treat it as naming main. `single_ruleset` prints the literal
+    # ref, not that special value, so the ruleset this check accepts is
+    # unaffected.
+    conditions = rs.get("conditions")
+    ref_name = conditions.get("ref_name") if isinstance(conditions, dict) else None
+    if not isinstance(ref_name, dict):
+        return f"conditions.ref_name is {ref_name!r}, which does not demonstrably name {MAIN}"
+    included = condition_matches(ref_name.get("include"), MAIN, default_branch=None, ref=True)
+    if included is not True:
+        return (f"conditions.ref_name.include is {ref_includes(rs)!r}, which does not "
+                f"demonstrably name {MAIN}")
+    excluded = condition_matches(ref_name.get("exclude"), MAIN, default_branch=None, ref=True)
+    if excluded is not False:
+        return f"conditions.ref_name.exclude is {ref_excludes(rs)!r}, which may name {MAIN}"
     missing = {"pull_request", "deletion", "non_fast_forward"} - rule_types(rs)
     if missing:
         return f"the rules do not include {', '.join(sorted(missing))}"
@@ -617,15 +767,28 @@ def required_checks(rs: dict) -> list[dict]:
     return []
 
 
-def gate_problem(rs: dict, app_id: int) -> str | None:
-    """Why this ruleset is not the review gate, naming the field, or None."""
+def gate_problem(rs: dict, app_id: int, default_branch: str | None) -> str | None:
+    """Why this ruleset is not the review gate, naming the field, or None.
+    An uninterpretable ref_name condition (a glob or special value
+    `matches_pattern`/`condition_matches` cannot resolve) counts as not
+    covering main, the same fail-closed rule `targets_main` applies for
+    every other caller, so a glob exclude like `refs/heads/*` or `**`
+    cannot silently remove main from this check's coverage."""
     if rs.get("enforcement") != "active":
         return f"enforcement is {rs.get('enforcement')!r}, not 'active'"
-    if MAIN not in ref_includes(rs):
-        return (f"conditions.ref_name.include is {ref_includes(rs)}, which does not "
-                f"name {MAIN}")
-    if MAIN in ref_excludes(rs):
-        return f"conditions.ref_name.exclude names {MAIN}"
+    conditions = rs.get("conditions")
+    ref_name = conditions.get("ref_name") if isinstance(conditions, dict) else None
+    if not isinstance(ref_name, dict):
+        return f"conditions.ref_name is {ref_name!r}, which does not demonstrably name {MAIN}"
+    included = condition_matches(ref_name.get("include"), MAIN, default_branch=default_branch,
+                                 ref=True)
+    if included is not True:
+        return (f"conditions.ref_name.include is {ref_includes(rs)!r}, which does not "
+                f"demonstrably name {MAIN}")
+    excluded = condition_matches(ref_name.get("exclude"), MAIN, default_branch=default_branch,
+                                 ref=True)
+    if excluded is not False:
+        return f"conditions.ref_name.exclude is {ref_excludes(rs)!r}, which may name {MAIN}"
     checks = {c.get("context"): c.get("integration_id") for c in required_checks(rs)}
     for context in CONTEXTS:
         if context not in checks:
@@ -642,14 +805,159 @@ def gate_problem(rs: dict, app_id: int) -> str | None:
     return None
 
 
+def _glob_to_regex(pattern: str) -> str | None:
+    """Translate one ref_name glob into a regex matching the same ref, by
+    GitHub's own path-aware syntax: `*` matches within one `/`-delimited
+    segment, `**` crosses segments, `?` matches one character other than
+    `/`, and a `[...]` class never matches `/`. GitHub's "Available rules
+    for rulesets" page documents `[!seq]` as the bracket-class negation
+    (the POSIX/fnmatch convention), and does not document `[^seq]`, so a
+    class negated with `^` is a second case this code cannot interpret.
+
+    None for any of three things this code cannot interpret: an unbalanced
+    `[`, a `[^seq]` class, or a backslash anywhere in the pattern (no ref
+    can contain one literally -- git-check-ref-format(1) -- and no escape
+    syntax for it is documented, so a literal `\\` would make the pattern
+    silently unmatchable rather than genuinely uncertain, which is worse).
+    None also for any other character this code does not deliberately
+    match as a literal: a control character, space, or one of `~^:`, none
+    of which a ref can contain either, so matching one literally could
+    never be what GitHub's pattern means."""
+    if "\\" in pattern:
+        return None
+    out = []
+    i, n = 0, len(pattern)
+    while i < n:
+        c = pattern[i]
+        if pattern[i:i + 2] == "**":
+            out.append(".*")
+            i += 2
+        elif c == "*":
+            out.append("[^/]*")
+            i += 1
+        elif c == "?":
+            out.append("[^/]")
+            i += 1
+        elif c == "[":
+            end = i + 1
+            if end < n and pattern[end] in "!^":
+                end += 1
+            if end < n and pattern[end] == "]":
+                end += 1
+            while end < n and pattern[end] != "]":
+                end += 1
+            if end >= n:
+                return None
+            body = pattern[i + 1:end]
+            if body[:1] == "^":
+                return None
+            negate = body[:1] == "!"
+            chars = (body[1:] if negate else body).replace("/", "")
+            if negate:
+                out.append(f"[^{chars}/]")
+            else:
+                out.append(f"[{chars}]" if chars else "(?!)")
+            i = end + 1
+        elif c.isprintable() and c not in "~^: ":
+            out.append(re.escape(c))
+            i += 1
+        else:
+            return None
+    return "".join(out)
+
+
+def matches_pattern(pattern: object, value: str) -> bool | None:
+    """One ref_name condition entry against `value`: the special value
+    ~ALL, or a glob matched by GitHub's own path-aware syntax, case-
+    sensitive, against the full ref (e.g. refs/heads/main). None for
+    anything else this code does not recognise: another special value, a
+    non-string entry, a glob `_glob_to_regex` cannot interpret, or a
+    pattern that does not begin with `refs/` -- this code has no citation
+    for how GitHub resolves a ref_name pattern without that prefix, so it
+    does not guess that GitHub auto-qualifies or never matches it."""
+    if pattern == "~ALL":
+        return True
+    if not isinstance(pattern, str) or pattern.startswith("~"):
+        return None
+    if not pattern.startswith("refs/"):
+        return None
+    regex = _glob_to_regex(pattern)
+    if regex is None:
+        return None
+    return re.fullmatch(regex, value) is not None
+
+
+def condition_matches(patterns: object, value: str, *, default_branch: str | None = None,
+                      ref: bool = False) -> bool | None:
+    """Whether any entry of a ref_name include or exclude list matches
+    `value`, by GitHub's documented ruleset condition matching. None when
+    an entry this code cannot interpret is the only thing that might have
+    matched."""
+    if patterns is None:
+        return False
+    if not isinstance(patterns, list):
+        return None
+    uncertain = False
+    for pattern in patterns:
+        if ref and pattern == "~DEFAULT_BRANCH":
+            if default_branch is None:
+                uncertain = True
+            elif value == f"refs/heads/{default_branch}":
+                return True
+            continue
+        outcome = matches_pattern(pattern, value)
+        if outcome is True:
+            return True
+        if outcome is None:
+            uncertain = True
+    return None if uncertain else False
+
+
+def ref_name_targets(conditions: dict, default_branch: str | None) -> bool | None:
+    ref_name = conditions.get("ref_name")
+    if not isinstance(ref_name, dict):
+        return None
+    included = condition_matches(ref_name.get("include"), MAIN, default_branch=default_branch,
+                                 ref=True)
+    if included is not True:
+        return included
+    excluded = condition_matches(ref_name.get("exclude"), MAIN, default_branch=default_branch,
+                                 ref=True)
+    if excluded is True:
+        return False
+    return None if excluded is None else True
+
+
+def targets_main(rs: dict, default_branch: str | None) -> bool | None:
+    """Whether this active ruleset's conditions target `main`, by GitHub's
+    documented ruleset condition matching: the special values ~ALL and
+    ~DEFAULT_BRANCH, and glob patterns matched against the full ref by
+    GitHub's own path-aware syntax. None when a condition this code cannot
+    interpret leaves the answer unknown; a caller reading None fails closed
+    in its own direction.
+
+    This does not match a ruleset's repository_name condition: the one
+    caller, `repository_rows`, reads rulesets through `GET
+    /repos/{org}/{repo}/rulesets?includes_parents=true`, an endpoint scoped
+    to one concrete repository, so GitHub has already resolved whether an
+    org-level ruleset's repository_name condition (including ~ALL,
+    excludes, and glob patterns) applies to that repository before
+    returning it. Re-matching it here would be redundant at best, and a
+    second place for this code to disagree with GitHub's own resolution at
+    worst."""
+    if rs.get("enforcement") != "active":
+        return False
+    conditions = rs.get("conditions")
+    if not isinstance(conditions, dict):
+        return None
+    return ref_name_targets(conditions, default_branch)
+
+
 def protects_main(rs: dict, default_branch: str | None) -> bool:
-    """Whether this ruleset forbids deleting and force-pushing `main`."""
-    if rs.get("enforcement") != "active" or MAIN in ref_excludes(rs):
-        return False
-    if not {"deletion", "non_fast_forward"} <= rule_types(rs):
-        return False
-    includes = ref_includes(rs)
-    return MAIN in includes or (DEFAULT_BRANCH in includes and default_branch == "main")
+    """Whether this ruleset forbids deleting and force-pushing `main`.
+    Uncertainty about whether it targets main counts as not protecting it."""
+    return (targets_main(rs, default_branch) is True
+            and {"deletion", "non_fast_forward"} <= rule_types(rs))
 
 
 def repository_rows(gh: GitHub, token: str, org: str, repo: dict, app_id: int) -> Report:
@@ -666,7 +974,8 @@ def repository_rows(gh: GitHub, token: str, org: str, repo: dict, app_id: int) -
 
     gates = [rs for rs in rulesets
              if any(c.get("context") in CONTEXTS for c in required_checks(rs))]
-    problems = [(rs, gate_problem(rs, app_id)) for rs in gates]
+    default_branch = repo.get("default_branch")
+    problems = [(rs, gate_problem(rs, app_id, default_branch)) for rs in gates]
     good = [rs for rs, p in problems if p is None]
     if good:
         report.add(f"{name}: ruleset {good[0].get('id')} requires both review checks "
@@ -680,12 +989,66 @@ def repository_rows(gh: GitHub, token: str, org: str, repo: dict, app_id: int) -
                    f"no ruleset names {' or '.join(CONTEXTS)}. Import the one "
                    f"`{PROG} --ruleset` prints.")
 
-    protecting = [rs for rs in rulesets if protects_main(rs, repo.get("default_branch"))]
+    protecting = [rs for rs in rulesets if protects_main(rs, default_branch)]
     report.add(
         f"{name}: a ruleset forbids deleting and force-pushing {MAIN}",
         bool(protecting),
         "add an active ruleset with the deletion and non_fast_forward rules on main",
     )
+
+    # Read through GraphQL: REST's `allow_auto_merge` is null for a token
+    # without administration, which this App deliberately lacks, while
+    # GraphQL's `autoMergeAllowed` answers a read-only App token (read on a
+    # live repository, 2026-11-17). Anything but a boolean fails closed.
+    code, detail = gh.graphql(
+        "query($owner: String!, $name: String!) "
+        "{ repository(owner: $owner, name: $name) { autoMergeAllowed } }",
+        {"owner": org, "name": name}, token)
+    allowed = ((detail.get("data") or {}).get("repository") or {}).get("autoMergeAllowed") \
+        if code == 200 and isinstance(detail, dict) else None
+    if isinstance(allowed, bool):
+        report.add(
+            f"{name}: \"Allow auto-merge\" is off",
+            not allowed,
+            "in the repository's Settings, General, Pull Requests, clear \"Allow "
+            "auto-merge\".",
+        )
+    else:
+        # A GraphQL execution error can arrive as HTTP 200 with a top-level
+        # `errors` array and no usable `data`, as well as a non-200 answer;
+        # either way, surface what GitHub said rather than the generic text,
+        # which is reserved for a boolean genuinely withheld, not an error.
+        detail_message = message(detail)
+        report.add(
+            f"{name}: \"Allow auto-merge\" is off",
+            False,
+            (f"GitHub answered {code}: {detail_message}" if code != 200 or
+             detail_message != "no message" else
+             "the installation token could not read \"Allow auto-merge\" on this "
+             "repository, so it cannot be confirmed off. In the repository's "
+             "Settings, General, Pull Requests, clear \"Allow auto-merge\" if it "
+             "is on."),
+        )
+
+    # Uncertainty about whether a ruleset targets main is read as a merge
+    # queue in force here: an unreadable ruleset detail still fails its own
+    # "ruleset N can be read" row above, so the check as a whole still fails
+    # either way, but this row's own True/False should not read as "no
+    # merge queue governs main" on a ruleset this code could not interpret.
+    merge_queued = [rs for rs in rulesets
+                    if targets_main(rs, default_branch) is not False
+                    and "merge_queue" in rule_types(rs)]
+    if merge_queued:
+        rs = merge_queued[0]
+        report.add(
+            f"{name}: no ruleset requires a merge queue",
+            False,
+            f"ruleset {rs.get('id')} ({rs.get('name')}) requires a merge queue; "
+            f"remove that rule in the repository's or organisation's Settings, "
+            f"Rules, Rulesets.",
+        )
+    else:
+        report.add(f"{name}: no ruleset requires a merge queue", True)
     return report
 
 
@@ -698,6 +1061,14 @@ def check(gh: GitHub, prefix: str, org: str, excludes: list[str]) -> Report:
     report.rows.extend(permission_rows(app).rows)
 
     inst = installation_for(gh, jwt, org)
+    account_type = (inst.get("account") or {}).get("type")
+    report.add(
+        f"{org} is organisation-owned, not a person's account (its type is "
+        f"{account_type!r})",
+        account_type == "Organization",
+        f"{org_only_note(org)} Then run this again.",
+    )
+
     selection = inst.get("repository_selection")
     report.add(
         f"the App is installed on every repository of {org} (it is installed on "
@@ -726,6 +1097,8 @@ def check(gh: GitHub, prefix: str, org: str, excludes: list[str]) -> Report:
 def app_instructions(org: str) -> str:
     perms = "\n".join(f"      {name}: {level}" for name, level in PERMISSIONS.items())
     return f"""\
+{org_only_note(org)}
+
 Create the approver App, in a browser signed in as an owner of {org}:
 
   1. https://github.com/organizations/{org}/settings/apps/new
@@ -749,6 +1122,8 @@ is on: `sudo {PROG} --ruleset --org {org} --exclude <repo>` prints it.
 
 def ruleset_instructions(org: str) -> str:
     return f"""\
+{org_only_note(org)}
+
 Import the JSON above as an organisation ruleset (save it to a file first):
 https://github.com/organizations/{org}/settings/rules, New ruleset, Import a ruleset.
 
@@ -845,6 +1220,10 @@ def main(argv: list[str], gh: GitHub | None = None, prefix: str = PREFIX) -> int
     parser.add_argument("--exclude", action="append", default=[], metavar="REPO",
                         help="a repository the gate leaves out (repeatable)")
     parser.add_argument("--app-id", help="with --place-key, the App's numeric id")
+    parser.add_argument("--orient-read", action="store_true",
+                        help="with --place-key, place the two-account shape's Orient read "
+                             "App key instead of the approver key; the App must hold "
+                             "contents: read and metadata: read and nothing else")
     parser.add_argument("--shape", choices=("three", "single"), default="three",
                         help="the install shape: three accounts and the approver App "
                              "(the default), or a single account with no App")
@@ -873,6 +1252,8 @@ def main(argv: list[str], gh: GitHub | None = None, prefix: str = PREFIX) -> int
             raise Refused("--app-id only means something with --place-key.")
         if args.place_key is not None and not args.app_id:
             raise Refused("--place-key needs --app-id, the number on the App's settings page.")
+        if args.orient_read and args.place_key is None:
+            raise Refused("--orient-read only means something with --place-key.")
         if (args.print_app or args.ruleset or args.check) and not args.org:
             raise Refused("name the organisation with --org.")
         if args.print_app:
@@ -882,7 +1263,8 @@ def main(argv: list[str], gh: GitHub | None = None, prefix: str = PREFIX) -> int
             raise Refused(f"this reads or writes the approver key, which only root may. "
                           f"Run: sudo {sys.argv[0]} {' '.join(argv)}".rstrip())
         if args.place_key is not None:
-            print("\n".join(place_key(gh, prefix, args.place_key, args.app_id)))
+            print("\n".join(place_key(gh, prefix, args.place_key, args.app_id,
+                                      orient_read=args.orient_read)))
             return 0
         if args.ruleset:
             key_path, app_id = placed_key(prefix)

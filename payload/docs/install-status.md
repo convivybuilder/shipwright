@@ -1,6 +1,6 @@
 # What does not work yet
 
-_Last checked against Builder 0.7.1, on 2026-11-08._
+_Last checked against Builder 0.8.0, on 2026-11-26._
 
 Every step on the install pages has been run on a Debian 12 or macOS 26 test machine, except what
 this page lists. Where there is something to do in the meantime, each entry says what.
@@ -14,9 +14,17 @@ this page lists. Where there is something to do in the meantime, each entry says
   Debian.
 - **The manual steps on [Installing on a Mac](install-mac.md) have not been run on a clean Mac.**
   The one command has.
-- **The single-account install is the only complete one.** The three-account install
-  (`--shape three`) has not been run end to end on a real machine, and there is no two-account
-  install yet. These pages cover only the single-account install.
+- **No install has yet passed a rehearsal on Ubuntu 24.04**, the platform that replaces Ubuntu
+  22.04 as supported in this release. The one 24.04 rehearsal ran before that change, and its
+  install stopped.
+- **The two-account install (`--shape two`) has not been run end to end on a real machine.** It has
+  been run against throwaway roots and stub account tools. The single-account and three-account
+  installs have been rehearsed end to end on Debian 12 and macOS 26 test machines. This release's
+  three-account rehearsals ran with `--no-github-app`.
+- **The two-account install's merge rule is not built.** It needs two GitHub rulesets on `main`,
+  one that refuses every update except a pull request the operator merges, and the command that
+  would print and check them, `github-gate --shape two`, does not exist yet. Merge each pull request
+  yourself, from another device, through GitHub's own web page, until it ships.
 - **On a Mac, nobody has yet seen the steward create a crew whose session writes code.** On Debian
   it has.
 - **Orient fails its first start on a fresh install.** Its supervisor restarts it moments later, and
@@ -40,11 +48,19 @@ this page lists. Where there is something to do in the meantime, each entry says
 
 ## Updating and removing
 
-- **`builder-update` has not been run end to end on a real machine.** It moves only a
-  single-account install, and only one already on 0.7.0 or later; an install from before 0.7.0
-  moves once by the manual route in [After the
-  install](after-installing.md#moving-to-a-later-release). Nobody has yet carried an earlier
-  install's registered crews forward this way.
+- **The updater has been rehearsed against rehearsal releases, not yet against published ones.**
+  The single-account update was rehearsed on Debian on 2026-11-17. The three-account update
+  (`--shape three`) was rehearsed on Debian 12 and macOS 26 on 2026-11-19, and so was a
+  three-account rollback on macOS 26, which put the earlier release back with every job running.
+  The two-account update (`--shape two`) has not been rehearsed on a real machine yet. An install from before
+  0.7.0 moves once by the manual route in [After the
+  install](after-installing.md#moving-to-a-later-release), to reach a signed release first.
+  Nobody has yet carried an earlier install's registered crews forward through an update.
+- **Rerunning `stand-up-backend --shape two|three` on an install from before the Library had its
+  own service account moves the Library's data to that account and takes its old units, which
+  still named `agents`, out of the supervisor, so the step right after writes the account's own
+  fresh ones rather than refusing a unit it does not recognise. Seen on a Debian 12 rehearsal,
+  not yet on a real adopter's machine.**
 - **The uninstaller has not been run end to end on a real machine.** [Removing
   Builder](after-installing.md#removing-builder) describes it.
 

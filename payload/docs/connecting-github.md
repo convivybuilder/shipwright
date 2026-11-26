@@ -61,6 +61,12 @@ the install skipped this step (`--no-github-app`), when you want the
 App under a GitHub organisation rather than your own account, or to create it later. It never
 replaces an existing key.
 
+An install made with `--no-github-app` already registered your crews with no CI workflows:
+`agentctl crew register` prints one line about it on stderr rather than refusing. Creating the App
+now does not fill them in by itself. Set them in the install's registry file and load it with
+`load_project_registry.py --replace`, comparing that file with the Library's live table first, since
+a stale file overwrites live rows.
+
 ```bash
 python3 ~/src/shipwright/bin/create-github-app
 ```
@@ -69,7 +75,10 @@ It prints the address of a page on this machine. Open it in a browser signed in 
 account and click **Create GitHub App**. The page fixes the App's permissions before GitHub shows
 them, so you only confirm: it can read and write repository contents and pull requests, read checks
 and Actions, and never change a repository's settings or rules. Add `--org <name>` to create it
-under a GitHub organisation rather than your own account.
+under a GitHub organisation rather than your own account. GitHub App names are unique across all of
+GitHub, so the command proposes a name of its own rather than a fixed one; if GitHub still says the
+name is taken, edit it on the form before pressing **Create**, or run the command again with
+`--name <name>`.
 
 GitHub then sends the browser back to this machine with a one-time code, and the command stores the
 App's id and private key in the `github-app` folder of Builder's configuration directory, the key

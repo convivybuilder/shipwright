@@ -1,0 +1,9 @@
+# Written by bin/install-privileged from this file, once `visudo -c` passes on the
+# rendered copy, one Defaults/rule pair per entity's agents account. The one command
+# any agents account may run as root is the review launcher, and only as itself: each
+# rule names its own account, never another's. The rule allows that launcher with ANY
+# arguments: it names no argument list, so nothing in sudoers narrows what the
+# launcher is given. The launcher's own argument grammar is what narrows it, and it
+# must refuse everything outside that grammar before it reads any credential.
+Defaults:@ACCOUNT@ env_reset
+@ACCOUNT@ ALL=(root) NOPASSWD: @LAUNCHER@

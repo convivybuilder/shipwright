@@ -151,14 +151,23 @@ def run(argv: list[str], **kwargs) -> subprocess.CompletedProcess:
 
 
 def claude_cli() -> str:
-    """The `claude` binary, or a refusal naming what to do about it."""
+    """The `claude` binary, or a refusal naming what to do about it.
+
+    Claude Code's own installer puts it in `~/.local/bin`, which is not on the
+    PATH `sudo -u agents -H` gives a command: sudo resets PATH to its
+    secure_path. The three-account install runs this as `agents` that way, so
+    the installer's own location is tried after PATH.
+    """
     found = shutil.which("claude")
-    if found is None:
-        raise Refused(
-            "`claude` is not on PATH, and it is what registers an MCP server. "
-            "Install Claude Code first; nothing was registered."
-        )
-    return found
+    if found is not None:
+        return found
+    local = Path.home() / ".local" / "bin" / "claude"
+    if local.is_file() and os.access(local, os.X_OK):
+        return str(local)
+    raise Refused(
+        "`claude` is not on PATH or in ~/.local/bin, and it is what registers an MCP "
+        "server. Install Claude Code first; nothing was registered."
+    )
 
 
 def config_path() -> Path:

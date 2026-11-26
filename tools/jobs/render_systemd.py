@@ -1,6 +1,6 @@
 """Render a job declaration as systemd units.
 
-systemd is the supervisor on Ubuntu 22.04, a platform the backend is committed
+systemd is the supervisor on Ubuntu 24.04, a platform the backend is committed
 to run on alongside macOS. A scheduled job becomes two units, a `.service`
 saying what to run and a `.timer` saying when; a long-running job becomes a
 `.service` alone.

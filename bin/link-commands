@@ -12,6 +12,9 @@ session, and every bare command over ssh, finds them.
     bin/link-commands --status     what is linked, and to what
     bin/link-commands --dry-run    say what would happen, change nothing
     bin/link-commands --check      report only; 1 if work is left, 2 if refused
+    bin/link-commands --login-path check PATH as this account's own login
+                                   shell reports it, not as this process
+                                   inherited it (for a run through sudo)
 
 **WITHOUT THIS, A FRESH INSTALL STOPS AT ITS FIRST CREW.** On a machine with an
 empty home, a steward can create an adopter's first crew and then cannot type
@@ -64,6 +67,19 @@ reported and not repaired: which file a login shell reads (`~/.profile`,
 than an installer should take, and depends on a login mode this command
 cannot see. **A bare, non-login command is different, and is fixed below.**
 
+**But WHOSE PATH is checked matters, and the process's own is not always the
+right answer.** `stand-up-backend` runs this as `agents` through `sudo -u
+agents -H`, and `sudo` replaces PATH with its own `secure_path` before this
+ever starts — never agents' own `~/.profile`, which on Debian puts
+`~/.local/bin` first. So the inherited PATH this process sees is sudo's, not
+agents'. `--login-path` checks the account's own login shell instead, by
+running it, which is this process's own account either way — this never
+reads or runs anything as root or as the administrator. For the single-
+account shape, the operator runs this directly in their own shell, with no
+sudo in between, and the process's own PATH already answers the question
+correctly; `stand-up-backend` passes `--login-path` only where sudo's
+`secure_path` would otherwise stand in for it.
+
 ## The session hook, and the PATH line — the two things here that are not links
 
 **A STALE BACKUP IS REPORTED WHERE THE OPERATOR IS, WHICH IS A SESSION.** The
@@ -101,6 +117,7 @@ import os
 import pwd
 import secrets
 import shlex
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -886,8 +903,45 @@ def path_entries() -> list[Path]:
     return [Path(part) for part in raw.split(os.pathsep) if part]
 
 
-def on_path(bin_dir: Path) -> bool:
+def login_shell_path() -> list[Path]:
+    """`PATH` as this account's own login shell reports it, by actually
+    running that shell — never this process's inherited environment.
+
+    **FOR `--login-path`, WHERE THIS PROCESS'S OWN PATH IS NOT THE ANSWER.**
+    `sudo -u agents -H link-commands --check` inherits sudo's `secure_path`,
+    never agents' own `~/.profile`, so `path_entries()` there reports a PATH
+    that no login of agents' ever actually has. This runs `agents`' login
+    shell — `-l` for a login shell, `-c` to run one command in it — AS
+    AGENTS, since this process already is agents by the time it runs; it
+    never escalates or runs as root. The same invocation covers a Mac: a
+    login `zsh` or `bash` there reads `/etc/zprofile` or `/etc/profile`,
+    which is what runs `path_helper`, so this needs no platform-specific
+    case.
+    """
+    shell = pwd.getpwuid(os.getuid()).pw_shell
+    try:
+        done = subprocess.run(
+            [shell, "-lc", 'printf %s "$PATH"'],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Refused(
+            f"could not run {shell} -lc to read this account's own login PATH "
+            f"({exc}); --login-path cannot be honored"
+        ) from None
+    if done.returncode != 0:
+        raise Refused(
+            f"{shell} -lc exited {done.returncode} reading this account's own "
+            f"login PATH: {done.stderr.strip()}"
+        )
+    return [Path(part) for part in done.stdout.split(os.pathsep) if part]
+
+
+def on_path(bin_dir: Path, entries: list[Path] | None = None) -> bool:
     """Whether a shell searching `PATH` would find what is linked here.
+
+    `entries` defaults to this process's own `PATH`; `--login-path` passes
+    `login_shell_path()`'s instead.
 
     **COMPARED BY RESOLVED PATH.** `~/.local/bin` and the same path spelled out
     from `$HOME` are the same directory and different strings, and a string comparison reports a
@@ -898,7 +952,7 @@ def on_path(bin_dir: Path) -> bool:
         target = bin_dir.resolve()
     except OSError:
         return False
-    for entry in path_entries():
+    for entry in (entries if entries is not None else path_entries()):
         try:
             if entry.resolve() == target:
                 return True
@@ -922,7 +976,8 @@ def zsh_line_covers(items: list[dict], bin_dir: Path) -> bool:
     return False
 
 
-def report(items: list[dict], bin_dir: Path | None, changed: list[str], verb: str) -> None:
+def report(items: list[dict], bin_dir: Path | None, changed: list[str], verb: str,
+           path_source: list[Path] | None = None) -> None:
     for item in items:
         state = item["state"]
         if state == "ours" and item["name"] not in changed:
@@ -949,12 +1004,12 @@ def report(items: list[dict], bin_dir: Path | None, changed: list[str], verb: st
         print(f"\n{PROG}: {verb} {', '.join(changed)}")
     else:
         print(f"\n{PROG}: nothing changed; every command and skill was already linked")
-    if bin_dir is not None and not on_path(bin_dir) and zsh_line_covers(items, bin_dir):
+    if bin_dir is not None and not on_path(bin_dir, path_source) and zsh_line_covers(items, bin_dir):
         # THIS PROCESS'S PATH PREDATES THE LINE. On a test Mac the run that wrote
         # `~/.zshenv` still told the operator to add the same directory by hand.
         print(f"\n{PROG}: {bin_dir} is on PATH in any new shell, because zsh reads "
               f"~/.zshenv for all of them. Open a new shell to type these by name.")
-    elif bin_dir is not None and not on_path(bin_dir):
+    elif bin_dir is not None and not on_path(bin_dir, path_source):
         # REPORTED, NOT REPAIRED. The file docstring says why.
         print(
             f"\n{PROG}: {bin_dir} is NOT on PATH, so none of these can be typed "
@@ -964,7 +1019,7 @@ def report(items: list[dict], bin_dir: Path | None, changed: list[str], verb: st
         )
 
 
-def status(items: list[dict], bin_dir: Path | None) -> int:
+def status(items: list[dict], bin_dir: Path | None, path_source: list[Path] | None = None) -> int:
     missing = 0
     for item in items:
         link, state = item["link"], item["state"]
@@ -998,7 +1053,7 @@ def status(items: list[dict], bin_dir: Path | None) -> int:
         else:
             print(f"  {item['name']:<16} not linked")
             missing += 1
-    if bin_dir is not None and not on_path(bin_dir):
+    if bin_dir is not None and not on_path(bin_dir, path_source):
         print(f"\n{PROG}: {bin_dir} is not on PATH")
     return 1 if missing else 0
 
@@ -1059,6 +1114,13 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--only", choices=("skills",), default=None,
                         help="link only the writing skills, and leave the link "
                              "directory alone")
+    parser.add_argument("--login-path", action="store_true",
+                        help="whether the link directory is on PATH as this "
+                             "account's own login shell reports it, by "
+                             "running that shell, rather than as this "
+                             "process's inherited PATH — for a run through "
+                             "sudo, whose secure_path replaces PATH entirely "
+                             "before this ever starts")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--status", action="store_true",
                       help="what is linked, and to what")
@@ -1101,10 +1163,14 @@ def main(argv: list[str]) -> int:
     # The link directory is out of scope under `--only skills`, so nothing
     # below checks it or reports on PATH.
     path_dir = None if skills_only else bin_dir
+    # **COMPUTED ONCE, ONLY WHEN NEEDED.** `login_shell_path()` spawns a
+    # shell; `None` here means every PATH check below falls back to this
+    # process's own `path_entries()`, exactly as before `--login-path` existed.
+    path_source = login_shell_path() if (path_dir is not None and args.login_path) else None
 
     if args.status:
         print(header)
-        return status(items, path_dir)
+        return status(items, path_dir, path_source)
 
     # **BOTH REFUSALS BEFORE THE `--dry-run` RETURN**, which is the correction
     # `install-backend` had to make: a mode whose job is to predict must
@@ -1135,7 +1201,7 @@ def main(argv: list[str]) -> int:
             print(f"\n{PROG}: {len(pending)} command(s) or skill(s) not linked: "
                   f"{', '.join(item['name'] for item in pending)}")
             return 1
-        if path_dir is not None and not on_path(path_dir):
+        if path_dir is not None and not on_path(path_dir, path_source):
             print(f"\n{PROG}: every command is linked, but {path_dir} is not on "
                   f"PATH, so none of them can be typed by name")
             return 1
@@ -1147,7 +1213,7 @@ def main(argv: list[str]) -> int:
 
     print(header)
     if args.dry_run:
-        report(items, path_dir, [item["name"] for item in pending], "would link")
+        report(items, path_dir, [item["name"] for item in pending], "would link", path_source)
         return 0
 
     changed = []
@@ -1171,7 +1237,7 @@ def main(argv: list[str]) -> int:
         else:
             link_one(item)
         changed.append(item["name"])
-    report(items, path_dir, changed, "linked")
+    report(items, path_dir, changed, "linked", path_source)
 
     print()
     for line in outstanding(skills_only):

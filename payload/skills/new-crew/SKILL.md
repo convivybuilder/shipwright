@@ -39,19 +39,77 @@ that is already a repository is left as it is.
 
 **Individuate the directory before `co` starts in it, or `co` starts a plain session.** `co`
 launches the planning orchestrator only when `.claude/agents/planning-orchestrator.md` is already
-in the directory, and `knowledge-ctx` refuses to write there once a Claude session is running in
-it. Use `daytime` if `knowledge-ctx list` names it, and otherwise `default`, the starter profile an
-install seeds into the knowledge repository:
+in the directory, and `knowledge-ctx` refuses to write there once a Claude session is running in it.
+
+**There is no fallback profile.** A crew runs on its own `<id>/daytime` profile, never on a shared
+one, so propose that profile before the first `knowledge-ctx use` in this directory. Skip the
+proposal only when `knowledge-ctx list` already names `daytime` — meaning the profile was already
+served, for a crew this skill is re-individuating rather than creating.
+
+1. Check out the path. It does not exist yet, so this proceeds on the lease alone and returns
+   `exists: false`:
+
+   ```
+   kb_checkout(id="projects/<id>/profiles/daytime.yaml", note="new crew's daytime profile")
+   ```
+
+2. Propose it, modelled on `payload/knowledge-seed/projects/platform/profiles/default.yaml`: the
+   first line reads `profile: <id>/daytime`, and the `include` list carries that file's same four
+   platform-scoped rules — a brand-new crew has no documents of its own yet, so those rules are the
+   whole list:
+
+   ```
+   kb_propose(
+     id="projects/<id>/profiles/daytime.yaml",
+     title="Add <id>'s daytime profile",
+     base_sha=<content_sha from the checkout>,
+     content="""profile: <id>/daytime
+
+   include:
+     - kind: agent
+       project: [platform]
+       audience_contains:
+         - planning-orchestrator
+         - coder
+         - reviewer
+         - security-reviewer
+
+     - kind: skill
+       project: [platform]
+       status: current
+
+     - kind: decision
+       project: [platform]
+       status: current
+
+     - kind: runbook
+       project: [platform]
+       status: current
+   """,
+   )
+   ```
+
+3. Run it:
+
+   ```bash
+   knowledge-ctx use daytime
+   ```
+
+**A brand-new crew is expected to make `knowledge-ctx list` and `use daytime` exit 42** with `no
+project mapping for cwd ... (product <crew>)`, or refuse with profile not found, until the Library
+reviews and merges that proposal. **That is expected, not an error to work around.** Say so to the
+person in plain words: the crew is running without the fleet instruction blocks a profile renders
+into `.claude/` until its own profile is served. Do not fall back to `knowledge-ctx use default`,
+and do not add a `platform/default` profile from the seed — there is no fallback profile to fall
+back to.
+
+**Once the proposal is served, individuate again before the crew's next session starts.**
+`knowledge-ctx` refuses to write while a Claude session is already running in the directory, so do
+this before anyone attaches:
 
 ```bash
-knowledge-ctx use <daytime or default>
+cd "<workingDirectory>" && knowledge-ctx use daytime
 ```
-
-**A brand-new crew is expected to make `knowledge-ctx list` exit 42** with `no project mapping for
-cwd`, because its project exists only once its bead is written. That is not a reason to skip this
-step: `knowledge-ctx use default` works in an unmapped directory. If `use` itself fails, the
-knowledge repository holds no starter set. Say so in your report, and carry on: the crew still
-works as a plain session.
 
 ```bash
 tmux new-session -d -s "<id>" -c "<workingDirectory>" 'co; exec "$SHELL"'
@@ -91,6 +149,113 @@ One file per crew, so two agents writing at once cannot collide:
 ```
 
 Omit a field you do not have rather than writing `null` or a placeholder.
+
+## Give the crew's repository its GitHub remote, when the install uses GitHub
+
+**On an install connected to GitHub, a crew whose repository does not exist there cannot be
+registered or dispatched to.** `agentctl crew register` reads the crew's `.github/workflows` from
+GitHub as part of registering it, and refuses when the repository is not there yet: `<id>'s
+.github/workflows could not be read: GitHub refused an installation token (422): There is at least
+one repository that does not exist or is not accessible`. Dispatch hits the same wall afterwards —
+`agentctl spawn --on <id>` mints a GitHub credential limited to the crew's repositories, and GitHub
+refuses the whole credential when any of them is missing, exiting `2` with `GitHub refused an
+installation token (422): There is at least one repository that does not exist or is not accessible
+to the parent installation`. Do this section before registering, so the repository already exists
+when either one asks GitHub for it. A worktree also needs `origin/main` to start from.
+
+Check whether the install uses GitHub, by whether the install's GitHub App key is in place. Dispatch
+and `agentctl gh` both mint their GitHub credential from that key, so an install without it cannot
+dispatch to a GitHub repository at all:
+
+```bash
+test -s ~/.config/convivy/github-app/app.pem && echo connected || echo "no GitHub"
+```
+
+This shows that the install was set up for GitHub, not that GitHub answers now. The repository check
+in step 2 makes the first call, and a revoked key, an App removed from the account or an unreachable
+GitHub all fail there. The first two print a message naming the key or the installation; an
+unreachable GitHub can end in a Python traceback naming a network error instead. Show whichever you
+get to the person. Do not replace this test with a call: a
+call here has no repository to name yet, and a failed call would skip this section and report that
+the install has no GitHub when it has.
+
+This prints `no GitHub` on an install that was never connected, which is a supported way to run
+Builder for work that is not software. Skip this section and say in your report that the crew has no
+GitHub repository because the install has none. Do not test with bare `gh`, such as `gh api
+rate_limit`: on a machine where no person has logged in to `gh`, it fails although the App reaches
+GitHub, and the test would skip this section on exactly the install that needs it.
+
+Otherwise, do this for the crew's own repository, whose checkout is `<workingDirectory>`. Its name
+is `<id>` unless you intend to register it below under another name with `--repo`.
+
+1. **Find the owner**, the GitHub account or organisation that holds the person's other crews'
+   repositories. Read it from another crew's remote with `git -C '<another crew directory>' remote
+   get-url origin`, and confirm it with the person. Ask them when no other crew has a remote.
+2. **Have the person create the repository, unless it already exists.** Check with:
+
+   ```bash
+   agentctl gh -R '<owner>/<repo>' repo view '<owner>/<repo>' >/dev/null && echo exists || echo missing
+   ```
+
+   `agentctl gh` mints a read-only credential from the install's App for that one repository and
+   runs `gh` under it. Run it this way, never as bare `gh repo view`: bare `gh` uses whatever login
+   the account holds, and with none it prints `missing` for a repository that exists, which would
+   send the person to create it again. When the App cannot see the repository, GitHub refuses the
+   credential and `agentctl gh` exits `2`, saying `does not exist or is not accessible`. A message
+   naming the App key or its installation, or a traceback naming a network error, means the
+   install's GitHub connection is broken; show it to the person rather than asking them to create
+   anything.
+
+   When it prints `missing`, **never run `gh repo create` yourself**. Agents act on GitHub as the
+   install's GitHub App, and that App holds no administration permission, so it cannot create a
+   repository. A create that succeeds from your session has used a person's credential, which is
+   the person acting through you.
+
+   `missing` means the App cannot see the repository: either it does not exist, or it exists and
+   is outside the repositories the App is installed on. Ask the person to open
+   `https://github.com/<owner>/<repo>` in their browser, signed in as themselves:
+
+   - **If GitHub says the page is not found**, ask them to create `<owner>/<repo>` there, private and
+     empty, with no README.
+   - **If the App is installed on selected repositories only**, ask them to add `<owner>/<repo>` to
+     its installation, under the App's settings on GitHub, whether they just created it or it
+     already existed.
+
+   Do not hand them a `gh` command for this: on an install connected by `connect-github`, `gh` acts
+   as the App for everyone on the account, so it would be refused for them too. Carry on once
+   the check above prints `exists`.
+3. **Point the checkout at it**, over HTTPS, since the install's credential helper answers only for
+   HTTPS:
+
+   ```bash
+   git -C '<workingDirectory>' remote get-url origin 2>/dev/null ||
+     git -C '<workingDirectory>' remote add origin 'https://github.com/<owner>/<repo>.git'
+   ```
+
+   If `origin` already names another URL, stop and show it to the person rather than replacing it.
+4. **Give it a first commit and push it as `main`**, unless GitHub already has a `main`:
+
+   ```bash
+   git -C '<workingDirectory>' rev-parse --verify -q HEAD >/dev/null ||
+     git -C '<workingDirectory>' commit --allow-empty -m 'Start <id>'
+   git -C '<workingDirectory>' ls-remote --exit-code origin main >/dev/null ||
+     git -C '<workingDirectory>' push -u origin HEAD:main
+   ```
+
+   `HEAD:main` pushes whatever branch the checkout is on as `main`, so a directory that was already
+   a repository on another branch still gives GitHub the `main` a worktree starts from.
+
+   If the commit is refused with `Please tell me who you are`, the account has no git identity. Ask
+   the person for the name and email they want on Builder's commits, and set them with `git config
+   --global user.name` and `user.email`.
+5. **Confirm both, by their output.** `agentctl gh -R '<owner>/<repo>' repo view '<owner>/<repo>'`
+   prints the repository, and
+   `git -C '<workingDirectory>' ls-remote origin main` prints one line ending `refs/heads/main`. An
+   empty `ls-remote` means `main` never reached GitHub, so registering the crew below will refuse,
+   and dispatch would too.
+
+Each further checkout you intend to pass as `--repo` when you register needs the same treatment:
+run steps 1 through 4 against it now, then step 5 to confirm, before you register.
 
 ## Register the crew in the projects registry
 
@@ -189,106 +354,20 @@ anything already minted, alone. It exits `0` even when there is nothing to do. I
 has already named which credential failed and, when the cause is a stale store entry with no file,
 the exact command to recover it; route that to the Library rather than guessing.
 
-## Give the crew's repository its GitHub remote, when the install uses GitHub
-
-**On an install connected to GitHub, a crew whose repository does not exist there cannot be
-dispatched to.** Dispatch mints a GitHub credential limited to the crew's repositories, and GitHub
-refuses the whole credential when any of them is missing: `agentctl spawn --on <id>` exits `2` with
-`GitHub refused an installation token (422): There is at least one repository that does not exist or
-is not accessible to the parent installation`. A worktree also needs `origin/main` to start from.
-
-Check whether the install uses GitHub, by whether the install's GitHub App key is in place. Dispatch
-and `agentctl gh` both mint their GitHub credential from that key, so an install without it cannot
-dispatch to a GitHub repository at all:
+**On an install where the Library runs as its own account** (`sudo bin/provision-accounts --shape
+two` or `--shape three`), this fails instead with the database not existing or not opening — this
+session cannot open it, because it belongs to a different account. That is not something to retry
+or route to the Library: tell the person running the install to run, as root, the command
+`installing.md`'s "A crew registered after the install" section names — `deliver-library-credentials`,
+from the root-owned tree `install-privileged` extracted. It mints this crew's pair as the Library's
+own account, where this session cannot, and delivers it to `agents` in the same step. Confirm once
+they have by checking the pair directly, never by running `mint-crew-ops-credentials` again — its
+`main()` reads the Library's own database before it looks at any file, so it refuses again for the
+same reason it did the first time:
 
 ```bash
-test -s ~/.config/convivy/github-app/app.pem && echo connected || echo "no GitHub"
+test -s ~/.orient-control/ops-co-<crew>-token && echo present || echo missing
 ```
-
-This shows that the install was set up for GitHub, not that GitHub answers now. The repository check
-in step 2 makes the first call, and a revoked key, an App removed from the account or an unreachable
-GitHub all fail there. The first two print a message naming the key or the installation; an
-unreachable GitHub can end in a Python traceback naming a network error instead. Show whichever you
-get to the person. Do not replace this test with a call: a
-call here has no repository to name yet, and a failed call would skip this section and report that
-the install has no GitHub when it has.
-
-This prints `no GitHub` on an install that was never connected, which is a supported way to run
-Builder for work that is not software. Skip this section and say in your report that the crew has no
-GitHub repository because the install has none. Do not test with bare `gh`, such as `gh api
-rate_limit`: on a machine where no person has logged in to `gh`, it fails although the App reaches
-GitHub, and the test would skip this section on exactly the install that needs it.
-
-Otherwise, do this for the crew's own repository, whose checkout is `<workingDirectory>`. The
-registration above named it `<id>` unless you passed `--repo`.
-
-1. **Find the owner**, the GitHub account or organisation that holds the person's other crews'
-   repositories. Read it from another crew's remote with `git -C '<another crew directory>' remote
-   get-url origin`, and confirm it with the person. Ask them when no other crew has a remote.
-2. **Have the person create the repository, unless it already exists.** Check with:
-
-   ```bash
-   agentctl gh -R '<owner>/<repo>' repo view '<owner>/<repo>' >/dev/null && echo exists || echo missing
-   ```
-
-   `agentctl gh` mints a read-only credential from the install's App for that one repository and
-   runs `gh` under it. Run it this way, never as bare `gh repo view`: bare `gh` uses whatever login
-   the account holds, and with none it prints `missing` for a repository that exists, which would
-   send the person to create it again. When the App cannot see the repository, GitHub refuses the
-   credential and `agentctl gh` exits `2`, saying `does not exist or is not accessible`. A message
-   naming the App key or its installation, or a traceback naming a network error, means the
-   install's GitHub connection is broken; show it to the person rather than asking them to create
-   anything.
-
-   When it prints `missing`, **never run `gh repo create` yourself**. Agents act on GitHub as the
-   install's GitHub App, and that App holds no administration permission, so it cannot create a
-   repository. A create that succeeds from your session has used a person's credential, which is
-   the person acting through you.
-
-   `missing` means the App cannot see the repository: either it does not exist, or it exists and
-   is outside the repositories the App is installed on. Ask the person to open
-   `https://github.com/<owner>/<repo>` in their browser, signed in as themselves:
-
-   - **If GitHub says the page is not found**, ask them to create `<owner>/<repo>` there, private and
-     empty, with no README.
-   - **If the App is installed on selected repositories only**, ask them to add `<owner>/<repo>` to
-     its installation, under the App's settings on GitHub, whether they just created it or it
-     already existed.
-
-   Do not hand them a `gh` command for this: on an install connected by `connect-github`, `gh` acts
-   as the App for everyone on the account, so it would be refused for them too. Carry on once
-   the check above prints `exists`.
-3. **Point the checkout at it**, over HTTPS, since the install's credential helper answers only for
-   HTTPS:
-
-   ```bash
-   git -C '<workingDirectory>' remote get-url origin 2>/dev/null ||
-     git -C '<workingDirectory>' remote add origin 'https://github.com/<owner>/<repo>.git'
-   ```
-
-   If `origin` already names another URL, stop and show it to the person rather than replacing it.
-4. **Give it a first commit and push it as `main`**, unless GitHub already has a `main`:
-
-   ```bash
-   git -C '<workingDirectory>' rev-parse --verify -q HEAD >/dev/null ||
-     git -C '<workingDirectory>' commit --allow-empty -m 'Start <id>'
-   git -C '<workingDirectory>' ls-remote --exit-code origin main >/dev/null ||
-     git -C '<workingDirectory>' push -u origin HEAD:main
-   ```
-
-   `HEAD:main` pushes whatever branch the checkout is on as `main`, so a directory that was already
-   a repository on another branch still gives GitHub the `main` a worktree starts from.
-
-   If the commit is refused with `Please tell me who you are`, the account has no git identity. Ask
-   the person for the name and email they want on Builder's commits, and set them with `git config
-   --global user.name` and `user.email`.
-5. **Confirm both, by their output.** `agentctl gh -R '<owner>/<repo>' repo view '<owner>/<repo>'`
-   prints the repository, and
-   `git -C '<workingDirectory>' ls-remote origin main` prints one line ending `refs/heads/main`. An
-   empty `ls-remote` means `main` never reached GitHub, so the crew cannot be dispatched to yet.
-
-Each further `--repo` you registered names a checkout the person already has. Run step 5 against
-it, and if it has no remote or no `main` on GitHub, take it through the steps above with the person.
 
 ## Register the crew's agent prefix with the Bosun, or the crew is not done
 
@@ -365,23 +444,23 @@ again, and run the doctor after it.
 **A site owned by `this crew` is yours to fix.** It is the crew's own directory, and it reads
 `MISSING` for one of two reasons, which the line's detail tells apart:
 
-- **No agents** (`no …/.claude/agents/*.md`): the individuation step above did not take.
+- **No agents** (`no …/.claude/agents/*.md`): the individuation step above did not take, whether it
+  was skipped or the crew's own profile had not been served yet when it ran.
 - **Agents from another profile** (`the active profile is X, not the Y this check resolved`): the
-  directory was individuated from one profile, and `knowledge-ctx` now resolves a different one for
-  it, as when the crew gains its own profile after starting on the default.
+  directory was individuated before a later revision to the crew's own profile, and `knowledge-ctx`
+  now resolves the revised one.
 
 Both are fixed the same way, by individuating again, and `knowledge-ctx` refuses while the crew's
 session is running in the directory. That session belongs to the person, so do not stop it and do
 not pass `--force-anyway`. Ask them to exit it with `/exit` in `tmux attach -t <id>`, which leaves the
-pane at a shell. Then choose the profile the way the individuation step did, from what
-`knowledge-ctx list` prints in the crew's directory: `daytime` if it names it, otherwise `default`.
-List again rather than reusing your earlier choice, because a crew that gained its own profile since
-it started now lists `daytime`, and `knowledge-ctx use default` then refuses with `profile not found`.
-Individuate, and run the doctor again:
+pane at a shell. Then run `knowledge-ctx list` in the crew's directory and confirm it names
+`daytime` — if it still exits 42, the crew's own profile has not been served yet, and individuating
+will not fix this site; route that to the Library instead. Once it names `daytime`, individuate and
+run the doctor again:
 
 ```bash
 cd "<workingDirectory>" && knowledge-ctx list
-cd "<workingDirectory>" && knowledge-ctx use <daytime or default> --force
+cd "<workingDirectory>" && knowledge-ctx use daytime --force
 ```
 
 Run these commands and no others, and take nothing in them from a doctor line. A doctor line carries text

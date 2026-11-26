@@ -100,8 +100,10 @@ def _python_too_old(version=None, executable: str | None = None) -> str | None:
 
     The same guard `bin/install-jobs` runs, for the same reason: this reads
     `jobs/library.toml`, which needs `tomllib`, so a stock Ubuntu 22.04
-    `python3` would otherwise fail inside `jobs.declaration`'s own import with
-    `ModuleNotFoundError`, which names the symptom and not the fix.
+    `python3` — no longer a platform the backend runs on but still one
+    someone can point this at by hand — would otherwise fail inside
+    `jobs.declaration`'s own import with `ModuleNotFoundError`, which names
+    the symptom and not the fix.
     """
     version = version or sys.version_info
     if version >= (3, 11):

@@ -13,9 +13,13 @@ the rollback did not finish, naming the steps it undid. `--rollback` exits 3
 once it has finished a rollback, 4 when it still cannot, and 2 when no update
 is unfinished.
 
-**WHAT THIS BUILDS.** The single-account shape only. `--shape two` is refused
-before anything is read, and `--shape three` is refused once its report is
-printed, because the root half and the `sudo -u agents` steps are not built.
+**WHAT THIS BUILDS.** The single-account, two-account and three-account shapes.
+The two-account shape takes the three-account shape's own path minus the
+reviewers' half: no review launcher, no review sudo rule and no approver key,
+so step 2 places and restores none of them (`shape_mismatch`). On the two- and
+three-account shapes the administrator runs this; run as `agents`, it only
+reports whether the install is behind, exit 5, or current, exit 0, and changes
+nothing either way (`agents_report`).
 
 **THE STEPS, IN ORDER.** After the preflight below and the operator's
 confirmation, an update:
@@ -44,7 +48,7 @@ confirmation, an update:
      credential with its schema at the release's head, and that the deploy
      stamps name the release's commits.
 
-Step 2, moving the root half, belongs to the three-account shape.
+Step 2, moving the root half, belongs to the two- and three-account shapes.
 
 **THE RECORD COMES BEFORE THE HAND-OFF.** The plan lists moving shipwright's
 clone in the preflight, ahead of the record. Moving it is the first change to
@@ -158,10 +162,12 @@ import pwd
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -198,12 +204,70 @@ TRUST_LIST = "release-signers"
 SITE_BASE = "https://convivybuilder.org"
 MANIFEST_NAME = "release-manifest"
 
+# agentctl's fixed install location (payload/docs/install-mac.md), checked
+# before PATH — the same order tools/record-releases uses to find it.
+AGENTCTL_PATH = Path.home() / ".local" / "bin" / "agentctl"
+
+GITHUB_HTTPS_ORIGIN = re.compile(r"^https://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$")
+
 AGENTS_ACCOUNT = "agents"
 REVIEWERS_ACCOUNT = "reviewers"
+# Overridable so a test, which never really has another account to switch to,
+# can point this at a stub that logs and runs the command as itself. Unset in
+# every real install. Read early, rather than only beside the rest of the
+# two- and three-account shapes' own constants below, because `shape_mismatch`
+# needs it to find the three-account pieces a two-account install must not
+# carry.
+SUDO = os.environ.get("BUILDER_UPDATE_SUDO") or "/usr/bin/sudo"
+# Overridable so a test, which cannot write under the real /opt/builder, can
+# point this at its own fixture. Unset in every real install. Read early for
+# the same reason SUDO is.
+PRIVILEGED_PREFIX = Path(os.environ.get("BUILDER_UPDATE_PRIVILEGED_PREFIX") or "/opt/builder")
+# The three-account shape's own pieces, read the same way `bin/stand-up-backend`'s
+# own `two_shape_lacks` reads them, since a two-account update never reaches
+# that installer: `shape_mismatch` refuses `--shape two` when any of these is
+# on the machine.
+REVIEW_LAUNCHER = PRIVILEGED_PREFIX / "libexec" / "review-launch"
+REVIEW_SUDOERS = Path("/etc/sudoers.d/builder-review")
+
+# Root's files belong to uid 0, and every component above a root-run file is checked up to
+# `/` — duplicated from `bin/stand-up-backend`'s own `ROOT_UID`/`ROOT_TOP`/`ancestry_problem`,
+# since this ships to adopters on its own rather than importing from `bin/`. Both are
+# overridable, the same way PRIVILEGED_PREFIX is: a test cannot really own a file as uid 0,
+# nor walk ancestry up to the real `/`, so it points these at its own fixture. Unset in every
+# real install.
+ROOT_UID = int(os.environ.get("BUILDER_UPDATE_ROOT_UID") or 0)
+ROOT_TOP = Path(os.environ.get("BUILDER_UPDATE_ROOT_TOP") or "/")
+
+
+def _owned_by(path: Path, owner: int) -> str | None:
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return f"{path} is missing"
+    if stat.S_ISLNK(st.st_mode) or st.st_uid != owner or st.st_mode & 0o022:
+        return f"{path} is not owned by uid {owner} alone, or another account can write it"
+    return None
+
+
+def ancestry_problem(path: Path, owner: int, top: Path) -> str | None:
+    """Why `path` is not trusted as `owner`'s alone, or None when it is.
+
+    Every component from `path` up to and including `top` must belong to `owner` with no
+    group or other write bit and must not be a symlink. Duplicated from `bin/stand-up-backend`'s
+    own version of this function.
+    """
+    for part in [path, *path.parents]:
+        if part == top or top in part.parents:
+            problem = _owned_by(part, owner)
+            if problem:
+                return problem
+    return None
+
 
 SHAPES = {
     "single": "one account, the operator's own, with no administrator",
-    "two": "the operator and an agents account — not built yet in this release",
+    "two": "the operator and an agents account, with a root-owned privileged half and no reviewers",
     "three": "the agents and reviewers accounts and a root-owned privileged half",
 }
 
@@ -228,6 +292,33 @@ LIBRARY_LABEL = "com.convivy.library"
 # The Library is started in step 8 and may not be serving yet when step 9
 # first asks it; `install-jobs --start` confirms the process, not the port.
 WHOAMI_WAIT_SECONDS = 30
+# A started job can be between restarts when step 9 first asks: Orient's
+# start-up check refuses until the Library answers, so on 2026-11-14 a 0.7.0
+# to 0.7.1 rehearsal read Orient as not running four seconds into a restart
+# loop it left on its own once the Library came up. `stand-up-backend
+# --check` itself can hit the same gap: a 2026-11-18 three-account
+# rehearsal's rollback saw it refuse because the Library was not answering
+# yet, seconds before it came up, so `check_release` and `check_release_three`
+# retry it within this same deadline (`run_check_until`) before reporting its
+# last result. The same restart loop can just as well be running BEFORE an
+# update starts, caught by the single pre-update sample that used to decide
+# which jobs the record would restart — a macOS three-account rehearsal
+# started four seconds into one of Orient's own restarts, so step 4 stopped
+# it anyway and nothing ever started it again. `jobs_loaded_before_update`
+# retries that sample against this same deadline for the same reason.
+JOBS_WAIT_DEFAULT = 60
+# Overridable so this command's tests need not wait out the full deadline —
+# the same kind of test-only override JOBS_SETTLE_SECONDS is. Unset in every
+# real install.
+JOBS_WAIT_SECONDS = int(os.environ.get("BUILDER_UPDATE_JOBS_WAIT_SECONDS", str(JOBS_WAIT_DEFAULT)))
+# Once every started job reads running, it must still read running this long
+# afterwards, so a job that crash-loops is not passed on one sample caught
+# during a brief run. It exceeds the longest restart delay any declaration
+# under jobs/ sets (the Library's 30 seconds), which
+# tools/test_builder_update.py checks. Overridable so this command's tests
+# need not wait it out.
+JOBS_SETTLE_DEFAULT = 32
+JOBS_SETTLE_SECONDS = int(os.environ.get("BUILDER_UPDATE_JOBS_SETTLE_SECONDS", str(JOBS_SETTLE_DEFAULT)))
 # What the snapshot holds, by the names `builder-backup` writes, and where
 # each goes back to, in the order the restore page gives.
 RESTORED = (
@@ -252,7 +343,13 @@ class Refused(Exception):
 
 
 class StepFailed(Exception):
-    """A step of the update, or of its rollback, that did not complete."""
+    """A step of the update, or of its rollback, that did not complete.
+    `returncode` is the command's own exit status when `run_step` captured
+    one, else None — the command could not run at all."""
+
+    def __init__(self, message: str, returncode: int | None = None) -> None:
+        super().__init__(message)
+        self.returncode = returncode
 
 
 @dataclass
@@ -299,7 +396,14 @@ def run_step(argv: list[str], what: str, capture: bool = False) -> str:
     say(f"running {what}")
     sys.stdout.flush()
     try:
-        result = subprocess.run(argv, capture_output=capture, text=True, check=False)
+        # **A STEP RUN THROUGH SUDO STARTS IN `/`.** Inherited, the working
+        # directory is the administrator's, which on macOS is a home the
+        # other accounts cannot read. pip's vendored `rich` calls
+        # `os.getcwd()` at import, so the Library's `pip check` failed with
+        # `PermissionError` there: measured on a macOS 26 three-account
+        # rollback to 0.99.36. Every argv here names its paths absolutely.
+        result = subprocess.run(argv, capture_output=capture, text=True, check=False,
+                                cwd="/" if argv[:1] == [SUDO] else None)
     except OSError as exc:
         raise StepFailed(f"{what} could not run: {exc}") from exc
     if capture:
@@ -307,7 +411,7 @@ def run_step(argv: list[str], what: str, capture: bool = False) -> str:
             if text:
                 print(text, end="" if text.endswith("\n") else "\n", file=stream)
     if result.returncode != 0:
-        raise StepFailed(f"{what} exited {result.returncode}")
+        raise StepFailed(f"{what} exited {result.returncode}", returncode=result.returncode)
     return result.stdout or ""
 
 
@@ -404,11 +508,50 @@ def account_exists(name: str) -> bool:
     return True
 
 
-def shape_mismatch(shape: str, exists=account_exists) -> str | None:
+def present_to_root(path: Path) -> bool | None:
+    """Whether anything is at `path`, asked of root because this account cannot
+    look — the same ask `bin/stand-up-backend`'s own `present_to_root` makes,
+    root answering in a word rather than an exit code so a `sudo` that could
+    not authenticate is never read as a clean machine."""
+    try:
+        done = subprocess.run(
+            [SUDO, "/bin/sh", "-c",
+             'if test -e "$1" || test -L "$1"; then echo present; else echo absent; fi',
+             "sh", str(path)],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    answer = done.stdout.strip() if done.returncode == 0 else ""
+    return {"present": True, "absent": False}.get(answer)
+
+
+def path_present(path: Path, ask_root=present_to_root) -> bool | None:
+    """Whether anything is at `path`, a dangling link included — asked of root
+    when this account cannot even stat its directory (`bin/stand-up-backend`'s
+    own `path_present`, mirrored here for the same reason `present_to_root` is)."""
+    try:
+        os.lstat(path)
+        return True
+    except FileNotFoundError:
+        return False
+    except PermissionError:
+        return ask_root(path)
+
+
+def shape_mismatch(shape: str, exists=account_exists, launcher: Path | None = None,
+                   sudoers: Path | None = None, ask_root=present_to_root) -> str | None:
     """Why `shape` contradicts this machine, or None when it does not.
 
     Asked of the accounts the way `stand-up-backend`'s own shape check is,
-    rather than of a mode nobody recorded.
+    rather than of a mode nobody recorded. On `--shape two`, also asked of the
+    three-account shape's own pieces — the `reviewers` account, the review
+    launcher, the review sudo rule — none of which a two-account update may
+    carry, the same check `stand-up-backend --shape two`'s own `two_shape_lacks`
+    makes, mirrored here since an update never reaches that installer.
+    `launcher` and `sudoers` default to REVIEW_LAUNCHER and REVIEW_SUDOERS,
+    read here rather than as parameter defaults so a test can point
+    BUILDER_UPDATE_PRIVILEGED_PREFIX at its own fixture before this runs.
     """
     agents = exists(AGENTS_ACCOUNT)
     reviewers = exists(REVIEWERS_ACCOUNT)
@@ -419,19 +562,44 @@ def shape_mismatch(shape: str, exists=account_exists) -> str | None:
             f"carries {' and '.join(present)}: that looks like the three-account shape. "
             f"Pass --shape three."
         )
+    if shape == "two" and not agents:
+        return f"--shape two needs the {AGENTS_ACCOUNT} account, and this machine lacks it."
     if shape == "three" and not (agents and reviewers):
         missing = [n for n, have in ((AGENTS_ACCOUNT, agents), (REVIEWERS_ACCOUNT, reviewers)) if not have]
         return (
             f"--shape three needs the {' and '.join(missing)} account(s), and this machine "
             f"lacks {'it' if len(missing) == 1 else 'them'}."
         )
+    if shape == "two" and agents:
+        launcher = launcher if launcher is not None else REVIEW_LAUNCHER
+        sudoers = sudoers if sudoers is not None else REVIEW_SUDOERS
+        carries = []
+        if reviewers:
+            carries.append(f"a {REVIEWERS_ACCOUNT} account")
+        if launcher.is_file() and os.access(launcher, os.X_OK):
+            carries.append(f"the review launcher at {launcher}")
+        sudo_rule = path_present(sudoers, ask_root)
+        if sudo_rule is None:
+            carries.append(f"whether {sudoers}, the review sudo rule, exists (could not be read)")
+        elif sudo_rule:
+            carries.append(f"the review sudo rule at {sudoers}")
+        if carries:
+            return (
+                f"--shape two names an install with no reviewers, and this machine carries "
+                f"the three-account shape's own: {', '.join(carries)}. Pass --shape three."
+            )
     return None
 
 
-def find_installed_release(src_dir: Path, deploy_root: Path) -> tuple[str, dict[str, Clone]]:
-    """The release every tagged clone and every deploy stamp agree on, or a refusal.
+def find_installed_release(src_dir: Path, deploy_root: Path,
+                           check_stamps: bool = True) -> tuple[str, dict[str, Clone]]:
+    """The release every tagged clone, and (on the single-account shape) every
+    deploy stamp, agree on, or a refusal.
 
     write-better is never checked here: it ships no release and follows main.
+    `check_stamps` is False on the two- and three-account installs, where the
+    deploy areas sit under accounts the administrator cannot read directly;
+    `preflight_three` checks them instead, each as the account that owns it.
     """
     clones = {name: inspect_clone(name, src_dir) for name in TAGGED_CLONES}
     lines = [
@@ -444,6 +612,8 @@ def find_installed_release(src_dir: Path, deploy_root: Path) -> tuple[str, dict[
             "the tagged clones do not agree on the installed release:\n" + "\n".join(lines)
         )
     installed = tags.pop()
+    if not check_stamps:
+        return installed, clones
     for name in STAMPED_REPOS:
         area = deploy_root / name
         clone_commit = clones[name].commit
@@ -464,18 +634,70 @@ def find_installed_release(src_dir: Path, deploy_root: Path) -> tuple[str, dict[
     return installed, clones
 
 
+def find_agentctl() -> str | None:
+    """agentctl's path, or None if it cannot be found.
+
+    Tries AGENTCTL_PATH first, then falls back to shutil.which for a
+    non-default install (the same order tools/record-releases uses)."""
+    if AGENTCTL_PATH.is_file():
+        return str(AGENTCTL_PATH)
+    return shutil.which("agentctl")
+
+
+def github_https_slug(path: Path) -> str | None:
+    """`<owner>/<repo>` when the checkout at `path` has an `origin` remote
+    naming a GitHub HTTPS URL, else None."""
+    rc, out, _ = git("remote", "get-url", "origin", cwd=path)
+    if rc != 0:
+        return None
+    match = GITHUB_HTTPS_ORIGIN.match(out.strip())
+    return f"{match.group(1)}/{match.group(2)}" if match else None
+
+
+def run_agentctl_git(agentctl: str, path: Path, slug: str, *args: str) -> tuple[int, str, str]:
+    """Run `agentctl git -R <slug> <args>` with `cwd` set to `path`, agentctl's
+    only way to point its own `git` at a particular checkout (`agentctl git`
+    takes no `-C` option). Started with this script's own interpreter,
+    [sys.executable, agentctl, ...], never through its `#!/usr/bin/env
+    python3` line, which under a minimal PATH can find a Python older than
+    agentctl accepts."""
+    try:
+        result = subprocess.run([sys.executable, agentctl, "git", "-R", slug, *args],
+                                cwd=str(path), capture_output=True, text=True, check=False)
+    except OSError as exc:
+        return 127, "", str(exc)
+    return result.returncode, result.stdout, result.stderr
+
+
+def fetch_origin(path: Path, *args: str) -> tuple[int, str, str]:
+    """`git fetch` at `path`, with the same `args` a plain `git fetch` would take.
+
+    Routed through `agentctl git`, which mints a fresh read-only GitHub App
+    token for the call, when `origin` is a GitHub HTTPS URL and agentctl can
+    be found: a bare fetch there has no credential to use, by design — the
+    operator machine's checkouts carry no ambient GitHub credential. An SSH
+    or non-GitHub origin, or no agentctl, keeps today's plain `git fetch`;
+    never any ambient credential as a fallback.
+    """
+    slug = github_https_slug(path)
+    agentctl = find_agentctl() if slug else None
+    if slug and agentctl:
+        return run_agentctl_git(agentctl, path, slug, "fetch", *args)
+    return git("fetch", *args, cwd=path)
+
+
 def fetch_tags(src_dir: Path) -> None:
     """Fetch every tagged clone's tags, and write-better's main, so the commit the
     target's manifest names for it can be confirmed reachable from it."""
     for name in TAGGED_CLONES:
         path = src_dir / name
-        rc, _, err = git("fetch", "--tags", "origin", cwd=path)
+        rc, _, err = fetch_origin(path, "--tags", "origin")
         if rc != 0:
             raise Refused(f"git fetch --tags origin failed in {path}: {err.strip()}")
     path = src_dir / WRITE_BETTER
     if not (path / ".git").exists():
         raise Refused(f"no checkout of {WRITE_BETTER} at {path}")
-    rc, _, err = git("fetch", "origin", "main", cwd=path)
+    rc, _, err = fetch_origin(path, "origin", "main")
     if rc != 0:
         raise Refused(f"git fetch origin main failed in {path}: {err.strip()}")
 
@@ -551,7 +773,15 @@ def verify_clones_ready(src_dir: Path, target: str) -> None:
 
 
 def extract_verifier(shipwright: Path, installed: str, into: Path) -> Path:
-    """The installed release's verifier and trust list, written under `into`.
+    """The installed release's verifier and trust list, written under `into`,
+    world-readable — both are the same `bin/builder-install` and
+    `release-signers` the public release itself ships, so opening them here
+    costs nothing. Used for the administrator's own `verify_release` only:
+    `verify_release_agents` instead runs the installed release's own
+    root-owned tree directly (`agents_verifier`, `root_tree`), since a fresh
+    directory made here, under this process's own temporary directory, sits
+    inside a per-user folder `agents` cannot traverse on macOS however the
+    directory itself is chmoded.
 
     Read with `git show <installed>:<path>`, so neither comes from whatever
     the clone's working tree holds, and never from the target release.
@@ -571,9 +801,12 @@ def extract_verifier(shipwright: Path, installed: str, into: Path) -> Path:
             )
         dest = into / relpath
         dest.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(dest.parent, 0o755)
         dest.write_bytes(shown.stdout)
+        os.chmod(dest, 0o644)
+    os.chmod(into, 0o755)
     verifier = into / VERIFIER
-    verifier.chmod(0o700)
+    verifier.chmod(0o755)
     return verifier
 
 
@@ -697,12 +930,13 @@ def verify_release(src_dir: Path, installed: str, target: str) -> dict[str, str]
 
 
 def plan_steps(shape: str, target: str) -> list[str]:
-    """The plan's steps, in order. `root half on three-account` is this shape's alone."""
+    """The plan's steps, in order. The root-half step belongs to the two- and
+    three-account shapes alone."""
     steps = [
         "record the update: each clone's commit, each deploy stamp, which jobs "
         "install-jobs reports running, and the knowledge repository's main",
     ]
-    if shape == "three":
+    if shape in ("two", "three"):
         steps.append("stand up the root-owned privileged half for the new release")
     steps += [
         f"move shipwright to {target} and hand control to that copy, which moves "
@@ -746,8 +980,43 @@ def install_jobs_argv(src_dir: Path, *args: str) -> list[str]:
             "--jobs", str(shipwright / "jobs"), *args]
 
 
+# `install-jobs --running`'s own contract is one job label per line and
+# nothing else, but it prints two prose notes to that same stdout, ahead of
+# the labels, whenever its install-time bookkeeping runs first: a
+# `--single-account` run dropping an account-only job, and a root run
+# leaving out a user-scope job that names no account. A single-account
+# `--running` always carries at least the first, since the shipped
+# declarations' library-backup and orient-backup are both account-only. Each
+# note is recognised by its fixed opening words and dropped; a line that
+# matches neither a label nor a note fails the read rather than being kept as
+# a label, which is what let one such note reach `install-jobs --start`
+# as a label on a macOS three-account rehearsal and leave the rollback unable
+# to restart anything.
+JOB_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+RUNNING_NOTE_PREFIXES = (
+    "Left out, since this ran as root:",
+    "Left out under --single-account:",
+)
+
+
+def running_labels(stdout: str) -> list[str] | None:
+    """Only the job labels in `stdout`, or None when a line is neither a
+    label nor one of `install-jobs --running`'s two known notes."""
+    labels = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if JOB_LABEL.match(line):
+            labels.append(line)
+        elif not line.startswith(RUNNING_NOTE_PREFIXES):
+            return None
+    return labels
+
+
 def jobs_running(src_dir: Path) -> list[str] | None:
-    """The labels `install-jobs --running` reports, or None when that cannot be asked."""
+    """The labels `install-jobs --running` reports, or None when that cannot
+    be asked, or when its stdout held a line `running_labels` could not place."""
     cmd = src_dir / "shipwright" / "bin" / "install-jobs"
     if not cmd.is_file():
         return None
@@ -755,11 +1024,18 @@ def jobs_running(src_dir: Path) -> list[str] | None:
                             capture_output=True, text=True, check=False)
     if result.returncode != 0:
         return None
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return running_labels(result.stdout)
 
 
 def knowledge_root() -> Path | None:
-    """The knowledge repository, as `builder-backup` finds it: `builder-root`/knowledge."""
+    """The knowledge repository, as `builder-backup` finds it: `builder-root`/knowledge.
+
+    Right only where this process's own account owns the knowledge
+    repository, as the single-account shape's operator does. The
+    three-account shape resolves it with `knowledge_root_as_agents` instead:
+    the repository belongs to `agents`, and the administrator has no
+    `builder-root` on PATH.
+    """
     try:
         found = subprocess.run(["builder-root"], capture_output=True, text=True, check=True)
     except (OSError, subprocess.CalledProcessError):
@@ -768,10 +1044,16 @@ def knowledge_root() -> Path | None:
     return Path(root) / "knowledge" if root else None
 
 
-def knowledge_main(repo: Path | None) -> str | None:
+def knowledge_main(repo: Path | None, as_agents: bool = False) -> str | None:
+    """The knowledge repository's `main`, read as `agents` when `as_agents` —
+    the three-account shape, where the repository belongs to `agents` rather
+    than to whichever account is running this process."""
     if repo is None:
         return None
-    rc, out, _ = git("rev-parse", "--verify", "--quiet", "refs/heads/main", cwd=repo)
+    if as_agents:
+        rc, out, _ = agents_git(repo, "rev-parse", "--verify", "--quiet", "refs/heads/main")
+    else:
+        rc, out, _ = git("rev-parse", "--verify", "--quiet", "refs/heads/main", cwd=repo)
     return out.strip() if rc == 0 else None
 
 
@@ -814,10 +1096,11 @@ def load_record(path: Path) -> dict:
         raise Refused(f"the update record at {path} cannot be read: {exc}") from exc
     if not isinstance(loaded, dict) or not isinstance(loaded.get("clones"), dict):
         raise Refused(f"the update record at {path} is not one this command wrote")
-    if loaded.get("shape") != "single":
+    if loaded.get("shape") not in ("single", "two", "three"):
         raise Refused(
             f"the update record at {path} is for the {loaded.get('shape')!r} shape, and this "
-            f"release updates and rolls back only the single-account shape"
+            f"release updates and rolls back only the single-account, two-account and "
+            f"three-account shapes"
         )
     return loaded
 
@@ -825,7 +1108,8 @@ def load_record(path: Path) -> dict:
 def write_record(
     state_dir: Path, installed: str, target: str, shape: str, clones: dict[str, Clone],
     deploy_root: Path, jobs: list[str] | None, knowledge: Path | None, src_dir: Path,
-    verified: dict[str, str],
+    verified: dict[str, str], deploy_stamps: dict[str, str | None] | None = None,
+    person_save_sources: dict[str, str] | None = None,
 ) -> Path:
     """Write this run's record under its own `<installed>-to-<target>` subdirectory
     of `state_dir` (see `find_unfinished_record`), and return its path.
@@ -833,7 +1117,14 @@ def write_record(
     `state_dir` and the subdirectory are each `chmod`ed 0o700 explicitly:
     `mkdir` applies `mode` only to a directory it creates, never to one that
     already exists, and `parents=True` creates missing parents with the
-    default mode."""
+    default mode.
+
+    `deploy_stamps`, when given, is each STAMPED_REPOS commit already read
+    the way the three-account shape has to read it — as the account that
+    owns the deploy area, never by the administrator directly
+    (`three_account_deploy_stamps`). Left out, each is read from `deploy_root`
+    directly, which is right only where the caller's own account owns every
+    deploy area: the single-account shape."""
     record_dir = state_dir / f"{installed}-to-{target}"
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(state_dir, 0o700)
@@ -854,16 +1145,23 @@ def write_record(
         # The commit verification checked for each repository: what step 3
         # checks out, and all it checks out.
         "target_commits": dict(verified),
-        "deploy_stamps": {
-            name: (read_stamp(deploy_root / name) or {}).get("commit") for name in STAMPED_REPOS
-        },
+        "deploy_stamps": (
+            dict(deploy_stamps) if deploy_stamps is not None
+            else {name: (read_stamp(deploy_root / name) or {}).get("commit") for name in STAMPED_REPOS}
+        ),
         "jobs_running": jobs,
         "knowledge_repo": str(knowledge) if knowledge else None,
-        "knowledge_main": knowledge_main(knowledge),
+        "knowledge_main": knowledge_main(knowledge, as_agents=(shape in ("two", "three"))),
         # The knowledge repository's main once install-payload has run in
         # step 6: the commit the update made, if it made one.
         "knowledge_after_update": None,
         "jobs_started": None,
+        # The operator's own sources for the Library's person-save inputs,
+        # the same three `bin/stand-up-backend` reads: carried across the
+        # hand-off to the new release's own copy of this tool, which is
+        # what actually runs `place-person-save --as-library` with them.
+        # `None` for any not given, which that step then skips cleanly.
+        "person_save_sources": dict(person_save_sources) if person_save_sources else None,
         # Step names, in the order each began changing something.
         "begun": [],
         "undone": [],
@@ -957,8 +1255,13 @@ def preflight_again(record: dict) -> None:
         rc, out, _ = git("rev-parse", "HEAD", cwd=src_dir / name)
         if rc != 0 or out.strip() != record["clones"].get(name):
             raise Refused(f"{name} at {src_dir / name} is no longer at the commit the record names")
+    # On the two- and three-account shapes `deploy_root` is the administrator's
+    # own, empty `default_deploy_root`: each stamp has to be read the same way
+    # the record's own `deploy_stamps` was, as the account that owns it.
+    current_stamps = (three_account_deploy_stamps() if record["shape"] in ("two", "three")
+                      else {name: (read_stamp(deploy_root / name) or {}).get("commit") for name in STAMPED_REPOS})
     for name in STAMPED_REPOS:
-        if (read_stamp(deploy_root / name) or {}).get("commit") != record["deploy_stamps"].get(name):
+        if current_stamps.get(name) != record["deploy_stamps"].get(name):
             raise Refused(f"{name}'s deploy stamp no longer names the commit the record names")
     verify_clones_ready(src_dir, target)
     verified = verify_release(src_dir, installed, target)
@@ -1101,6 +1404,41 @@ def default_jobs(shipwright: Path, commit: str) -> dict[str, bool]:
     return found
 
 
+def jobs_loaded_before_update(sample: Callable[[], list[str] | None],
+                              enabled: list[str]) -> list[str] | None:
+    """Every label `sample` (a `jobs_running`- or `jobs_running_three`-shaped
+    call) reports running within `JOBS_WAIT_SECONDS`, accumulated across
+    retries, or None when `sample` itself never returns one.
+
+    A job the supervisor is restarting on its own can read as not running for
+    one sample and as running moments later — the restart loop
+    `JOBS_WAIT_DEFAULT`'s own comment describes, which on a macOS three-account
+    rehearsal caught Orient between restarts on the ONE sample this used to
+    take before stopping the jobs: the record never listed it, so neither the
+    update nor its rollback ever started it again. Retrying here, against the
+    same deadline `check_release`'s own post-update sample retries against,
+    until every label in `enabled` (the installed release's own
+    enabled-by-default jobs) has been seen running closes that gap. Every
+    label ever seen is kept, not only `enabled`'s own, so a job running for a
+    reason other than being enabled by default is still carried forward, as
+    it always was. The first sample's own order is kept, a label seen only on
+    a later retry appended after it, so a run that never needs to retry
+    records exactly what `sample` reported, in the order it reported it.
+    """
+    deadline = time.monotonic() + JOBS_WAIT_SECONDS
+    found = sample()
+    if found is None:
+        return None
+    seen = list(found)
+    while not all(label in seen for label in enabled) and time.monotonic() < deadline:
+        time.sleep(2)
+        found = sample()
+        if found is None:
+            return None
+        seen += [label for label in found if label not in seen]
+    return seen
+
+
 def jobs_to_start(record: dict) -> list[str]:
     """The jobs that ran before, then each job the target adds that is enabled by default."""
     shipwright = Path(record["src_dir"]) / "shipwright"
@@ -1150,8 +1488,11 @@ def schema_problem(deploy_root: Path) -> str | None:
     except sqlite3.Error as exc:
         return f"cannot read the Library's schema version: {exc}"
     try:
+        # The Library's migration tree loads only with LIBRARY_DB set, as the
+        # job's own environment sets it; without it `heads` exits 1.
         result = subprocess.run([str(library / ".venv" / "bin" / "python"), "-m", "alembic", "heads"],
-                                cwd=str(library), capture_output=True, text=True, check=False)
+                                cwd=str(library), capture_output=True, text=True, check=False,
+                                env={**os.environ, "LIBRARY_DB": str(LIBRARY_STATE / "library.db")})
     except OSError as exc:
         return f"cannot ask the placed Library for its migration heads: {exc}"
     if result.returncode != 0:
@@ -1163,24 +1504,66 @@ def schema_problem(deploy_root: Path) -> str | None:
     return None
 
 
+def run_check_until(argv: list[str], what: str, deadline: float) -> str | None:
+    """Run `argv` (capturing its output) until it exits 0, or `deadline` (a
+    `time.monotonic()` value) has passed; the last failure's message, or None
+    on success.
+
+    The Library is started in step 8, or by the rollback's own restart, and
+    may not be answering yet the first time this runs — the 2026-11-18
+    three-account rehearsal's gap this closes. Retrying within the same
+    deadline the jobs-running loop uses avoids reporting a problem that
+    resolves itself moments later.
+
+    `--check`'s own contract (1 is work left, 2 is a decisive refusal) means
+    only exit 1 is worth retrying: exit 2 fails at once, on the first
+    attempt, since the deadline would otherwise spend itself waiting out a
+    refusal that retrying cannot change.
+    """
+    while True:
+        try:
+            run_step(argv, what, capture=True)
+            return None
+        except StepFailed as exc:
+            if exc.returncode == 2:
+                return str(exc)
+            problem = str(exc)
+        if time.monotonic() >= deadline:
+            return problem
+        time.sleep(2)
+
+
 def check_release(record: dict, release: str, started: list[str], commits: dict[str, str]) -> list[str]:
     """Step 9's four checks against `release`, whose commits are `commits`; each problem found, in words."""
     src_dir = Path(record["src_dir"])
     deploy_root = Path(record["deploy_root"])
     shipwright = src_dir / "shipwright"
     problems = []
-    try:
-        run_step([sys.executable, str(shipwright / "bin" / "stand-up-backend"), "--shape", "single",
-                  "--check"], "stand-up-backend --shape single --check", capture=True)
-    except StepFailed as exc:
-        problems.append(str(exc))
-    running = jobs_running(src_dir)
+    # Checked against `release` by name: with no --release the backend
+    # check compares the deploy areas against origin/stable, the newest
+    # release, so a rollback to an older one always read stale.
+    argv = [sys.executable, str(shipwright / "bin" / "stand-up-backend"), "--shape", "single",
+            "--check", "--release", release]
+    if commits.get(WRITE_BETTER):
+        argv += ["--commit", f"{WRITE_BETTER}={commits[WRITE_BETTER]}"]
+    deadline = time.monotonic() + JOBS_WAIT_SECONDS
+    problem = run_check_until(argv, "stand-up-backend --shape single --check", deadline)
+    if problem:
+        problems.append(problem)
+    while True:
+        running = jobs_running(src_dir)
+        missing = None if running is None else [label for label in started if label not in running]
+        if missing == [] or time.monotonic() >= deadline:
+            break
+        time.sleep(2)
+    if missing == []:
+        time.sleep(JOBS_SETTLE_SECONDS)
+        running = jobs_running(src_dir)
+        missing = None if running is None else [label for label in started if label not in running]
     if running is None:
         problems.append("install-jobs --running could not say which jobs are running")
-    else:
-        missing = [label for label in started if label not in running]
-        if missing:
-            problems.append(f"not running: {', '.join(missing)}")
+    elif missing:
+        problems.append(f"not running: {', '.join(missing)}")
     if LIBRARY_LABEL in started:
         for problem in (library_answers(), schema_problem(deploy_root)):
             if problem:
@@ -1210,12 +1593,25 @@ def prune_snapshots(state_dir: Path, keep: Path) -> None:
 
 
 def continue_update(path: Path) -> int:
-    """The target release's half of an update: preflight again, then steps 3 to 9."""
+    """The target release's half of an update: preflight again, then steps 3 to 9.
+
+    Dispatches on the record's shape: the two- and three-account shapes' own
+    steps 3 to 9 are built together (`continue_update_three`, which takes the
+    two-account path minus the reviewers' half), reusing this record, this
+    preflight-again and this hand-off contract rather than a second copy of them.
+    """
     try:
         record = load_record(path)
     except Refused as exc:
         print(f"{PROG}: refusing — {exc}", file=sys.stderr)
         return 2
+    if record.get("shape") in ("two", "three"):
+        return continue_update_three(path, record)
+    return continue_update_single(path, record)
+
+
+def continue_update_single(path: Path, record: dict) -> int:
+    """The single-account shape's steps 3 to 9."""
     if record.get("finished"):
         print(f"{PROG}: refusing — the update recorded at {path} has already finished", file=sys.stderr)
         return 2
@@ -1315,9 +1711,17 @@ def move_clones_back(record: dict) -> None:
     say(f"every clone is back at the commit the record names")
 
 
-def local_remote(repo: Path) -> bool:
-    """Whether `repo`'s origin is a folder on this machine, as the install makes it."""
-    rc, out, _ = git("remote", "get-url", "origin", cwd=repo)
+def local_remote(repo: Path, as_agents: bool = False) -> bool:
+    """Whether `repo`'s origin is a folder on this machine, as the install makes it.
+
+    Read as `agents` when `as_agents`: on the three-account shape the
+    knowledge repository's local remote sits under `agents`' own home, which
+    the administrator cannot stat directly.
+    """
+    if as_agents:
+        rc, out, _ = agents_git(repo, "remote", "get-url", "origin")
+    else:
+        rc, out, _ = git("remote", "get-url", "origin", cwd=repo)
     url = out.strip()
     if rc != 0 or not url:
         return False
@@ -1325,30 +1729,49 @@ def local_remote(repo: Path) -> bool:
         url = url[len("file://"):]
     elif "://" in url or re.match(r"^[^/]+:", url):
         return False
+    if as_agents:
+        result = subprocess.run([*AS_AGENTS, "test", "-d", url], check=False)
+        return result.returncode == 0
     return Path(url).is_dir()
 
 
 def reset_knowledge(record: dict) -> None:
-    """Reset the knowledge repository's main only when it is still at the commit the update made."""
+    """Reset the knowledge repository's main only when it is still at the commit the update made.
+
+    On the two- and three-account shapes the repository belongs to `agents`,
+    so every git call on it here runs as `agents` (AS_AGENTS) rather than as
+    whichever account is running this process.
+    """
     if not record.get("knowledge_repo") or not record.get("knowledge_main"):
         return
     repo = Path(record["knowledge_repo"])
+    as_agents = record.get("shape") in ("two", "three")
+
+    def repo_git(*args: str) -> tuple[int, str, str]:
+        return agents_git(repo, *args) if as_agents else git(*args, cwd=repo)
+
+    def repo_git_step(*args: str, what: str) -> str:
+        rc, out, err = repo_git(*args)
+        if rc != 0:
+            raise StepFailed(f"{what}: git {' '.join(args)} in {repo} failed: {err.strip()}")
+        return out.strip()
+
     before, made = record["knowledge_main"], record.get("knowledge_after_update")
-    current = knowledge_main(repo)
+    current = knowledge_main(repo, as_agents=as_agents)
     if current == before:
         return
-    if made is not None and current == made and local_remote(repo):
-        rc, out, _ = git("symbolic-ref", "--quiet", "HEAD", cwd=repo)
+    if made is not None and current == made and local_remote(repo, as_agents=as_agents):
+        rc, out, _ = repo_git("symbolic-ref", "--quiet", "HEAD")
         if rc == 0 and out.strip() == "refs/heads/main":
-            git_step("reset", "-q", "--keep", before, cwd=repo, what="resetting the knowledge repository")
+            repo_git_step("reset", "-q", "--keep", before, what="resetting the knowledge repository")
         else:
-            git_step("update-ref", "refs/heads/main", before, made, cwd=repo,
-                     what="resetting the knowledge repository")
-        git_step("push", "-q", f"--force-with-lease=main:{made}", "origin", "main", cwd=repo,
-                 what="pushing the reset knowledge repository to its local remote")
+            repo_git_step("update-ref", "refs/heads/main", before, made,
+                          what="resetting the knowledge repository")
+        repo_git_step("push", "-q", f"--force-with-lease=main:{made}", "origin", "main",
+                      what="pushing the reset knowledge repository to its local remote")
         say(f"reset the knowledge repository's main to {before[:9]}")
         return
-    rc, out, _ = git("diff", "--name-only", before, made or current or before, cwd=repo)
+    rc, out, _ = repo_git("diff", "--name-only", before, made or current or before)
     changed = [line for line in out.splitlines() if line.strip()] if rc == 0 else []
     say(f"left the knowledge repository's main alone: it has moved since the update "
         f"changed it. The documents the update changed:" +
@@ -1356,12 +1779,24 @@ def reset_knowledge(record: dict) -> None:
 
 
 def rollback(path: Path) -> int:
-    """Undo every begun step from the record, then check the old release; 3 when it did, 4 when not."""
+    """Undo every begun step from the record, then check the old release; 3 when it did, 4 when not.
+
+    Dispatches on the record's shape: the two- and three-account shapes' own
+    rollback (`rollback_three`, which takes the two-account path minus the
+    reviewers' half) reuses this record and this load, rather than a second copy.
+    """
     try:
         record = load_record(path)
     except Refused as exc:
         print(f"{PROG}: the rollback cannot start — {exc}", file=sys.stderr)
         return 4
+    if record.get("shape") in ("two", "three"):
+        return rollback_three(path, record)
+    return rollback_single(path, record)
+
+
+def rollback_single(path: Path, record: dict) -> int:
+    """The single-account shape's rollback."""
     src_dir = Path(record["src_dir"])
     old = record["installed_release"]
     begun = set(record["begun"])
@@ -1411,7 +1846,1270 @@ def rollback(path: Path) -> int:
     return 3
 
 
-# --- the command ------------------------------------------------------------
+# --- the two- and three-account shapes ---------------------------------------
+#
+# Each step runs as the account the shapes table names: the administrator's
+# own process never reads or writes a file under `agents`' home directly —
+# every such read or write is a subprocess run as `agents` through `sudo -u`.
+# Root's own steps run the same way, as the root-owned tree's own copy under
+# `sudo`, never this process's own euid (the administrator is never root).
+# SUDO and PRIVILEGED_PREFIX are defined earlier, beside `shape_mismatch`,
+# which needs them too.
+
+AS_AGENTS = [SUDO, "-u", AGENTS_ACCOUNT, "-H"]
+# A world-writable base `agents` can make its own view directory under
+# (`agents_view_dir`, below) — unlike the system's default temporary
+# directory, which on macOS is itself a private directory under the calling
+# account's own home and unreachable to `agents` however the directory made
+# inside it is chmoded.
+AGENTS_VIEW_BASE = "/tmp"
+LIBRARY_ACCOUNT_NAMES = {"darwin": "_library", "linux": "library"}
+ORIENT_ACCOUNT_NAMES = {"darwin": "_orient", "linux": "orient"}
+# The same interpreters `install-privileged` and `stand-up-backend` pin for root.
+ROOT_INTERPRETERS = {"darwin": "/opt/homebrew/bin/python3.11", "linux": "/usr/bin/python3"}
+ROOT_INSTALLED_RECORD = PRIVILEGED_PREFIX / "src" / "installed"
+ROOT_PREVIOUS_RECORD = PRIVILEGED_PREFIX / "src" / "installed.previous"
+ROOT_INSTALL_JSON = PRIVILEGED_PREFIX / "install.json"
+ROOT_JOBS_RECORD = PRIVILEGED_PREFIX / "var" / "install-jobs" / "units.json"
+ROOT_LOG_DIR = PRIVILEGED_PREFIX / "var" / "log"
+ORIENT_DEPLOY_LABEL = "com.convivy.orient-deploy"
+ORIENT_DEPLOY_RECORD = PRIVILEGED_PREFIX / "var" / "install-jobs" / "orient-deploy-units.json"
+ORIENT_DEPLOY_DEPLOYED_FILE = PRIVILEGED_PREFIX / "var" / "orient-deploy" / "deployed"
+KNOWLEDGE_WATCHER_LABEL = "com.convivy.knowledge-watcher"
+RUN_REGISTER_API_LABEL = "com.convivy.run-register-api"
+ORIENT_LABEL = "com.convivy.orient"
+# `bin/install-backend`'s own `PLACEABLE`, minus `"library"`: what the `place`
+# step places on the shapes where `place-library` places the Library
+# separately. Duplicated from `bin/stand-up-backend`'s own constant of the
+# same name and for the same reason — see this file's own note on the deploy
+# stamp format.
+NON_LIBRARY_PLACEABLE = ("agent-platform", "convivy-orient", WRITE_BETTER, "llm-gateway")
+
+
+def root_record_text() -> str | None:
+    try:
+        return ROOT_INSTALLED_RECORD.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def record_commit(text: str | None, name: str) -> str | None:
+    """The commit a root-owned record (`src/installed` or `installed.previous`)
+    names for `name`, reading only a bare `<name> <sha>` line — the same shape
+    `install-privileged`'s own `last_recorded_commit` reads."""
+    if text is None:
+        return None
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0] == name and re.fullmatch(r"[0-9a-f]{40}", fields[1]):
+            return fields[1]
+    return None
+
+
+def record_python(text: str | None) -> str | None:
+    """The version a root-owned record's `python <version> <sha256>` line names,
+    the pinned standalone CPython `install-privileged` extracted under
+    `PRIVILEGED_PREFIX/python/<version>/`. Reads the same line, and only that
+    shape, as `bin/stand-up-backend`'s own `installed_python`."""
+    if text is None:
+        return None
+    for line in text.splitlines():
+        fields = line.split()
+        if (len(fields) == 3 and fields[0] == "python"
+                and re.fullmatch(r"[0-9a-f]{64}", fields[2])):
+            return fields[1]
+    return None
+
+
+def place_interpreters(platform: str = sys.platform) -> tuple[str, str]:
+    """`(agents, library)`: the interpreters step 6 places with, the same two the
+    install's own `stand-up-backend` used, so an update rebuilds each venv with
+    the interpreter that built it.
+
+    **NEVER `sys.executable`.** That is whatever `python3` the administrator's
+    PATH found to start this, and the documented `builder-update` runs through
+    a `#!/usr/bin/env python3` shebang. On a Mac with Homebrew's python@3.11,
+    which links no bare `python3`, that is Apple's 3.9. Rebuilding `agents`'
+    3.11 venv with it fails in `ensurepip`, and so does the rollback's
+    placement of the old release, which leaves every job stopped: measured on
+    a macOS 26 three-account update from 0.99.36 to 0.99.37.
+
+    `agents` gets `root_interpreter()`, which `stand-up-backend` runs under as
+    root and passes to `place` as its own `sys.executable`. The Library gets the
+    same on Linux. On macOS it gets the pinned CPython root's record names,
+    because the Library's `serve.sh` refuses Homebrew's Python (stand-up-backend's
+    `library_python_args`)."""
+    agents = root_interpreter(platform)
+    if platform != "darwin":
+        return agents, agents
+    version = record_python(root_record_text())
+    if version is None:
+        raise Refused(
+            f"{ROOT_INSTALLED_RECORD} names no pinned Python, so there is no interpreter to "
+            f"rebuild the Library's venv with. Run `sudo bin/install-privileged --shape three`, "
+            f"which installs and records one.")
+    return agents, str(PRIVILEGED_PREFIX / "python" / version / "bin" / "python3.11")
+
+
+def root_tree(sha: str) -> Path:
+    return PRIVILEGED_PREFIX / "src" / f"shipwright@{sha}"
+
+
+def root_interpreter(platform: str = sys.platform) -> str:
+    # Overridable for the same reason BUILDER_UPDATE_SUDO is: a test has no
+    # pinned root interpreter to run root's tools under. Unset in every real
+    # install.
+    return os.environ.get("BUILDER_UPDATE_ROOT_INTERPRETER") or \
+        ROOT_INTERPRETERS["darwin" if platform == "darwin" else "linux"]
+
+
+def account_home(name: str) -> str:
+    # Overridable for the same reason BUILDER_UPDATE_SUDO is: a test has no
+    # real `agents`, Library or Orient account to ask the directory service
+    # for. Unset in every real install.
+    fake = os.environ.get("BUILDER_UPDATE_FAKE_HOMES")
+    if fake:
+        mapped = json.loads(fake).get(name)
+        if mapped:
+            return mapped
+    try:
+        return pwd.getpwnam(name).pw_dir
+    except KeyError:
+        raise Refused(f"the {name} account does not exist. Nothing was changed.")
+
+
+def agents_home() -> str:
+    return account_home(AGENTS_ACCOUNT)
+
+
+def agents_src_dir() -> Path:
+    return Path(agents_home()) / "src"
+
+
+def library_account_name() -> str:
+    return LIBRARY_ACCOUNT_NAMES["darwin" if sys.platform == "darwin" else "linux"]
+
+
+def orient_account_name() -> str:
+    return ORIENT_ACCOUNT_NAMES["darwin" if sys.platform == "darwin" else "linux"]
+
+
+def follow_orient_main() -> bool:
+    """Whether this install's settings turn on following Orient's `main` —
+    read directly, since `install.json` is root-owned but world-readable."""
+    try:
+        data = json.loads(ROOT_INSTALL_JSON.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and bool(data.get("follow_orient_main"))
+
+
+def agents_builder_root(home: str) -> str:
+    """The Builder root `agents` runs with, read by `agents` from its own linked
+    command — the same way `bin/stand-up-backend`'s `agents_builder_root` does,
+    because a run as root or as the administrator never executes a program
+    `agents` could have placed."""
+    result = subprocess.run([*AS_AGENTS, f"{home}/.local/bin/builder-root"],
+                            capture_output=True, text=True, check=False)
+    root = result.stdout.strip()
+    if result.returncode != 0 or not root.startswith("/") or "\n" in root:
+        raise Refused("could not read the Builder root from `builder-root` as agents. "
+                      "Nothing was changed.")
+    return root
+
+
+def knowledge_root_as_agents(home: str) -> Path:
+    """The knowledge repository as `agents` resolves it: `agents_builder_root()`/
+    knowledge, read as `agents` because the repository belongs to `agents` and
+    the administrator has no `builder-root` on PATH. Raises Refused (through
+    `agents_builder_root`) when it cannot be resolved, so the three-account
+    preflight refuses rather than recording a null knowledge repository."""
+    return Path(agents_builder_root(home)) / "knowledge"
+
+
+def root_install_jobs_argv(tree: Path, home: str, builder_root: str, *extra: str) -> list[str]:
+    """Root's own `install-jobs` from `tree`, with the flags `stand-up-backend`'s
+    own supervise step passes: `--home`, `--root`, `--jobs`, `--log-dir`, `--record`."""
+    return [SUDO, root_interpreter(), "-I", str(tree / "bin" / "install-jobs"),
+            "--home", home, "--root", builder_root, "--jobs", str(tree / "jobs"),
+            "--log-dir", str(ROOT_LOG_DIR), "--record", str(ROOT_JOBS_RECORD), *extra]
+
+
+def run_root_tool(tree: Path, name: str, what: str, *extra: str) -> None:
+    """Run root's own copy of `name`, from `tree`, under `sudo`."""
+    run_step([SUDO, root_interpreter(), "-I", str(tree / "bin" / name), *extra], what)
+
+
+# Where the Bosun's `install-agent-platform-shared` builds the area, under
+# `agents`' own home — duplicated from `bin/migrate-orient-account`'s and
+# `bin/stand-up-backend`'s own constant of the same name.
+AGENT_PLATFORM_SHARED_REL = Path(".local", "deploy", "agent-platform-shared")
+
+
+def agent_platform_shared_argv(sha: str, agents_home_path: str) -> list[str]:
+    """`agents`-run `install-agent-platform-shared`, from root's own bare copy
+    of agent-platform at `sha` — the commit this update just placed, the same
+    call `bin/stand-up-backend`'s own `agents_agent_platform_shared` builds
+    for a fresh install, and `bin/migrate-orient-account`'s own
+    `install_agent_platform_shared` builds for a migration. `safe.directory`
+    and a `PATH` naming the pinned interpreter's own directory are the same
+    two fixes both of those already carry: git refuses a repository another
+    account owns without the former, and the install's own Python is not on
+    `sudo`'s PATH without the latter.
+
+    Refuses, with `StepFailed`, when `tool` or the bare copy it reads as
+    `--repo` is not trusted as root's alone, the same `ancestry_problem`
+    checks `agent_platform_tool_and_bare` runs before handing either to
+    `agents`. Both are checked here, on every call, because this builds the
+    command for the forward update, the continuation after the hand-off and
+    both rollbacks, including a `--rollback` run long after the update.
+    `check_agent_platform_bare` also checks the bare copy in the preflight,
+    so a forward update refuses before any job stops.
+    """
+    tool = repo_tree("agent-platform", sha) / "bin" / "install-agent-platform-shared"
+    bare = PRIVILEGED_PREFIX / "src" / "agent-platform.git"
+    problem = ancestry_problem(tool, ROOT_UID, ROOT_TOP)
+    if problem:
+        raise StepFailed(f"{tool} is not a copy this may run as {AGENTS_ACCOUNT}: {problem}.")
+    problem = ancestry_problem(bare, ROOT_UID, ROOT_TOP)
+    if problem:
+        raise StepFailed(f"{bare} is not a repository this may install from as "
+                         f"{AGENTS_ACCOUNT}: {problem}.")
+    deploy_dir = Path(agents_home_path) / AGENT_PLATFORM_SHARED_REL
+    path = f"{os.path.dirname(root_interpreter())}:/usr/bin:/bin:/usr/sbin:/sbin"
+    return [*AS_AGENTS, "/usr/bin/env", f"PATH={path}", "GIT_CONFIG_COUNT=1",
+            "GIT_CONFIG_KEY_0=safe.directory", f"GIT_CONFIG_VALUE_0={bare}",
+            str(tool), f"--repo={bare}", f"--ref={sha}", "--allow-non-main",
+            f"--deploy-dir={deploy_dir}"]
+
+
+# --- step 2: the root half, and Orient's deploy pause ------------------------
+
+def move_root_half(record: dict) -> None:
+    """Step 2: root's installed copy of `install-privileged`, told the shape, the
+    target and the four verified commits. Its own swap is atomic, so this is
+    marked begun only once it has actually succeeded — see the call site."""
+    old_sha = record_commit(root_record_text(), "shipwright")
+    if old_sha is None:
+        raise Refused(f"{ROOT_INSTALLED_RECORD} names no shipwright commit; the root half "
+                      f"is not installed. Nothing was changed.")
+    shape = record["shape"]
+    target = record["target_release"]
+    commits = record["target_commits"]
+    argv = [SUDO, root_interpreter(), "-I", str(root_tree(old_sha) / "bin" / "install-privileged"),
+            "--shape", shape, "--release", target]
+    for name in TAGGED_CLONES[:4]:  # shipwright, agent-platform, library, convivy-orient
+        argv += ["--commit", f"{name}={commits[name]}"]
+    run_step(argv, f"install-privileged --shape {shape} --release {target}, moving the root half")
+
+
+def restore_root_half(shape: str) -> None:
+    """Undo step 2: the old shipwright tree's own `install-privileged --restore-previous`,
+    run from the tree `src/installed.previous` names — never the update record."""
+    sha = record_commit(
+        ROOT_PREVIOUS_RECORD.read_text(encoding="utf-8") if ROOT_PREVIOUS_RECORD.is_file() else None,
+        "shipwright")
+    if sha is None:
+        raise StepFailed(f"{ROOT_PREVIOUS_RECORD} names no shipwright commit; cannot restore "
+                         f"the root half")
+    argv = [SUDO, root_interpreter(), "-I", str(root_tree(sha) / "bin" / "install-privileged"),
+            "--shape", shape, "--restore-previous"]
+    run_step(argv, f"install-privileged --shape {shape} --restore-previous, restoring the root half")
+
+
+def orient_deploy_jobs_argv(tree: Path, *extra: str) -> list[str]:
+    return [SUDO, root_interpreter(), "-I", str(tree / "bin" / "install-jobs"),
+            "--jobs", str(tree / "jobs" / "follow-orient-main"),
+            "--record", str(ORIENT_DEPLOY_RECORD), *extra]
+
+
+def pause_orient_deploy(old_tree: Path) -> None:
+    """Stop `com.convivy.orient-deploy` by label, before step 2 moves the entry
+    point it runs — only on an install that follows Orient's `main`."""
+    if follow_orient_main():
+        run_step(orient_deploy_jobs_argv(old_tree, "--stop", ORIENT_DEPLOY_LABEL),
+                 "install-jobs --stop, pausing Orient's deploy job")
+
+
+def resume_orient_deploy(tree: Path) -> None:
+    if follow_orient_main():
+        run_step(orient_deploy_jobs_argv(tree, "--start", ORIENT_DEPLOY_LABEL),
+                 "install-jobs --start, resuming Orient's deploy job")
+
+
+# --- step 3 (agents' half): moving agents' own clones ------------------------
+
+def agents_git(repo: Path, *args: str) -> tuple[int, str, str]:
+    """`git` run as `agents`, against a repository `agents` owns throughout
+    — the administrator is never the owner of any path a git call here
+    reads, so none of these calls needs a `safe.directory` exception."""
+    result = subprocess.run([*AS_AGENTS, "git", "-C", str(repo), *args],
+                            capture_output=True, text=True, check=False)
+    return result.returncode, result.stdout, result.stderr
+
+
+def agents_tag_commit(repo: Path, tag: str) -> str | None:
+    rc, out, _ = agents_git(repo, "rev-parse", "--verify", "--quiet", f"refs/tags/{tag}^{{commit}}")
+    return out.strip() if rc == 0 else None
+
+
+def move_agents_clones(record: dict) -> None:
+    """The administrator's own clones (`move_clones`) carry the preflight; this
+    moves `agents`' own clones the same way, as `agents`, since `place` and the
+    steps after it read from there, never from the administrator's checkouts."""
+    src_dir = agents_src_dir()
+    target = record["target_release"]
+    for name in TAGGED_CLONES:
+        rc, _, err = agents_git(src_dir / name, "checkout", "-q", "--detach", record["target_commits"][name])
+        if rc != 0:
+            raise StepFailed(f"moving {name} as agents failed: {err.strip()}")
+    rc, _, err = agents_git(src_dir / WRITE_BETTER, "merge", "-q", "--ff-only",
+                            record["target_commits"][WRITE_BETTER])
+    if rc != 0:
+        raise StepFailed(f"moving {WRITE_BETTER}'s main as agents failed: {err.strip()}")
+
+
+def move_agents_clones_back(record: dict) -> None:
+    src_dir = agents_src_dir()
+    for name in TAGGED_CLONES:
+        rc, _, err = agents_git(src_dir / name, "checkout", "-q", "--detach", record["clones"][name])
+        if rc != 0:
+            raise StepFailed(f"moving {name} back as agents failed: {err.strip()}")
+    rc, _, err = agents_git(src_dir / WRITE_BETTER, "reset", "-q", "--keep", record["clones"][WRITE_BETTER])
+    if rc != 0:
+        raise StepFailed(f"moving {WRITE_BETTER}'s main back as agents failed: {err.strip()}")
+
+
+def fetch_agents_tags() -> None:
+    """`fetch_tags`, over `agents`' own clones, as `agents`."""
+    src_dir = agents_src_dir()
+    for name in TAGGED_CLONES:
+        rc, _, err = agents_git(src_dir / name, "fetch", "--tags", "origin")
+        if rc != 0:
+            raise Refused(f"git fetch --tags origin failed in {src_dir / name} (as agents): {err.strip()}")
+    path = src_dir / WRITE_BETTER
+    rc, _, err = agents_git(path, "fetch", "origin", "main")
+    if rc != 0:
+        raise Refused(f"git fetch origin main failed in {path} (as agents): {err.strip()}")
+
+
+def verify_agents_clones_ready(target: str) -> None:
+    """`verify_clones_ready`, over `agents`' own clones, read as `agents`."""
+    src_dir = agents_src_dir()
+    problems = []
+    for name in TAGGED_CLONES + (WRITE_BETTER,):
+        path = src_dir / name
+        if name == WRITE_BETTER:
+            rc, out, _ = agents_git(path, "symbolic-ref", "--quiet", "HEAD")
+            if rc != 0 or out.strip() != "refs/heads/main":
+                problems.append(f"{name}: is not checked out at main at {path} (as agents)")
+                continue
+        elif agents_tag_commit(path, target) is None:
+            problems.append(f"{name}: no tag {target} at {path} (as agents)")
+            continue
+        rc, out, err = agents_git(path, "status", "--porcelain", "--untracked-files=no")
+        if rc != 0:
+            problems.append(f"{name}: could not read its status at {path} as agents ({err.strip()})")
+        elif out.strip():
+            problems.append(f"{name}: has uncommitted changes to tracked files at {path} (as agents)")
+    if problems:
+        raise Refused(f"not every agents clone is ready for {target}:\n"
+                      + "\n".join(f"  {p}" for p in problems))
+
+
+def agents_view_dir() -> Path:
+    """A fresh directory `agents` makes and owns outright, for
+    `target_view_agents` to build its clones under.
+
+    Made as `agents`, under `AGENTS_VIEW_BASE` (`/tmp`, sticky, world-writable)
+    rather than this process's own default temporary directory: on macOS
+    that default is itself a private directory under the administrator's own
+    home, unreachable to `agents` whatever this directory's mode. `mktemp`
+    run as `agents` leaves the result at `agents`' own default mode,
+    owner-only, so nothing under it is ever readable or writable by anyone
+    but `agents` — unlike the administrator pre-creating the directory,
+    which needed a window of relaxed permissions for `agents` to clone into.
+    """
+    template = f"{AGENTS_VIEW_BASE}/.builder-update-agents-view.XXXXXXXX"
+    result = subprocess.run([*AS_AGENTS, "mktemp", "-d", template],
+                            capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise Refused(f"could not make a view directory as agents: {result.stderr.strip()}")
+    return Path(result.stdout.strip())
+
+
+def target_view_agents(target: str, write_better_commit: str, into: Path) -> dict[str, str]:
+    """`target_view`, over `agents`' own clones, built by `agents` throughout:
+    `into` is `agents_view_dir`'s own directory, made and owned by `agents`,
+    so every clone made under it — `update-ref` included — is `agents`' own
+    too. Ownership never crosses accounts anywhere in this view, so unlike
+    `target_view`'s administrator-owned destination, no `safe.directory`
+    exception is needed for any of it.
+    """
+    src_dir = agents_src_dir()
+    commits: dict[str, str] = {}
+    for name in TAGGED_CLONES + (WRITE_BETTER,):
+        clone = src_dir / name
+        commit = write_better_commit if name == WRITE_BETTER else agents_tag_commit(clone, target)
+        if not commit:
+            raise Refused(f"could not find the commit {name} would move to at {clone} (as agents)")
+        dest = into / name
+        done = subprocess.run(
+            [*AS_AGENTS, "git", "clone", "-q", "--shared", "--no-checkout", str(clone), str(dest)],
+            capture_output=True, text=True, check=False,
+        )
+        if done.returncode != 0:
+            raise Refused(f"could not stage {name} at {commit[:9]} for verification (as agents): "
+                          f"{done.stderr.strip()}")
+        rc, _, err = agents_git(dest, "update-ref", "--no-deref", "HEAD", commit)
+        if rc != 0:
+            raise Refused(f"could not stage {name} at {commit[:9]} for verification (as agents): {err.strip()}")
+        commits[name] = commit
+    return commits
+
+
+def agents_verifier(old_tree: Path) -> Path:
+    """The verifier `agents` will run: the installed release's own root-owned
+    tree at `old_tree` (`root_tree`, the same tree every other root step
+    locates that way), never a fresh extraction. `install-privileged` placed
+    that tree with `git archive`, world-readable and owned by root, so it
+    already carries the installed release's `bin/builder-install` and
+    `release-signers` at the same commit `extract_verifier` would read via
+    `git show` — and, unlike a directory made under this process's own
+    temporary directory, it sits under a world-traversable prefix (`/opt/builder`
+    and its ancestors), not inside a per-user folder `agents` cannot enter.
+
+    Confirms both files are there and that neither is writable by group or
+    other, so `agents` can read what the administrator wrote and nothing else.
+    """
+    verifier = old_tree / VERIFIER
+    for relpath in (VERIFIER, TRUST_LIST):
+        path = old_tree / relpath
+        try:
+            mode = path.stat().st_mode
+        except OSError as exc:
+            raise Refused(
+                f"release verification is not installed: the installed release's own "
+                f"tree at {old_tree} carries no {relpath}"
+            ) from exc
+        if mode & 0o022:
+            raise Refused(f"refusing to run {relpath} as agents: {path} is writable by group or other")
+    return verifier
+
+
+def verify_release_agents(old_tree: Path, installed: str, target: str, write_better_commit: str) -> dict[str, str]:
+    """`verify_release`, but over `agents`' own clones and run as `agents`
+    throughout — the verifier itself (`sh`), not only the git calls inside
+    it, so the administrator never executes anything that targets a path
+    under `agents`' view, and never grants that view a `safe.directory`
+    exception into the administrator's own git. The verifier and trust list
+    are the installed release's own root-owned tree at `old_tree`
+    (`agents_verifier`), and `write_better_commit` is the one the
+    administrator's own `verify_release` already resolved and checked, never
+    re-read here.
+
+    `verified`, the commits this returns, is `agents`' own account of what it
+    verified: `agents` built the view and ran the check, so this is never
+    trusted on its own. `preflight_three` is what makes it trustworthy, by
+    refusing unless it matches the administrator's own independent
+    `verify_release` over the administrator's own clones — a decisive check
+    `agents` cannot influence, since `agents` never sees it run.
+    """
+    view_dir = agents_view_dir()
+    try:
+        verifier = agents_verifier(old_tree)
+        verified = target_view_agents(target, write_better_commit, view_dir)
+        result = subprocess.run(
+            [*AS_AGENTS, "sh", str(verifier), "--verify", target, "--src-dir", str(view_dir)],
+            capture_output=True, text=True, check=False,
+        )
+    finally:
+        subprocess.run([*AS_AGENTS, "rm", "-rf", str(view_dir)], check=False)
+    if result.stdout:
+        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+    if result.stderr:
+        print(result.stderr, end="" if result.stderr.endswith("\n") else "\n", file=sys.stderr)
+    if result.returncode != 0:
+        raise Refused(
+            f"release verification over agents' own clones failed for {target} (exit "
+            f"{result.returncode}), checked by the verifier and trust list of the installed "
+            f"release {installed}."
+        )
+    return verified
+
+
+# --- step 6: place -----------------------------------------------------------
+
+def place_three(agents_src: Path, root_tree_path: Path, release: str, commits: dict[str, str],
+                library_tree: Path, orient_tree: Path, *, rolling_back: bool = False) -> None:
+    """Step 6, in `stand-up-backend`'s own order: install-payload and `place`
+    (agents), `hand-library-inputs` (root), `place-library` (the Library's own
+    account), `place-orient` (root), `install-agent-platform-shared` (agents),
+    `install-document-service` (root), `make-orient-statement-key` (root),
+    `link` and `register` (agents). Each
+    runs under, and builds its venv with, the interpreter `place_interpreters`
+    names.
+
+    `rolling_back` is set when this places the old release again. A release
+    from before `install-document-service` or `make-orient-statement-key`
+    existed has no copy of it in its tree, so the rollback skips that step
+    there rather than failing on a tool the old release never shipped; the
+    forward placement always requires both."""
+    bin_dir = agents_src / "shipwright" / "bin"
+    python_interpreter, library_python = place_interpreters()
+    run_step([*AS_AGENTS, "sh", "-c", 'cd / && exec sh "$0" "$@"', str(bin_dir / "install-payload"),
+              f"--ref={release}", f"--expect-commit={commits['shipwright']}"],
+             f"install-payload at {release}, as agents")
+    expect = [arg for name in ("agent-platform", "convivy-orient", WRITE_BETTER) if name in commits
+              for arg in ("--expect-commit", f"{name}={commits[name]}")]
+    only = [arg for name in NON_LIBRARY_PLACEABLE for arg in ("--only", name)]
+    run_step([*AS_AGENTS, python_interpreter, str(bin_dir / "install-backend"),
+              "--release", release, "--seed-registry", "--from", str(agents_src),
+              "--python", python_interpreter, *only,
+              "--commit", f"{WRITE_BETTER}={commits[WRITE_BETTER]}", *expect],
+             f"install-backend at {release}, as agents")
+    run_root_tool(root_tree_path, "hand-library-inputs", "hand-library-inputs, as root")
+    library_argv = [SUDO, "-u", library_account_name(), "-H", python_interpreter,
+                    str(root_tree_path / "bin" / "install-backend"), "--only", "library",
+                    "--from-tree", f"library={library_tree}",
+                    "--expect-commit", f"library={commits['library']}",
+                    "--python", library_python]
+    run_step(library_argv, f"install-backend --only library at {release}, as the Library's account")
+    run_root_tool(root_tree_path, "place-orient", "place-orient, as root")
+    if "agent-platform" in commits:
+        run_step(agent_platform_shared_argv(commits["agent-platform"], agents_home()),
+                 "install-agent-platform-shared, as agents")
+        if rolling_back and not (root_tree_path / "bin" / "install-document-service").is_file():
+            say(f"{release} has no install-document-service, so the document service the "
+                f"update installed is left in place")
+        else:
+            run_root_tool(root_tree_path, "install-document-service", "install-document-service, as root")
+    # An install from before `make-orient-statement-key` existed has no Orient statement key,
+    # and step 9's `stand-up-backend --check` fails without one, so the update makes it here.
+    # The tool leaves an existing key alone. The administrator who runs this update is the
+    # operator whose kb-verifier.json carries the key's public half.
+    if rolling_back and not (root_tree_path / "bin" / "make-orient-statement-key").is_file():
+        say(f"{release} has no make-orient-statement-key, so Orient's statement key the "
+            f"update made is left in place")
+    else:
+        run_root_tool(root_tree_path, "make-orient-statement-key", "make-orient-statement-key, as root",
+                      "--operator", pwd.getpwuid(os.getuid()).pw_name)
+    run_step([*AS_AGENTS, python_interpreter, str(bin_dir / "link-commands")], "link-commands, as agents")
+    run_step([*AS_AGENTS, python_interpreter, str(bin_dir / "register-mcp")], "register-mcp, as agents")
+
+
+def repo_tree(name: str, sha: str) -> Path:
+    return PRIVILEGED_PREFIX / "src" / f"{name}@{sha}"
+
+
+# --- steps 4, 7 and 8: stopping, rendering and restarting the jobs -----------
+
+def stop_jobs_three(tree: Path, home: str, builder_root: str) -> None:
+    run_step(root_install_jobs_argv(tree, home, builder_root, "--stop"), "install-jobs --stop, as root")
+
+
+def render_jobs_three(tree: Path, home: str, builder_root: str) -> None:
+    run_step(root_install_jobs_argv(tree, home, builder_root),
+             "install-jobs, re-rendering the jobs and running their prepare steps, as root")
+
+
+def start_jobs_three(tree: Path, home: str, builder_root: str, labels: list[str]) -> None:
+    if labels:
+        run_step(root_install_jobs_argv(tree, home, builder_root, "--start", *labels),
+                 "install-jobs --start, as root")
+
+
+def jobs_running_three(tree: Path, home: str, builder_root: str) -> list[str] | None:
+    """The labels `install-jobs --running` reports as root, or None when that
+    cannot be asked, or when its stdout held a line `running_labels` could
+    not place — root's own run always leaves out a user-scope job that names
+    no account, which is one of the two notes that reads."""
+    result = subprocess.run(root_install_jobs_argv(tree, home, builder_root, "--running"),
+                            capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        return None
+    return running_labels(result.stdout)
+
+
+# --- step 5, and its restore: the three-part snapshot ------------------------
+
+def update_dirname(record: dict) -> str:
+    return f"{record['installed_release']}-to-{record['target_release']}"
+
+
+def snapshot_path_three(home: str, record: dict) -> Path:
+    return Path(home) / ".local" / "state" / "builder-update" / update_dirname(record) / "snapshot"
+
+
+def take_snapshot_three(record: dict) -> None:
+    """Step 5, as three runs: `agents`, the Library's own account and Orient's
+    own account, each into its own home, each with that account's own copy of
+    `builder-backup`.
+
+    **RUN UNDER `root_interpreter()`, NEVER THROUGH THE SCRIPT'S OWN SHEBANG.**
+    `sudo -u <account> -H` resets PATH to `/usr/bin:/bin:/usr/sbin:/sbin`, so
+    `#!/usr/bin/env python3` finds whatever `python3` that PATH holds — on
+    macOS, Apple's 3.9, whose SQLite build cannot open a WAL-mode database
+    read-only once a clean stop has removed its `-wal`/`-shm` files. That
+    failed every three-account update on macOS. `root_interpreter()` is the
+    same interpreter `install-jobs` resolves `{python}` to for these three
+    job declarations (`jobs/builder-backup.toml`, `jobs/library-backup.toml`,
+    `jobs/orient-backup.toml`): `root_install_jobs_argv` runs `install-jobs`
+    itself as `sudo root_interpreter() -I ...` with no `--python` override, so
+    `sys.executable` inside that run, which `Machine.for_home` falls back to,
+    is `root_interpreter()`. None of `agents`, the Library's account or
+    Orient's account can write to it."""
+    home = agents_home()
+    dest = snapshot_path_three(home, record)
+    argv = [*AS_AGENTS, root_interpreter(), f"{home}/.local/bin/builder-backup", "--dest", str(dest),
+            "--skip-library", "--skip-orient"]
+    if record.get("knowledge_repo"):
+        argv += ["--knowledge", record["knowledge_repo"]]
+    run_step(argv, "builder-backup, as agents")
+
+    lib_account, lib_home = library_account_name(), account_home(library_account_name())
+    run_step([SUDO, "-u", lib_account, "-H", root_interpreter(), f"{lib_home}/.local/bin/builder-backup",
+              "--dest", str(snapshot_path_three(lib_home, record)), "--library-only"],
+             "builder-backup, as the Library's account")
+
+    orient_account, orient_home = orient_account_name(), account_home(orient_account_name())
+    run_step([SUDO, "-u", orient_account, "-H", root_interpreter(), f"{orient_home}/.local/bin/builder-backup",
+              "--dest", str(snapshot_path_three(orient_home, record)), "--orient-only"],
+             "builder-backup, as Orient's account")
+    for owner, snap_home in (("agents", home), (lib_account, lib_home), (orient_account, orient_home)):
+        manifest = subprocess.run(
+            [SUDO, "-u", owner, "-H", "test", "-f",
+             str(snapshot_path_three(snap_home, record) / "latest" / "manifest.json")],
+            check=False,
+        )
+        if manifest.returncode != 0:
+            raise StepFailed(f"builder-backup exited 0 and left no snapshot at "
+                             f"{snapshot_path_three(snap_home, record)} (as {owner})")
+
+
+def file_exists_as(account: str, path: Path) -> bool:
+    """Whether `path` is a file, asked as `account`. **Never `path.is_file()`** as
+    the administrator: under another account's home that raises EACCES, which
+    failed a macOS 26 rollback's restore of the Library's snapshot."""
+    return subprocess.run([SUDO, "-u", account, "-H", "test", "-f", str(path)],
+                          cwd="/", check=False).returncode == 0
+
+
+def copy_as(account: str, source: Path, dest: Path) -> None:
+    run_step([SUDO, "-u", account, "-H", "cp", str(source), str(dest)],
+             f"restoring {dest.name}, as {account}")
+
+
+def remove_as(account: str, *paths: Path) -> None:
+    for path in paths:
+        subprocess.run([SUDO, "-u", account, "-H", "rm", "-f", str(path)], check=False)
+
+
+def restore_databases_three(record: dict) -> None:
+    """Undo step 7: the snapshot's three databases back, as the account that owns
+    each, read from each account's own fixed path — never from the record — and
+    `vectors.db` deleted, as the single-account restore does."""
+    lib_account, lib_home = library_account_name(), account_home(library_account_name())
+    lib_latest = snapshot_path_three(lib_home, record) / "latest"
+    library_state = Path(lib_home) / ".local" / "state" / "library"
+    for name in ("library.db", "cold.db"):
+        if not file_exists_as(lib_account, lib_latest / name):
+            raise StepFailed(f"the Library's snapshot at {lib_latest} holds no {name}")
+    for name, dest in (("library.db", library_state / "library.db"), ("cold.db", library_state / "cold.db")):
+        copy_as(lib_account, lib_latest / name, dest)
+        remove_as(lib_account, Path(f"{dest}-wal"), Path(f"{dest}-shm"))
+    vectors = library_state / "vectors.db"
+    remove_as(lib_account, vectors, Path(f"{vectors}-wal"), Path(f"{vectors}-shm"))
+    say(f"deleted {vectors}; init_vectors.py and a reindex rebuild it")
+
+    orient_account, orient_home = orient_account_name(), account_home(orient_account_name())
+    orient_latest = snapshot_path_three(orient_home, record) / "latest"
+    orient_db = Path(orient_home) / ".orient-control" / "control.db"
+    source = orient_latest / "orient-control.db"
+    if not file_exists_as(orient_account, source):
+        raise StepFailed(f"Orient's snapshot at {orient_latest} holds no orient-control.db")
+    copy_as(orient_account, source, orient_db)
+    remove_as(orient_account, Path(f"{orient_db}-wal"), Path(f"{orient_db}-shm"))
+    say(f"restored {orient_db} from the snapshot")
+
+
+# --- step 9's per-service check ----------------------------------------------
+
+def read_stamp_as(account: str, home: str, repo_name: str) -> dict | None:
+    """`read_stamp`, read as `account`: its deploy area is under its own home,
+    which the administrator or root cannot open directly."""
+    path = Path(home) / ".local" / "deploy" / repo_name / STAMP
+    result = subprocess.run([SUDO, "-u", account, "-H", "cat", str(path)],
+                            capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        return None
+    try:
+        loaded = json.loads(result.stdout)
+    except ValueError:
+        return {"unreadable": True}
+    if not isinstance(loaded, dict) or not isinstance(loaded.get("commit"), str):
+        return {"unreadable": True}
+    return loaded
+
+
+def read_orient_serving_commit(account: str, home: str) -> str | None:
+    """`orient-serving-commit`, read as Orient's account: `{home}/.orient-control/
+    orient-serving-commit`, the same place `bin/orient-deploy`'s own
+    `SERVING_MARKER` writes it, and unreadable directly by the administrator."""
+    path = Path(home) / ".orient-control" / "orient-serving-commit"
+    result = subprocess.run([SUDO, "-u", account, "-H", "cat", str(path)],
+                            capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def process_start_time(label: str) -> datetime | None:
+    """When `label`'s process started, read from launchd or systemd; None when
+    it cannot be read. `platform` is read from this process's own `sys.platform`,
+    since step 9 always runs on the machine it checks."""
+    if sys.platform == "darwin":
+        printed = subprocess.run(["launchctl", "print", f"system/{label}"],
+                                 capture_output=True, text=True, check=False)
+        if printed.returncode != 0:
+            return None
+        pid = None
+        for line in printed.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("pid = "):
+                pid = line[len("pid = "):].strip()
+        if not pid or not pid.isdigit():
+            return None
+        shown = subprocess.run(["ps", "-o", "lstart=", "-p", pid], capture_output=True, text=True, check=False)
+        if shown.returncode != 0 or not shown.stdout.strip():
+            return None
+        try:
+            # `ps -o lstart=` prints in the local timezone, never UTC; a naive
+            # datetime's own `astimezone()` is defined to assume the system's
+            # local zone, so this converts rather than mislabels it.
+            return datetime.strptime(shown.stdout.strip(), "%a %b %d %H:%M:%S %Y").astimezone(timezone.utc)
+        except ValueError:
+            return None
+    shown = subprocess.run(["systemctl", "show", "-p", "ExecMainStartTimestamp", f"{label}.service"],
+                          capture_output=True, text=True, check=False)
+    if shown.returncode != 0:
+        return None
+    line = shown.stdout.strip()
+    if not line.startswith("ExecMainStartTimestamp="):
+        return None
+    value = line[len("ExecMainStartTimestamp="):].strip()
+    if not value:
+        return None
+    try:
+        # systemd reports in the system's local timezone, exactly like `ps`'s
+        # `lstart` above; `strptime`'s `%Z` consumes the name but never attaches
+        # it as `tzinfo`, so the naive result's own `astimezone()` converts from
+        # that same local-zone assumption rather than mislabelling it.
+        return datetime.strptime(value, "%a %Y-%m-%d %H:%M:%S %Z").astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def orient_expected_commit(record: dict, commits: dict[str, str]) -> str | None:
+    """The commit Orient's deploy stamp must name: the target's own commit, or,
+    on an install that follows Orient's `main`, the one the deploy step itself
+    deployed — read from root's own state, since the release's own commit is
+    never what is serving there."""
+    if follow_orient_main():
+        try:
+            return ORIENT_DEPLOY_DEPLOYED_FILE.read_text(encoding="utf-8").strip() or None
+        except OSError:
+            return None
+    return commits.get("convivy-orient")
+
+
+def service_check(label: str, account: str, home: str, repo_name: str, expected_commit: str | None,
+                  placed_after: datetime | None, *, orient_serving: bool = False) -> str | None:
+    """None when `label`, run as `account`, serves `expected_commit` and its
+    process started after `placed_after` (when step 6 finished placing the new
+    code) — the per-service check the 2026-11-18 rehearsal's gap asks for.
+
+    `orient_serving` is True only for Orient's row: Orient's deploy stamp
+    names the target's convivy-orient commit, but that is the commit placed
+    on disk, not what the running server has loaded, so `orient-serving-
+    commit` must also name `expected_commit`.
+
+    `placed_after` is None when nothing was placed for this run (a rollback
+    that failed before step 6 ever ran): the restart-after-placement timing is
+    then not demanded, but the process still has to be running for this to
+    pass."""
+    if expected_commit is None:
+        return f"{label}: no expected commit to check its deploy stamp against"
+    stamp = read_stamp_as(account, home, repo_name)
+    have = (stamp or {}).get("commit")
+    if stamp is None or stamp.get("unreadable") or have != expected_commit:
+        return (f"{label}'s deploy stamp (as {account}) names {str(have)[:9]}, not "
+               f"{expected_commit[:9]}")
+    if orient_serving:
+        serving = read_orient_serving_commit(account, home)
+        if serving != expected_commit:
+            return (f"{label}'s orient-serving-commit (as {account}) names "
+                   f"{str(serving)[:9]}, not {expected_commit[:9]}")
+    started = process_start_time(label)
+    if started is None:
+        return f"{label}'s process start time could not be read"
+    # `ps` and systemd report a process's start time to the second; floored
+    # to match, so a process started in the same second placement finished is
+    # not misread as having started before it.
+    if placed_after is not None and started < placed_after.replace(microsecond=0):
+        return (f"{label} started at {started.isoformat()}, before step 6 finished placing "
+               f"the new code at {placed_after.isoformat()}")
+    return None
+
+
+def check_release_three(record: dict, release: str, tree: Path, started: list[str],
+                        commits: dict[str, str], placed_after: datetime | None) -> list[str]:
+    """Step 9, on the two- and three-account installs: `stand-up-backend --check`,
+    every job started in step 8 running (read through root's own `tree`, the
+    one that ran install-jobs for this release), and the per-service check for
+    the Library, knowledge-watcher, run-register-api and Orient's server.
+
+    `placed_after` is None when a rollback never reached placement: the
+    per-service check then still confirms each service is running, but does
+    not demand that it restarted, since nothing was placed for it to restart
+    onto.
+
+    **RUNS ROOT'S OWN COPY, FROM `tree`, NEVER `agents`' CLONE.** `agents` owns
+    and can rewrite its own checkout, so the administrator — who runs this —
+    must never execute a file under `agents`' home; `tree` is the root-owned
+    extraction `install-privileged` made. The top-level process itself runs as
+    the administrator, exactly as a person running `stand-up-backend --check`
+    would: every step that needs root or `agents` escalates to it internally
+    (`runs_as`/`launch`), so this needs no `sudo` of its own. `--from` still
+    names `agents`' own clone, which is sound because `place`'s own `--check`
+    only reads it (a `git` call), run as `agents` through that internal
+    escalation, never executed by the administrator directly."""
+    shape = record["shape"]
+    problems = []
+    argv = [sys.executable, str(tree / "bin" / "stand-up-backend"),
+            "--shape", shape, "--check", "--release", release, "--from", str(agents_src_dir())]
+    deadline = time.monotonic() + JOBS_WAIT_SECONDS
+    problem = run_check_until(argv, f"stand-up-backend --shape {shape} --check", deadline)
+    if problem:
+        problems.append(problem)
+
+    home = agents_home()
+    builder_root = agents_builder_root(home)
+    while True:
+        running = jobs_running_three(tree, home, builder_root)
+        missing = None if running is None else [label for label in started if label not in running]
+        if missing == [] or time.monotonic() >= deadline:
+            break
+        time.sleep(2)
+    if missing == []:
+        time.sleep(JOBS_SETTLE_SECONDS)
+        running = jobs_running_three(tree, home, builder_root)
+        missing = None if running is None else [label for label in started if label not in running]
+    if running is None:
+        problems.append("install-jobs --running could not say which jobs are running")
+    elif missing:
+        problems.append(f"not running: {', '.join(missing)}")
+
+    orient_expected = orient_expected_commit(record, commits)
+    checks = [
+        (LIBRARY_LABEL, library_account_name(), account_home(library_account_name()), "library",
+         commits.get("library"), False),
+        (KNOWLEDGE_WATCHER_LABEL, AGENTS_ACCOUNT, home, "agent-platform", commits.get("agent-platform"),
+         False),
+        (RUN_REGISTER_API_LABEL, AGENTS_ACCOUNT, home, "agent-platform", commits.get("agent-platform"),
+         False),
+        (ORIENT_LABEL, orient_account_name(), account_home(orient_account_name()), "convivy-orient",
+         orient_expected, True),
+    ]
+    for label, account, acc_home, repo_name, expected, orient_serving in checks:
+        problem = service_check(label, account, acc_home, repo_name, expected, placed_after,
+                                orient_serving=orient_serving)
+        if problem:
+            problems.append(problem)
+    return problems
+
+
+# --- the two- and three-account preflight's own additions --------------------
+
+def check_migration_pending(tool_name: str, old_tree: Path, shape: str) -> None:
+    """Refuse when `migrate-library-account` or `migrate-orient-account`'s own
+    `--check`, run as root from `old_tree`, reports pending work: the Library
+    or Orient still runs as `agents`, and that move stays with the migration."""
+    argv = [SUDO, root_interpreter(), "-I", str(old_tree / "bin" / tool_name), "--shape", shape, "--check"]
+    result = subprocess.run(argv, capture_output=True, text=True, check=False)
+    if result.returncode == 1:
+        raise Refused(f"{tool_name} reports its migration is still pending. Run it before "
+                      f"updating: {result.stdout.strip() or result.stderr.strip()}")
+    if result.returncode != 0:
+        raise Refused(f"{tool_name} --check exited {result.returncode}: {result.stderr.strip()}")
+
+
+def check_restore_previous_supported(old_tree: Path) -> None:
+    """Refuse when the installed release's own `install-privileged` lacks
+    `--restore-previous` — the first three-account install that can update is
+    one on the release that carries it."""
+    tool = old_tree / "bin" / "install-privileged"
+    try:
+        text = tool.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise Refused(f"could not read {tool}: {exc}. Nothing was changed.")
+    if "--restore-previous" not in text:
+        raise Refused(f"the installed release's {tool} has no --restore-previous, so a failed "
+                      f"update could not put the root half back. Nothing was changed.")
+
+
+def check_agent_platform_bare() -> None:
+    """Refuse when root's own bare copy of agent-platform
+    (`PRIVILEGED_PREFIX / "src" / "agent-platform.git"`) is not trusted as
+    root's alone, before `place_three` ever hands it to `agents` as `--repo`
+    through `sudo` — the same check `bin/migrate-orient-account`'s own
+    `install_agent_platform_shared` and `bin/stand-up-backend`'s own
+    `agent_platform_tool_and_bare` already carry for the identical
+    operation. Run here, from the preflight, so a bad bare copy is refused
+    before any job stops or any record is written, rather than triggering a
+    rollback mid-update."""
+    bare = PRIVILEGED_PREFIX / "src" / "agent-platform.git"
+    problem = ancestry_problem(bare, ROOT_UID, ROOT_TOP)
+    if problem:
+        raise Refused(f"{bare} is not a repository this may install from as {AGENTS_ACCOUNT}: "
+                      f"{problem}. Nothing was changed.")
+
+
+def three_account_stamp_targets() -> list[tuple[str, str, str]]:
+    """Each STAMPED_REPOS name, the account that owns its deploy area, and
+    that account's home — shared by `check_three_account_stamps` and
+    `three_account_deploy_stamps`, the only two readers of these stamps on
+    this shape."""
+    return [
+        ("agent-platform", AGENTS_ACCOUNT, agents_home()),
+        ("convivy-orient", orient_account_name(), account_home(orient_account_name())),
+        ("library", library_account_name(), account_home(library_account_name())),
+    ]
+
+
+def three_account_deploy_stamps() -> dict[str, str | None]:
+    """Each STAMPED_REPOS deploy stamp's commit, read the way
+    `check_three_account_stamps` reads them — as the account that owns the
+    deploy area, never by the administrator's own (empty) `default_deploy_root`.
+    Used for the record's own `deploy_stamps` and for `preflight_again`'s
+    comparison against it, so both read the same values the same way."""
+    return {name: (read_stamp_as(account, home, name) or {}).get("commit")
+            for name, account, home in three_account_stamp_targets()}
+
+
+def check_three_account_stamps(src_dir: Path, installed: str) -> None:
+    """`find_installed_release`'s own stamp check, as the two- and three-account
+    installs need it: each deploy stamp read as the account that owns it,
+    never by the administrator directly."""
+    for name, account, home in three_account_stamp_targets():
+        expected = tag_commit(src_dir / name, installed)
+        found = read_stamp_as(account, home, name)
+        area = Path(home) / ".local" / "deploy" / name
+        if found is None:
+            raise Refused(f"{area} carries no install stamp ({STAMP}), read as {account}; cannot "
+                          f"confirm {name} is serving {installed}. Nothing was changed.")
+        if found.get("unreadable"):
+            raise Refused(f"{area / STAMP} is unreadable (as {account}); cannot confirm what "
+                          f"{name} is serving. Nothing was changed.")
+        if found.get("commit") != expected:
+            raise Refused(f"{name}'s clone names {str(expected)[:9]} at {installed}, and its "
+                          f"deploy stamp at {area / STAMP} (as {account}) names "
+                          f"{str(found.get('commit'))[:9]}. Nothing was changed.")
+
+
+def preflight_three(src_dir: Path, installed: str, target: str, verified: dict[str, str],
+                    shape: str) -> dict[str, str]:
+    """The two- and three-account shapes' own preflight additions, after the
+    administrator's own clones have verified: the installed release must
+    carry `--restore-previous`, the Library's and Orient's moves must already
+    have happened, root's own bare copy of agent-platform must still be
+    trusted, and `agents`' own clones must verify too. Returns the commits
+    `agents`' own verification checked."""
+    old_sha = record_commit(root_record_text(), "shipwright")
+    if old_sha is None:
+        raise Refused(f"{ROOT_INSTALLED_RECORD} names no shipwright commit; the root half is "
+                      f"not installed. Nothing was changed.")
+    rc, out, _ = git("tag", "--points-at", old_sha, cwd=src_dir / "shipwright")
+    root_tags = sorted({t for t in out.splitlines() if TAG_VERSION.fullmatch(t)}) if rc == 0 else []
+    if len(root_tags) != 1 or root_tags[0] != installed:
+        raise Refused(f"root's own record at {ROOT_INSTALLED_RECORD} names shipwright at "
+                      f"{old_sha[:9]}, which is not tagged {installed}; root's half and the "
+                      f"administrator's clones disagree. Nothing was changed.")
+    old_tree = root_tree(old_sha)
+    check_restore_previous_supported(old_tree)
+    check_migration_pending("migrate-library-account", old_tree, shape)
+    check_migration_pending("migrate-orient-account", old_tree, shape)
+    check_three_account_stamps(src_dir, installed)
+    if "agent-platform" in verified:
+        check_agent_platform_bare()
+    fetch_agents_tags()
+    verify_agents_clones_ready(target)
+    verified_agents = verify_release_agents(old_tree, installed, target, verified[WRITE_BETTER])
+    if verified_agents != verified:
+        differ = sorted(n for n in set(verified) | set(verified_agents)
+                        if verified.get(n) != verified_agents.get(n))
+        raise Refused(f"agents' own clones verified different commits than the administrator's "
+                      f"own, for {', '.join(differ)}. Nothing was changed.")
+    return verified_agents
+
+
+# --- run as `agents`: report only ---------------------------------------------
+
+def agents_report(src_dir: Path) -> int:
+    """Run as `agents` on the two- or three-account install: report whether the
+    install, root half included, is behind the latest release, and change
+    nothing either way."""
+    try:
+        deploy_root = default_deploy_root()
+        installed, _clones = find_installed_release(src_dir, deploy_root, check_stamps=False)
+        fetch_tags(src_dir)
+        target = stable_tag(src_dir)
+    except Refused as exc:
+        print(f"{PROG}: refusing — {exc}", file=sys.stderr)
+        return 2
+    root_tag = None
+    root_sha = record_commit(root_record_text(), "shipwright")
+    if root_sha is not None:
+        rc, out, _ = git("tag", "--points-at", root_sha, cwd=src_dir / "shipwright")
+        tags = sorted({t for t in out.splitlines() if TAG_VERSION.fullmatch(t)}) if rc == 0 else []
+        root_tag = tags[0] if len(tags) == 1 else None
+    behind = version_key(installed) < version_key(target) or root_tag is None or root_tag != installed
+    if behind:
+        say(f"behind — installed {installed}, root half at {root_tag or 'unknown'}, "
+            f"latest {target}. Changed nothing.")
+        return 5
+    say(f"ok — current at {installed}, root half included. Changed nothing.")
+    return 0
+
+
+# --- the two- and three-account shapes' own update and rollback --------------
+
+def start_update_three(path: Path, record: dict) -> int:
+    """Step 2, run by THIS process at the installed release, before the
+    hand-off moves shipwright and hands control to the target's own copy:
+    Orient's deploy pause, then the root half. Shared by the two- and
+    three-account shapes; `move_root_half` reads `record["shape"]` to tell
+    root's own `install-privileged` which one this is."""
+    target = record["target_release"]
+    old_sha = record["clones"]["shipwright"]
+    old_tree = root_tree(old_sha)
+    try:
+        if follow_orient_main():
+            pause_orient_deploy(old_tree)
+            record["orient_deploy_paused"] = True
+            save_record(path, record)
+        move_root_half(record)
+        begin(path, record, "root")
+    except (Refused, StepFailed, OSError) as exc:
+        print(f"{PROG}: the update to {target} failed: {exc}", file=sys.stderr)
+        return rollback(path)
+    return hand_off(path, load_record(path))
+
+
+def continue_update_three(path: Path, record: dict) -> int:
+    """The two- and three-account shapes' own steps 3 to 9, run by the target's
+    own copy after `hand_off` has moved the administrator's shipwright clone
+    and handed control here — the same contract the single-account shape
+    uses. Every step below runs identically on both shapes: neither moves,
+    places nor checks anything the reviewers' half owns."""
+    if record.get("finished"):
+        print(f"{PROG}: refusing — the update recorded at {path} has already finished", file=sys.stderr)
+        return 2
+    if not isinstance(record.get("target_commits"), dict):
+        print(f"{PROG}: refusing — the update record at {path} names no verified commits",
+              file=sys.stderr)
+        return 2
+    src_dir = Path(record["src_dir"])
+    installed, target = record["installed_release"], record["target_release"]
+    try:
+        say(f"{target}'s {PROG} running the preflight again")
+        preflight_again(record)
+        move_clones(record)
+        move_agents_clones(record)
+    except Refused as exc:
+        print(f"{PROG}: refusing — {exc}", file=sys.stderr)
+        code = rollback(path)
+        return 2 if code == 3 else code
+    except (StepFailed, OSError) as exc:
+        print(f"{PROG}: the update to {target} failed: {exc}", file=sys.stderr)
+        return rollback(path)
+
+    new_tree = root_tree(record["target_commits"]["shipwright"])
+    home = agents_home()
+    try:
+        builder_root = agents_builder_root(home)
+
+        begin(path, record, "stop")
+        say("stopping the jobs; the Library and Orient are down until the restart")
+        stop_jobs_three(new_tree, home, builder_root)
+
+        begin(path, record, "snapshot")
+        take_snapshot_three(record)
+
+        begin(path, record, "place")
+        library_tree = repo_tree("library", record["target_commits"]["library"])
+        orient_tree = repo_tree("convivy-orient", record["target_commits"]["convivy-orient"])
+        place_three(agents_src_dir(), new_tree, target, record["target_commits"],
+                   library_tree, orient_tree)
+        record["knowledge_after_update"] = knowledge_main(
+            Path(record["knowledge_repo"]) if record.get("knowledge_repo") else None, as_agents=True)
+        save_record(path, record)
+        placed_after = now()
+
+        begin(path, record, "migrate")
+        render_jobs_three(new_tree, home, builder_root)
+        run_root_tool(new_tree, "deliver-library-credentials", "deliver-library-credentials, as root")
+        person_save_sources = record.get("person_save_sources")
+        person_save_extra = []
+        if person_save_sources:
+            for flag, key in (("--root-ca", "root_ca"), ("--app-key", "app_key"),
+                              ("--app-config", "app_config")):
+                value = person_save_sources.get(key)
+                if value:
+                    person_save_extra += [flag, value]
+        run_root_tool(new_tree, "place-person-save", "place-person-save --as-library, as root",
+                     "--as-library", *person_save_extra)
+
+        labels = jobs_to_start(record)
+        record["jobs_started"] = labels
+        begin(path, record, "restart")
+        running = jobs_running_three(new_tree, home, builder_root) or []
+        start_jobs_three(new_tree, home, builder_root, [l for l in labels if l not in running])
+        if LIBRARY_LABEL in labels:
+            # `root_interpreter()`, never `sys.executable`, for `place_interpreters`' reason.
+            run_step([*AS_AGENTS, root_interpreter(),
+                     str(agents_src_dir() / "shipwright" / "bin" / "sync-knowledge-index"),
+                     "--deploy", str(Path(home) / ".local" / "deploy"), "--soft"],
+                     "sync-knowledge-index, as agents")
+
+        begin(path, record, "verify")
+        problems = check_release_three(record, target, new_tree, labels, record["target_commits"],
+                                       placed_after)
+        if problems:
+            raise StepFailed("the restarted backend did not check out:\n" +
+                             "\n".join(f"  {p}" for p in problems))
+    except (StepFailed, Refused, OSError) as exc:
+        print(f"{PROG}: the update to {target} failed: {exc}", file=sys.stderr)
+        return rollback(path)
+
+    if record.get("orient_deploy_paused"):
+        resume_orient_deploy(new_tree)
+    finish(path, record, "updated")
+    prune_snapshots(path.parent.parent, path)
+    say(f"ok — updated from {installed} to {target}; every job that ran before is running again")
+    return 0
+
+
+def rollback_three(path: Path, record: dict) -> int:
+    """Undo every begun step from the record, in the order the plan's rollback
+    section gives: the root half, the clones, the old release's placement, the
+    snapshot's databases and the old release's jobs, then the jobs that ran
+    before restart. Shared by the two- and three-account shapes; `restore_root_half`
+    is told `record["shape"]`. Orient's deploy job, if paused, resumes only after
+    this rollback's own check passes, as its last action — never before, since a
+    resumed deploy job can restart Orient while the rollback is still
+    unfinished."""
+    old = record["installed_release"]
+    begun = set(record["begun"])
+    previously = record.get("jobs_running") or []
+    say(f"rolling back to {old}")
+
+    old_sha = record["clones"]["shipwright"]
+    old_tree = root_tree(old_sha)
+    home = agents_home()
+
+    placed_after_box: list[datetime] = []
+
+    def place_old() -> None:
+        place_three(agents_src_dir(), old_tree, old, record["clones"],
+                   repo_tree("library", record["clones"]["library"]),
+                   repo_tree("convivy-orient", record["clones"]["convivy-orient"]),
+                   rolling_back=True)
+        placed_after_box.append(now())
+
+    undo_steps = [
+        ("restore the root half (step 2)", "root" in begun, lambda: restore_root_half(record["shape"])),
+        ("check each clone out at its recorded commit (step 3)", "clones" in begun,
+         lambda: (move_clones_back(record), move_agents_clones_back(record))),
+        ("reset the knowledge repository (step 6)", "place" in begun, lambda: reset_knowledge(record)),
+        ("place the old release again (step 6)", "place" in begun, place_old),
+        ("stop the jobs again (step 4/8)", "restart" in begun,
+         lambda: stop_jobs_three(old_tree, home, agents_builder_root(home))),
+        ("restore the snapshot's databases (step 7)", "migrate" in begun,
+         lambda: restore_databases_three(record)),
+        ("re-render the old release's jobs (step 7)", "migrate" in begun,
+         lambda: render_jobs_three(old_tree, home, agents_builder_root(home))),
+        ("start the jobs that ran before (step 4)", "stop" in begun,
+         lambda: start_jobs_three(old_tree, home, agents_builder_root(home), previously)),
+    ]
+    undone: list[str] = []
+    for name, needed, action in undo_steps:
+        if not needed:
+            continue
+        try:
+            action()
+        except (StepFailed, Refused, OSError) as exc:
+            record["undone"] = undone
+            save_record(path, record)
+            print(f"{PROG}: the rollback did not finish. It could not {name}: {exc}", file=sys.stderr)
+            print(f"{PROG}: undone so far: " + ("; ".join(undone) if undone else "nothing"), file=sys.stderr)
+            print(f"{PROG}: the record stays at {path}. Run `{PROG} --rollback` to finish the rollback.",
+                  file=sys.stderr)
+            return 4
+        undone.append(name)
+        record["undone"] = undone
+        save_record(path, record)
+
+    # None when `place_old` never ran (the failure was in step 2 or 3, before
+    # placement): nothing was placed, so the per-service check below must not
+    # demand a restart after placement, only that each service is running.
+    placed_after = placed_after_box[0] if placed_after_box else None
+    problems = check_release_three(record, old, old_tree, previously, record["clones"], placed_after)
+    if problems:
+        print(f"{PROG}: the rollback did not finish: {old} did not check out:\n" +
+              "\n".join(f"  {p}" for p in problems), file=sys.stderr)
+        print(f"{PROG}: undone: " + ("; ".join(undone) if undone else "nothing"), file=sys.stderr)
+        if record.get("orient_deploy_paused"):
+            print(f"{PROG}: Orient's deploy job stays paused until `{PROG} --rollback` finishes.",
+                  file=sys.stderr)
+        print(f"{PROG}: the record stays at {path}. Run `{PROG} --rollback` to finish the rollback.",
+              file=sys.stderr)
+        return 4
+
+    if record.get("orient_deploy_paused"):
+        try:
+            resume_orient_deploy(old_tree)
+            undone.append("resume Orient's deploy job")
+        except (StepFailed, Refused, OSError) as exc:
+            record["undone"] = undone
+            save_record(path, record)
+            print(f"{PROG}: the rollback did not finish. It could not resume Orient's deploy job: {exc}",
+                  file=sys.stderr)
+            return 4
+
+    finish(path, record, "rolled-back")
+    say(f"rolled back — the install is on {old} again and the jobs that ran before are running. "
+        f"Undone: " + ("; ".join(undone) if undone else "nothing had changed"))
+    return 3
+
+
+def person_save_flags_problem(root_ca: str | None, app_key: str | None,
+                               app_config: str | None) -> str | None:
+    """None when `--root-ca`, `--app-key` and `--app-config` are all given or
+    none is; otherwise names which of the three are still missing, for
+    `main()` to refuse with before any job stops or any record is written.
+    A partial set reaching `continue_update_three`'s own `place-person-save
+    --as-library` call exits 2 there, inside the try that rolls the whole
+    update back — after `stop_jobs_three`, `take_snapshot_three` and
+    `place_three` have already run."""
+    values = {"--root-ca": root_ca, "--app-key": app_key, "--app-config": app_config}
+    given = [name for name, value in values.items() if value]
+    if not given or len(given) == len(values):
+        return None
+    missing = [name for name in values if name not in given]
+    return ", ".join(missing)
+
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
@@ -1429,10 +3127,28 @@ def main(argv: list[str]) -> int:
                         help=f"where the six repositories are cloned (default {DEFAULT_SRC_DIR})")
     parser.add_argument("--rollback", action="store_true",
                         help="finish rolling back an update that did not finish, from its record")
+    parser.add_argument("--root-ca", default=None,
+                        help="Deck's root certificate (PEM), for the Library's person-save "
+                             "inputs on a shape where the Library has its own account. Given "
+                             "with --app-key and --app-config, places the six entries that "
+                             "need no Orient key; omitted, that step skips cleanly")
+    parser.add_argument("--app-key", default=None,
+                        help="the Library App's RSA private key (PEM), for the Library's "
+                             "person-save inputs")
+    parser.add_argument("--app-config", default=None,
+                        help="JSON naming the Library App's app_id and its repo, for the "
+                             "Library's person-save inputs")
     # The hand-off from the release that started the update; see the module docstring.
     parser.add_argument("--continue", dest="continue_record", type=Path, default=None,
                         help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+
+    problem = person_save_flags_problem(args.root_ca, args.app_key, args.app_config)
+    if problem:
+        print(f"{PROG}: refusing — missing {problem}; give --root-ca, --app-key and "
+              f"--app-config together, or omit them all to skip placing the Library's "
+              f"person-save inputs. Nothing was changed.", file=sys.stderr)
+        return 2
 
     if args.continue_record is not None:
         return continue_update(args.continue_record)
@@ -1459,12 +3175,18 @@ def main(argv: list[str]) -> int:
         print(f"{PROG}: name the install shape; this never chooses one for you:\n{shapes}",
               file=sys.stderr)
         return 2
-    if args.shape == "two":
-        print(f"{PROG}: the two-account install is not built yet in this release. "
-              f"Nothing was changed.", file=sys.stderr)
-        return 2
 
     src_dir = args.src_dir.expanduser().absolute()
+
+    running_as_agents = (pwd.getpwuid(os.getuid()).pw_name == AGENTS_ACCOUNT
+                        # A test-only override, in the same spirit as
+                        # BUILDER_UPDATE_JOBS_SETTLE_SECONDS: nothing can make a test
+                        # process really be the `agents` account.
+                        or os.environ.get("BUILDER_UPDATE_AS_AGENTS") == "1")
+    if args.shape in ("two", "three") and running_as_agents:
+        # Run as `agents`, this only ever reports; the privileged half moves
+        # only when an administrator runs the update.
+        return agents_report(src_dir)
 
     try:
         # Looked up here, at call time, so a test can stand in for this
@@ -1473,7 +3195,8 @@ def main(argv: list[str]) -> int:
         if mismatch:
             raise Refused(mismatch)
         deploy_root = default_deploy_root()
-        installed, clones = find_installed_release(src_dir, deploy_root)
+        installed, clones = find_installed_release(src_dir, deploy_root,
+                                                    check_stamps=args.shape == "single")
         fetch_tags(src_dir)
         target, already_current = pick_target(args.release, src_dir, installed)
         if already_current:
@@ -1481,6 +3204,11 @@ def main(argv: list[str]) -> int:
             return 0
         verify_clones_ready(src_dir, target)
         verified = verify_release(src_dir, installed, target)
+        if args.shape in ("two", "three"):
+            preflight_three(src_dir, installed, target, verified, args.shape)
+            knowledge = knowledge_root_as_agents(agents_home())
+        else:
+            knowledge = knowledge_root()
     except Refused as exc:
         print(f"{PROG}: refusing — {exc}", file=sys.stderr)
         return 2
@@ -1491,11 +3219,6 @@ def main(argv: list[str]) -> int:
     if args.plan:
         return 0
 
-    if args.shape == "three":
-        print(f"{PROG}: the three-account update is not built yet in this release. "
-              f"Nothing was changed.", file=sys.stderr)
-        return 2
-
     try:
         answer = input(f"{PROG}: proceed with this update? [y/N] ")
     except EOFError:
@@ -1504,20 +3227,85 @@ def main(argv: list[str]) -> int:
         print(f"{PROG}: not confirmed; nothing was changed.", file=sys.stderr)
         return 2
 
-    jobs = jobs_running(src_dir)
+    try:
+        if args.shape in ("two", "three"):
+            old_sha = record_commit(root_record_text(), "shipwright")
+            if old_sha is None:
+                raise Refused(f"{ROOT_INSTALLED_RECORD} names no shipwright commit; the root "
+                              f"half is not installed.")
+            enabled = [label for label, on in default_jobs(src_dir / "shipwright", old_sha).items() if on]
+            jobs = jobs_loaded_before_update(
+                lambda: jobs_running_three(root_tree(old_sha), agents_home(),
+                                           agents_builder_root(agents_home())),
+                enabled)
+        else:
+            enabled = [label for label, on in
+                      default_jobs(src_dir / "shipwright", clones["shipwright"].commit).items() if on]
+            jobs = jobs_loaded_before_update(lambda: jobs_running(src_dir), enabled)
+    except (Refused, StepFailed) as exc:
+        print(f"{PROG}: refusing — {exc}. Nothing was changed.", file=sys.stderr)
+        return 2
     if jobs is None:
         print(f"{PROG}: refusing — install-jobs --running could not say which jobs are running, "
               f"so there is no telling which to start again. Nothing was changed.", file=sys.stderr)
         return 2
+    person_save_sources = None
+    if args.root_ca or args.app_key or args.app_config:
+        person_save_sources = {"root_ca": args.root_ca, "app_key": args.app_key,
+                               "app_config": args.app_config}
     try:
+        deploy_stamps = three_account_deploy_stamps() if args.shape in ("two", "three") else None
         path = write_record(DEFAULT_STATE_DIR, installed, target, args.shape, clones, deploy_root,
-                            jobs, knowledge_root(), src_dir, verified)
+                            jobs, knowledge, src_dir, verified, deploy_stamps, person_save_sources)
     except StepFailed as exc:
         print(f"{PROG}: refusing — {exc}. Nothing was changed.", file=sys.stderr)
         return 2
     say(f"recorded the update at {path}")
+    if args.shape in ("two", "three"):
+        return start_update_three(path, load_record(path))
     return hand_off(path, load_record(path))
 
 
+REEXEC_MARKER = "BUILDER_UPDATE_REEXECED"
+
+
+def reexec_argv(version: tuple[int, ...], argv: list[str], env: dict[str, str],
+                script: str) -> list[str] | None:
+    """The argv to run this again under, or None when this interpreter will do.
+
+    **`tools/jobs/declaration.py` NEEDS 3.11's `tomllib`**, and step 8 imports it.
+    The documented `builder-update` runs through `#!/usr/bin/env python3`, which
+    on a Mac with Homebrew's python@3.11 is Apple's 3.9.6: measured on a macOS 26
+    three-account update from 0.99.38 to 0.99.39, which crashed in step 8 with
+    `ModuleNotFoundError: No module named 'tomllib'` and rolled back. So an older
+    interpreter runs this once more under `root_interpreter()`, the one root's
+    tools and every placed venv use. `REEXEC_MARKER` stops a second try when that
+    interpreter is older too; `main_entry` then refuses."""
+    if version >= (3, 11):
+        return None
+    if env.get(REEXEC_MARKER):
+        raise Refused(f"this needs Python 3.11 or later, and {root_interpreter()} is older. "
+                      f"Run it as `python3.11 {script} ...`. Nothing was changed.")
+    target = root_interpreter()
+    if not os.access(target, os.X_OK):
+        raise Refused(f"this needs Python 3.11 or later, and {target} is not there. "
+                      f"Run it as `python3.11 {script} ...`. Nothing was changed.")
+    return [target, script, *argv]
+
+
+def main_entry(argv: list[str]) -> int:
+    script = os.path.abspath(__file__)
+    try:
+        again = reexec_argv(tuple(sys.version_info), argv, dict(os.environ), script)
+    except Refused as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 2
+    if again is not None:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.execve(again[0], again, {**os.environ, REEXEC_MARKER: "1"})
+    return main(argv)
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(main_entry(sys.argv[1:]))

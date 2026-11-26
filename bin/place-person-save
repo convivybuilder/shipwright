@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Place the Library's person-save inputs on an install whose Library runs as the operator.
+"""Place the Library's person-save inputs on an install whose Library runs as the operator,
+or, with --as-library, the six entries that need no Orient key on a shape where the Library
+has its own account.
 
     bin/place-person-save --root-ca <file> --app-key <file> --app-config <file>
                           [--verifier <file>] [--check]
+    sudo bin/place-person-save --as-library --root-ca <file> --app-key <file> --app-config <file>
 
 The Library verifies a knowledge save that claims a person made it, then commits
 and pushes it, using inputs it reads from one directory: `.library/person-save/`
@@ -36,9 +39,17 @@ verify an Orient-signed save, so with the other entries placed Deck-signed saves
 work, and an Orient-signed save is refused with 403 `inputs` until this runs again
 with --verifier. The report marks that entry NOTE and the run exits 0.
 
-**THE THREE-ACCOUNT SHAPE IS NOT THIS COMMAND'S.** There the directory belongs to
-the Library's own account, out of the operator's reach, and the root-run install
-places it. This command refuses when the install record names a Library account.
+**A SHAPE WHERE THE LIBRARY HAS ITS OWN ACCOUNT IS NOT THE OPERATOR PATH'S.** There the
+directory belongs to the Library's own account, out of the operator's reach, and the
+root-run install places it instead, through `--as-library`: root drops into the Library
+account's own uid and gid (never placing directly as root, since that account's home is
+mode 700), and places the six entries that need no Orient key. `--as-library --check` reads
+them back the same dropped way, placing nothing; `--as-library` takes no `--verifier`. Given
+none of `--root-ca`, `--app-key` or `--app-config`, `--as-library` skips cleanly (exit 0,
+needing no root) rather than refusing — `bin/stand-up-backend` passes none of them when the
+operator has not supplied its own sources yet, and this step is not what should stop an
+install over that. The plain operator path above still refuses when the install record
+names a Library account.
 
 Exit codes: 0 every entry in place (Orient's key may be a NOTE), 1 refused or an entry
 missing or wrong, 2 usage.
@@ -64,6 +75,11 @@ from pathlib import Path
 PROG = "place-person-save"
 HERE = Path(__file__).resolve().parent
 INSTALL_RECORD = "/opt/builder/install.json"
+# The Library's own account, company decision 0025 point 5 — duplicated from
+# `bin/provision-accounts`' own `LIBRARY_ACCOUNT_NAMES`, the same way every
+# other sibling in this codebase duplicates it rather than importing it, for
+# `--as-library` below.
+LIBRARY_ACCOUNT_NAMES = {"macos": "_library", "linux": "library"}
 # Where the knowledge repository is cloned from. Tests point it at a local directory.
 GIT_BASE = "https://github.com"
 SUBDIR = (".library", "person-save")
@@ -109,6 +125,59 @@ def account_home() -> Path:
     return Path(pwd.getpwuid(os.getuid()).pw_dir)
 
 
+def library_account_name(platform: str | None = None) -> str:
+    platform = platform or ("macos" if sys.platform == "darwin" else "linux")
+    return LIBRARY_ACCOUNT_NAMES[platform]
+
+
+def _drop_privileges(uid: int, gid: int) -> None:
+    """Become `(uid, gid)` in THIS process, with no supplementary groups
+    carried over. Called only in a child that is about to do nothing else
+    but place and read back the Library's own person-save inputs."""
+    os.setgroups([])
+    os.setgid(gid)
+    os.setuid(uid)
+
+
+def run_as_account(uid: int, gid: int, action, *, drop=None):
+    """Run `action()` — a zero-argument callable returning a JSON-able
+    value — in a child that has dropped to `(uid, gid)` first, and return
+    what it returns, or raise `Refused` with what it raised. Duplicated from
+    `bin/migrate-orient-account`'s own version of this function, for
+    `--as-library` below: root never places the Library's own person-save
+    inputs directly, since that account's home is mode 700."""
+    if drop is None:
+        drop = _drop_privileges
+    read_fd, write_fd = os.pipe()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            drop(uid, gid)
+            result = action()
+            payload = json.dumps({"ok": True, "result": result}).encode("utf-8")
+        except BaseException as exc:
+            payload = json.dumps({"ok": False, "error": str(exc)}).encode("utf-8")
+        try:
+            with os.fdopen(write_fd, "wb") as out:
+                out.write(len(payload).to_bytes(8, "big"))
+                out.write(payload)
+        finally:
+            os._exit(0)
+    os.close(write_fd)
+    with os.fdopen(read_fd, "rb") as inp:
+        header = inp.read(8)
+        size = int.from_bytes(header, "big") if header else 0
+        data = inp.read(size) if size else b""
+    os.waitpid(pid, 0)
+    decoded = json.loads(data.decode("utf-8")) if data else {"ok": False, "error": "the child reported nothing"}
+    if not decoded.get("ok"):
+        raise Refused(decoded.get("error") or "the child failed silently")
+    return decoded.get("result")
+
+
 def refuse_separated_install() -> None:
     record = INSTALL_RECORD
     try:
@@ -144,7 +213,36 @@ def write_file(path: Path, data: bytes, mode: int) -> None:
     os.chmod(path, mode)
 
 
-def read_source(path: str, what: str) -> bytes:
+class Preread(bytes):
+    """A source file's bytes, read by the caller before it dropped privileges,
+    that prints as the path it was read from. A root caller reads the
+    operator's `--root-ca`, `--app-key` and `--app-config` itself, because the
+    Library account it then drops to cannot read the operator's home; every
+    message that names the source shows the path, never the bytes."""
+
+    def __new__(cls, data: bytes, label: str):
+        obj = super().__new__(cls, data)
+        obj.label = label
+        return obj
+
+    def __str__(self) -> str:
+        return self.label
+
+    def __repr__(self) -> str:
+        return repr(self.label)
+
+    def __format__(self, spec: str) -> str:
+        return format(self.label, spec)
+
+
+def preread(path: str, what: str) -> Preread:
+    """Read `path` now, as the calling account, for a child that drops first."""
+    return Preread(read_source(path, what), path)
+
+
+def read_source(path, what: str) -> bytes:
+    if isinstance(path, Preread):
+        return bytes(path)
     p = Path(path)
     if p.is_symlink() or not p.is_file():
         raise Refused(f"{what} {path} is not a regular file. Nothing further was placed.")
@@ -168,9 +266,46 @@ def place_root(d: Path, source: str) -> str:
     return "placed from --root-ca"
 
 
-def place_orient_key(d: Path, source: str | None) -> str:
-    if source is None:
-        return "not placed: no --verifier was given"
+def _validate_orient_key(key: str) -> None:
+    try:
+        der = base64.b64decode(key, validate=True)
+    except ValueError:
+        raise Refused("the orient statement key is not standard base64. Nothing further was placed.")
+    require_ok([OPENSSL, "pkey", "-pubin", "-inform", "DER", "-noout"],
+               "the orient statement key is not a DER public key", der)
+
+
+def _normalize_persons(persons) -> list[str]:
+    # Section 2.2 stores `persons` in lower case, so each email is trimmed and lowered first, and
+    # the list is checked as it will be stored: an entry of only spaces would otherwise pass as
+    # non-empty and be written as "".
+    if isinstance(persons, list) and all(isinstance(p, str) for p in persons):
+        persons = [p.strip().lower() for p in persons]
+    if not isinstance(persons, list) or not persons or not all(isinstance(p, str) and p for p in persons):
+        raise Refused("persons is not a list of emails. Nothing further was placed.")
+    return persons
+
+
+def write_orient_key(d: Path, key: str, persons) -> list[str]:
+    """Validate and write `orient-statement-key.json`: `key` and `persons`, exactly as
+    given — this never reads either one back from any file itself, so neither one's
+    trustworthiness depends on anything this function opens. Returns the normalized,
+    trimmed-and-lowered persons list, for the caller's own report line.
+
+    Shared by `main`, below (the operator CLI's own `--verifier` file), and
+    `place_entries` (a root-privileged caller's in-memory key and operator-supplied
+    persons list)."""
+    _validate_orient_key(key)
+    persons = _normalize_persons(persons)
+    out = {"orient_statement_key": key, "persons": persons}
+    write_file(d / "orient-statement-key.json", (json.dumps(out, indent=2) + "\n").encode(), 0o644)
+    return persons
+
+
+def read_verifier(source: str) -> tuple[str, object]:
+    """`orient_statement_key` and `persons`, read from the operator's own `--verifier`
+    file. Unvalidated beyond "is this JSON holding the right shape" — `write_orient_key`
+    does the real validation, once, inside `place_entries`."""
     try:
         data = json.loads(read_source(source, "--verifier"))
     except ValueError:
@@ -179,24 +314,7 @@ def place_orient_key(d: Path, source: str | None) -> str:
     persons = data.get("persons") if isinstance(data, dict) else None
     if not isinstance(key, str) or not key:
         raise Refused(f"--verifier {source} has no orient_statement_key. Nothing further was placed.")
-    try:
-        der = base64.b64decode(key, validate=True)
-    except ValueError:
-        raise Refused(f"--verifier {source}'s orient_statement_key is not standard base64. "
-                      f"Nothing further was placed.")
-    require_ok([OPENSSL, "pkey", "-pubin", "-inform", "DER", "-noout"],
-               f"--verifier {source}'s orient_statement_key is not a DER public key", der)
-    # Section 2.2 stores `persons` in lower case, so each email is trimmed and lowered first, and
-    # the list is checked as it will be stored: an entry of only spaces would otherwise pass as
-    # non-empty and be written as "".
-    if isinstance(persons, list) and all(isinstance(p, str) for p in persons):
-        persons = [p.strip().lower() for p in persons]
-    if not isinstance(persons, list) or not persons or not all(isinstance(p, str) and p for p in persons):
-        raise Refused(f"--verifier {source}'s persons is not a list of emails. "
-                      f"Nothing further was placed.")
-    out = {"orient_statement_key": key, "persons": persons}
-    write_file(d / "orient-statement-key.json", (json.dumps(out, indent=2) + "\n").encode(), 0o644)
-    return f"placed from --verifier, {len(persons)} person(s)"
+    return key, persons
 
 
 def place_signing_key(d: Path) -> str:
@@ -344,6 +462,131 @@ def check(d: Path) -> list[tuple[str, bool | None, str]]:
     return rows
 
 
+def place_entries(d: Path, *, root_ca: str, key: str | None, persons, app_key: str,
+                  app_config: str, gate, gh) -> list[tuple[str, str]]:
+    """Place all seven entries under `d`, owned by the running account — the Library's
+    protocol, section 2.2. Shared by the operator CLI (`main`, below) and a
+    root-privileged caller already dropped to the target account's own uid and gid
+    (`bin/migrate-orient-account`, `bin/stand-up-backend`, `payload/bin/builder-update`).
+
+    `key` and `persons` are plain values, never read back from any file this function
+    opens itself: the caller sources them — the operator's own `--verifier` file for
+    `main`, or a value a root-privileged caller already holds in memory or took
+    directly from the operator. `key=None` places the six entries that need no Orient
+    key, the same as `main` with no `--verifier`; nothing is written for
+    `orient-statement-key.json` in that case, and the report says so.
+    """
+    if d.is_symlink() or (d.exists() and not d.is_dir()):
+        raise Refused(f"{d} exists and is not a directory. Nothing was changed.")
+    d.mkdir(parents=True, exist_ok=True)
+    os.chmod(d, 0o700)
+    report = [("root-ca.crt", place_root(d, root_ca))]
+    if key is None:
+        orient_report = "not placed: no orient statement key was given"
+    else:
+        placed = write_orient_key(d, key, persons)
+        orient_report = f"placed, {len(placed)} person(s)"
+    report.append(("orient-statement-key.json", orient_report))
+    report.append(("commit-signing-key", place_signing_key(d)))
+    repo, token, line = place_app(d, app_key, app_config, gate, gh)
+    report.append(("github-app.pem and github-app.json", line))
+    try:
+        report.append(("knowledge.git", place_clone(d, repo, token)))
+    finally:
+        try:
+            gh.request("DELETE", f"{gh.api}/installation/token", token, None)
+        except Exception:
+            pass
+    return report
+
+
+def _library_entry() -> pwd.struct_passwd:
+    """The Library's own account's password-database entry, or `Refused`
+    naming it when there is none."""
+    name = library_account_name()
+    try:
+        return pwd.getpwnam(name)
+    except KeyError:
+        raise Refused(f"the {name} account does not exist. Nothing was changed.")
+
+
+def main_as_library(args, gate=None, gh=None) -> int:
+    """Place the six entries that need no Orient key as the Library's own
+    account, dropped to from root — never as root directly, since that
+    account's home is mode 700. For a root-run install on the two- and
+    three-account shapes, where the Library has its own account and
+    `refuse_separated_install()` is exactly why the operator's own path
+    above refuses instead.
+
+    `--check` reads the six entries back, dropped to the Library account's
+    own uid the same way a real run is, and places nothing; `bin/stand-up-
+    backend` maps every reporting mode (`--dry-run`, `--check`, `--status`)
+    to it, since this tool has no separate dry-run of its own. `--verifier`
+    is refused outright: Orient's key never reaches this path — see
+    `bin/migrate-orient-account`'s own placement, which never reads it from
+    a file either.
+    """
+    if args.verifier:
+        print(f"{PROG}: --as-library takes no --verifier. Nothing was changed.", file=sys.stderr)
+        return 2
+    if not args.check and not (args.root_ca or args.app_key or args.app_config):
+        print(f"{PROG}: --as-library given no --root-ca, --app-key or --app-config; nothing "
+              f"to place. Pass all three to place the six person-save inputs. Until they are "
+              f"placed, the Library refuses every person-save, Orient-signed or Deck-signed.")
+        return 0
+    if not args.check and not (args.root_ca and args.app_key and args.app_config):
+        print(f"{PROG}: --root-ca, --app-key and --app-config are required", file=sys.stderr)
+        return 2
+    if os.geteuid() != 0:
+        print(f"{PROG}: --as-library needs root, to drop into the Library's own account's "
+              f"own uid and gid. Nothing was changed.", file=sys.stderr)
+        return 2
+    try:
+        entry = _library_entry()
+    except Refused as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 2
+    d = Path(entry.pw_dir).joinpath(*SUBDIR)
+
+    if args.check:
+        try:
+            rows = run_as_account(entry.pw_uid, entry.pw_gid, lambda: check(d))
+        except Refused as exc:
+            print(f"{PROG}: refused: {exc}", file=sys.stderr)
+            return 1
+        for entry_name, ok, found in rows:
+            print(f"{PROG}: {'NOTE' if ok is None else 'ok  ' if ok else 'FAIL'} {entry_name}: {found}")
+        return 0 if all(ok is not False for _, ok, _ in rows) else 1
+
+    # Read as root, before the drop: the Library account cannot read the
+    # operator's home, where these files usually are.
+    try:
+        root_ca = preread(args.root_ca, "--root-ca")
+        app_key = preread(args.app_key, "--app-key")
+        app_config = preread(args.app_config, "--app-config")
+    except (Refused, OSError) as exc:
+        print(f"{PROG}: refused: {exc}", file=sys.stderr)
+        return 1
+
+    def _place():
+        g = gate or load_gate()
+        h = gh or g.GitHub()
+        placed = place_entries(d, root_ca=root_ca, key=None, persons=None,
+                               app_key=app_key, app_config=app_config, gate=g, gh=h)
+        return {"report": placed, "rows": check(d)}
+
+    try:
+        result = run_as_account(entry.pw_uid, entry.pw_gid, _place)
+    except Refused as exc:
+        print(f"{PROG}: refused: {exc}", file=sys.stderr)
+        return 1
+    for entry_name, what in result["report"]:
+        print(f"{PROG}: {entry_name}: {what}")
+    for entry_name, ok, found in result["rows"]:
+        print(f"{PROG}: {'NOTE' if ok is None else 'ok  ' if ok else 'FAIL'} {entry_name}: {found}")
+    return 0 if all(ok is not False for _, ok, _ in result["rows"]) else 1
+
+
 def main(argv: list[str], gate=None, gh=None) -> int:
     p = argparse.ArgumentParser(prog=PROG, description="Place the Library's person-save inputs "
                                 "on an install whose Library runs as the operator.")
@@ -352,7 +595,14 @@ def main(argv: list[str], gate=None, gh=None) -> int:
     p.add_argument("--app-key", help="the Library App's RSA private key, PEM")
     p.add_argument("--app-config", help="JSON naming the Library App's app_id and its repo, owner/name")
     p.add_argument("--check", action="store_true", help="only read back what is placed")
+    p.add_argument("--as-library", action="store_true",
+                  help="place the six entries that need no Orient key as the Library's own "
+                       "account, dropped to from root, on a shape where the Library has its "
+                       "own account. --check reads them back the same way; takes no "
+                       "--verifier; needs root.")
     args = p.parse_args(argv)
+    if args.as_library:
+        return main_as_library(args, gate=gate, gh=gh)
     d = account_home().joinpath(*SUBDIR)
     try:
         refuse_separated_install()
@@ -361,24 +611,13 @@ def main(argv: list[str], gate=None, gh=None) -> int:
                 p.print_usage(sys.stderr)
                 print(f"{PROG}: --root-ca, --app-key and --app-config are required", file=sys.stderr)
                 return 2
-            if d.is_symlink() or (d.exists() and not d.is_dir()):
-                raise Refused(f"{d} exists and is not a directory. Nothing was changed.")
-            d.mkdir(parents=True, exist_ok=True)
-            os.chmod(d, 0o700)
             gate = gate or load_gate()
             gh = gh or gate.GitHub()
-            report = [("root-ca.crt", place_root(d, args.root_ca)),
-                      ("orient-statement-key.json", place_orient_key(d, args.verifier)),
-                      ("commit-signing-key", place_signing_key(d))]
-            repo, token, line = place_app(d, args.app_key, args.app_config, gate, gh)
-            report.append(("github-app.pem and github-app.json", line))
-            try:
-                report.append(("knowledge.git", place_clone(d, repo, token)))
-            finally:
-                try:
-                    gh.request("DELETE", f"{gh.api}/installation/token", token, None)
-                except Exception:
-                    pass
+            key = persons = None
+            if args.verifier:
+                key, persons = read_verifier(args.verifier)
+            report = place_entries(d, root_ca=args.root_ca, key=key, persons=persons,
+                                   app_key=args.app_key, app_config=args.app_config, gate=gate, gh=gh)
             for name, what in report:
                 print(f"{PROG}: {name}: {what}")
     except Refused as exc:

@@ -7,14 +7,15 @@ timer on Linux. `tools/jobs/FORMAT.md` is the format; this is the thing that
 installs it.
 
 WHY THE INTERPRETER LINE IS `/usr/bin/env python3` AND THE VERSION IS CHECKED
-BELOW. A declaration is TOML, and `tomllib` arrived in Python 3.11. Ubuntu
-22.04, a platform the backend is committed to run on, ships 3.10, so the stock
-interpreter cannot read a declaration at all: it fails with
-`ModuleNotFoundError: No module named 'tomllib'`, which says nothing about
-what is actually wrong. A hardcoded `/opt/homebrew/bin/python3.11` is how ten
-scripts in `agent-platform/bin` became unrunnable on Linux, so that is not the
-fix either. `env` finds whatever python3 is on the path, and the check below
-turns the confusing import error into a sentence naming the version needed.
+BELOW. A declaration is TOML, and `tomllib` arrived in Python 3.11. An Ubuntu
+22.04 box, no longer a platform the backend runs on but still one someone can
+point this at by hand, ships 3.10 as its stock interpreter, which cannot read
+a declaration at all: it fails with `ModuleNotFoundError: No module named
+'tomllib'`, which says nothing about what is actually wrong. A hardcoded
+`/opt/homebrew/bin/python3.11` is how ten scripts in `agent-platform/bin`
+became unrunnable on Linux, so that is not the fix either. `env` finds
+whatever python3 is on the path, and the check below turns the confusing
+import error into a sentence naming the version needed.
 
 WHY INSTALLING AND ACTIVATING ARE SEPARATE, AND ONLY ONE IS THE DEFAULT.
 Copying a unit file does not run it: launchd needs `launchctl bootstrap` and
@@ -40,9 +41,19 @@ the 2026-10-01 rehearsal the Library's unit, written two days earlier, lacked
 the variables a later `library.toml` added; the newer stand-up skipped it, and
 the Library failed with `LIBRARY_VECTORS_DB is not set`. So each run records
 the sha256 of every unit it writes or finds already matching, in
-`{state}/install-jobs/units.json`. A live unit that matches the record is this
-installer's own and is replaced. One that matches neither the record nor the
-declaration is a hand edit and is refused as before.
+`{state}/install-jobs/units.json`, or wherever `--record` names instead. A
+live unit that matches the record is this installer's own and is replaced.
+One that matches neither the record nor the declaration is a hand edit and is
+refused as before.
+
+A ROOT RUN NEEDS `--record` NAMED UNDER A ROOT-OWNED PATH WHEN `--home` IS AN
+ACCOUNT'S OWN. The default location sits under `--state`, which follows
+`--home`, and `open_record_directory` refuses to keep a record under a
+directory that account owns, the same refusal a hand edit gets. Without
+`--record`, a root run given such a `--home` keeps no record at all, and
+every unit a later release changes reads as a hand edit and is skipped —
+found in a Debian 12 upgrade rehearsal on 2026-11-15, where the Library's
+unit kept the previous release's `User=` and paths.
 """
 
 from __future__ import annotations
@@ -69,11 +80,11 @@ def python_too_old(version=None, executable: str | None = None) -> str | None:
     """The message to die with under an interpreter that cannot read TOML.
 
     A FUNCTION RATHER THAN A BARE `if`, SO THE GUARD CAN BE TESTED WHERE IT
-    MATTERS. The machine this has to be right on is Ubuntu 22.04, and CI runs
-    3.11, so an inline check could only ever be confirmed by hand in a
-    container — which I did once, and which proves nothing about the next
-    change. Passing the version in means the 3.10 case is a check that runs on
-    every pull request.
+    MATTERS. No platform the backend runs on ships a `python3` this old any
+    more, and CI runs 3.11, so an inline check could only ever be confirmed by
+    hand against a machine like an unsupported Ubuntu 22.04 box — which I did
+    once, and which proves nothing about the next change. Passing the version
+    in means the 3.10 case is a check that runs on every pull request.
     """
     version = version or sys.version_info
     if version >= (3, 11):
@@ -261,12 +272,42 @@ def as_invoker(jobs: list[declaration.Job]) -> list[declaration.Job]:
     user-scope jobs `main` renders: `{home}`, `{state}` and the log paths resolve against the operator, and
     no log moves under `--log-dir`. A system-scope job that names no account keeps its scope, so a
     non-root run still refuses it.
+
+    `own-root` goes with the account; it replaces `{root}` only while the account is in force, so a job
+    that drops its account here has nothing left for it to replace. `account-environment` and
+    `account-prepare` go with it the same way: each adds to its plain counterpart only while the account
+    is in force, so a job with no account here has nothing left for either to apply to.
+
+    A job declaring `account-only` is never passed here at all: `main` drops it before this runs. See
+    `drop_account_only`.
     """
     return [
-        replace(job, scope="user", account=None)
+        replace(job, scope="user", account=None, account_macos=None, own_root=None,
+               account_environment={}, account_prepare=())
         if job.scope == "system" and job.account is not None else job
         for job in jobs
     ]
+
+
+def drop_account_only(jobs: list[declaration.Job]) -> list[declaration.Job]:
+    """`jobs`, with every `account-only` declaration left out and named.
+
+    **UNDER `--single-account`, THESE WOULD OTHERWISE BE CONVERTED LIKE ANY OTHER JOB THAT NAMES AN
+    ACCOUNT**, and `as_invoker` has no way to tell "convert" from "this job's task only exists while
+    its account is separate from the one installing it" — that is exactly what `account-only` says
+    (FORMAT.md, "account-only"). So this runs before `as_invoker`, on the single-account path alone.
+    """
+    kept, dropped = [], []
+    for job in jobs:
+        (dropped if job.account_only else kept).append(job)
+    for job in dropped:
+        print(
+            f"  Left out under --single-account: {job.label}. account-only says this job's task "
+            f"exists only while {job.account} is its own account; --single-account drops that "
+            f"account, so there is nothing here for this job to do beyond what another declaration "
+            f"already does as the operator."
+        )
+    return kept
 
 
 def leave_out_as_root(jobs: list[declaration.Job]) -> list[declaration.Job]:
@@ -295,13 +336,19 @@ def resolve(
     machine: placeholders.Machine,
     directory: accounts.Directory | None = None,
     log_dir: str | None = None,
+    *,
+    platform: str | None = None,
 ):
     """Each job with its placeholders resolved.
 
     A job that names an `account` resolves against that account's home, as the
     directory service reports it, rather than against the home of whoever runs
     this. `--deploy`, `--state` and `--bin` describe the running account, so
-    they do not carry over; `--root` and `--python` do.
+    they do not carry over; `--root` and `--python` do, unless the job also
+    names an `own-root`, which replaces `{root}` for that job alone (see
+    `placeholders.own_root_value`). `platform` decides which of a job's
+    `account`/`account-macos` is the real account this machine's directory
+    service has (see `declaration.effective_account`).
 
     A system-scope job that names an account has its logs moved to `log_dir`
     (see `account_log_paths`), so `log_dir` is required for one that writes a log.
@@ -312,8 +359,12 @@ def resolve(
         try:
             target = machine
             if job.account is not None:
-                account = accounts.require(job.account, job.source, directory or accounts.lookup)
+                name = declaration.effective_account(job, platform)
+                account = accounts.require(name, job.source, directory or accounts.lookup)
                 target = machine.for_account(account.home)
+                own_root = placeholders.own_root_value(job, target, programs)
+                if own_root is not None:
+                    target = replace(target, root=own_root)
             done = placeholders.resolve(job, target, programs)
             if job.scope == "system" and job.account is not None and (job.stdout or job.stderr):
                 if log_dir is None:
@@ -663,8 +714,17 @@ def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def record_path(machine: placeholders.Machine) -> Path:
-    return Path(machine.state) / "install-jobs" / "units.json"
+def record_path(machine: placeholders.Machine, record: str | None = None) -> Path:
+    """Where the record is kept: `record`, if the caller named one, else `{state}/install-jobs/units.json`.
+
+    **A ROOT RUN GIVEN `--home` UNDER AN ACCOUNT'S HOME NEEDS THIS NAMED ELSEWHERE.** `state` follows
+    `--state`, which the three-account shape's supervision leaves at its default, `{home}/.local/state`
+    under the account `--home` names. `open_record_directory` then refuses that path, since the account
+    owns a directory on the way, and every unit this run would otherwise update is treated as a hand
+    edit. `--record` points this at a root-owned path instead; `stand-up-backend` passes one for a root
+    run.
+    """
+    return Path(record) if record else Path(machine.state) / "install-jobs" / "units.json"
 
 
 class Untrusted(Exception):
@@ -921,7 +981,7 @@ def write_without_following(path: Path, text: str) -> None:
         stream.write(text)
 
 
-def ensure_log_directories(jobs) -> None:
+def ensure_log_directories(jobs, platform: str | None = None) -> None:
     """Create the directory each job's log file goes in.
 
     A SUPERVISOR OPENS THE LOG BEFORE IT RUNS THE PROGRAM, AND NEITHER CREATES
@@ -967,7 +1027,7 @@ def ensure_log_directories(jobs) -> None:
             if not log:
                 continue
             if root and job.scope == "system" and job.account is not None:
-                make_account_log(Path(log), job.account)
+                make_account_log(Path(log), declaration.effective_account(job, platform))
                 continue
             if root and job.scope != "system":
                 if not Path(log).parent.is_dir() and str(Path(log).parent) not in left:
@@ -1077,7 +1137,8 @@ def _as_account_hook(ids, working_directory: str, drop):
     return enter
 
 
-def prepare_jobs(jobs, dry_run: bool, runner=subprocess.run, drop=drop_to_account) -> None:
+def prepare_jobs(jobs, dry_run: bool, runner=subprocess.run, drop=drop_to_account,
+                  *, platform: str | None = None) -> None:
     """Create each job's declared directories, then run its prepare commands.
 
     **SOME STATE HAS TO EXIST BEFORE A JOB FIRST STARTS, AND ONLY THE JOB'S
@@ -1108,13 +1169,16 @@ def prepare_jobs(jobs, dry_run: bool, runner=subprocess.run, drop=drop_to_accoun
     for job in jobs:
         if not job.directories and not job.prepare:
             continue
-        account = getattr(job, "account", None)
-        if root and account is None:
+        declared_account = getattr(job, "account", None)
+        if root and declared_account is None:
             print(
                 f"  Left for the account, since this ran as root: preparing "
                 f"{job.label}. Run this again as that account."
             )
             continue
+        account = (
+            declaration.effective_account(job, platform) if declared_account is not None else None
+        )
         try:
             ids = pwd.getpwnam(account) if account is not None else None
         except KeyError:
@@ -1259,6 +1323,35 @@ def make_private_directory(directory: Path, mode: int = 0o700, owner: int | None
     return created
 
 
+def load_and_resolve(args, platform: str, machine: placeholders.Machine,
+                     jobs_dir: Path) -> list:
+    """The declarations in `jobs_dir` for `platform`, shaped for this run and
+    resolved against `machine`. Prints its notes to stdout, which `main`
+    redirects under `--running`."""
+    declared = load_jobs(jobs_dir, platform)
+    if args.single_account:
+        declared = as_invoker(drop_account_only(declared))
+    elif os.geteuid() == 0:
+        declared = leave_out_as_root(declared)
+    if not machine.root:
+        using_root = sorted(job.label for job in declared
+                            if placeholders.uses_placeholder(job, "root"))
+        if using_root:
+            why = (
+                "a run as root never executes `builder-root`, since another "
+                "account could have placed it. Pass --root."
+                if os.geteuid() == 0 else
+                f"`builder-root` is not in {machine.bin} or on PATH, or did not "
+                f"print one absolute path. Pass --root, or run bin/link-commands "
+                f"first."
+            )
+            raise Refused(
+                f"cannot find the Builder root, which {', '.join(using_root)} "
+                f"name as {{root}}: {why} Nothing was installed."
+            )
+    return resolve(declared, machine, log_dir=args.log_dir, platform=platform)
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog=PROG,
@@ -1273,6 +1366,13 @@ def main(argv: list[str]) -> int:
         "--log-dir",
         help="the root-owned directory the logs of system-scope jobs that run as an account are written "
         "to, as <label>.out and <label>.err. Required for such a job; supervision passes it",
+    )
+    parser.add_argument(
+        "--record",
+        help="where the installer's own record of units it wrote is kept, instead of "
+        "{state}/install-jobs/units.json. A root run given --home under an account's home needs this "
+        "named under a root-owned path, since the account owns a directory on the way to the default "
+        "location; supervision passes it for such a run",
     )
     parser.add_argument(
         "--single-account",
@@ -1313,6 +1413,15 @@ def main(argv: list[str]) -> int:
         "--force",
         action="store_true",
         help="replace a live unit that differs from its declaration",
+    )
+    parser.add_argument(
+        "--only",
+        nargs="+",
+        metavar="LABEL",
+        help="render, prepare and install exactly these jobs by label, leaving every "
+        "other declared job untouched — its prepare steps included. Refused if a "
+        "label names no declaration for this platform. A unit this run does not "
+        "touch keeps its existing record entry rather than losing it",
     )
     parser.add_argument(
         "--activate",
@@ -1358,34 +1467,35 @@ def main(argv: list[str]) -> int:
     machine = machine_from(args)
     jobs_dir = args.jobs or (REPO / "jobs")
 
-    declared = load_jobs(jobs_dir, platform)
-    if args.single_account:
-        declared = as_invoker(declared)
-    elif os.geteuid() == 0:
-        declared = leave_out_as_root(declared)
-    if not machine.root:
-        using_root = sorted(job.label for job in declared
-                            if placeholders.uses_placeholder(job, "root"))
-        if using_root:
-            why = (
-                "a run as root never executes `builder-root`, since another "
-                "account could have placed it. Pass --root."
-                if os.geteuid() == 0 else
-                f"`builder-root` is not in {machine.bin} or on PATH, or did not "
-                f"print one absolute path. Pass --root, or run bin/link-commands "
-                f"first."
-            )
-            raise Refused(
-                f"cannot find the Builder root, which {', '.join(using_root)} "
-                f"name as {{root}}: {why} Nothing was installed."
-            )
-    jobs = resolve(declared, machine, log_dir=args.log_dir)
+    # `--running`'s stdout is one job label per line and nothing else, because
+    # builder-update reads it as a list of labels. Loading and resolving print
+    # notes (an account-only job left out, a job left out as root, where a
+    # program was found), so under `--running` they go to stderr until the
+    # labels are printed.
+    with contextlib.redirect_stdout(sys.stderr) if args.running else contextlib.nullcontext():
+        jobs = load_and_resolve(args, platform, machine, jobs_dir)
     if not jobs:
-        print(f"{PROG}: no declarations list {platform}; nothing to install")
+        print(f"{PROG}: no declarations list {platform}; nothing to install",
+              file=sys.stderr if args.running else sys.stdout)
         return 0
 
     if args.running:
         return report_running(jobs, platform)
+
+    # EVERY DECLARED JOB THIS PLATFORM RESOLVES, KEPT ASIDE BEFORE --only NARROWS
+    # `jobs`. Pruning the record below has to know what is still declared, not only
+    # what this run touches, or a render limited to a few labels would read every
+    # other label's units as retired and erase their entries.
+    resolved_jobs = jobs
+    if args.only is not None:
+        wanted = set(args.only)
+        unknown = sorted(wanted - {job.label for job in jobs})
+        if unknown:
+            raise Refused(
+                f"--only names {len(unknown)} label(s) with no declaration for "
+                f"{platform}: {', '.join(unknown)}. Nothing was installed."
+            )
+        jobs = [job for job in jobs if job.label in wanted]
 
     system_scope = [job for job in jobs if job.scope == "system"]
     if system_scope and os.geteuid() != 0 and not args.dry_run and not args.status:
@@ -1402,7 +1512,7 @@ def main(argv: list[str]) -> int:
     if args.start is not None:
         return start_command(jobs, platform, machine.home, args)
 
-    record_file = record_path(machine)
+    record_file = record_path(machine, args.record)
     record = load_record(record_file)
     keep_record = record is not None
     if record is None:
@@ -1431,8 +1541,8 @@ def main(argv: list[str]) -> int:
         return report_status(jobs, entries, platform)
 
     if not args.dry_run:
-        ensure_log_directories(jobs)
-    prepare_jobs(jobs, args.dry_run)
+        ensure_log_directories(jobs, platform)
+    prepare_jobs(jobs, args.dry_run, platform=platform)
 
     wrote = replaced = skipped = unchanged = 0
     replaced_jobs: dict[str, declaration.Job] = {}
@@ -1457,7 +1567,14 @@ def main(argv: list[str]) -> int:
         # Saved even when a write refused partway, so the units written before
         # it are recognised as this installer's own on the next run.
         # Only units still declared are kept, so a retired job's entry goes.
-        declared_paths = {str(entry["path"]) for entry in entries}
+        # Computed from every job this platform resolves, not only the ones
+        # `entries` covers, so --only narrowing this run never reads an
+        # untouched label's units as retired.
+        declared_paths = {
+            str(path)
+            for job in resolved_jobs
+            for path in destinations(job, platform, machine.home, args.system_dir)
+        }
         written = {k: v for k, v in written.items() if k in declared_paths}
         if keep_record and not args.dry_run and written != record:
             save_record(record_file, written)

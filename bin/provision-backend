@@ -9,11 +9,12 @@
                                           let the operator's key into the agents account
 
 **This is the provisioning half of standing the backend up**, and it is
-deliberately only that half. A clean Ubuntu 22.04 machine is missing `zsh`,
-`lsof`, `tmux`, `git`, `curl`, a Python new enough to read a job
-declaration, that Python's venv support, the `getfacl` the Library's
-start-up guard reads ACLs with, and `bubblewrap` and `socat`, which a
-dispatched run's sandbox needs on Linux — measured by running Builder's backend
+deliberately only that half. A clean Ubuntu 24.04 machine is missing `zsh`,
+`lsof`, `tmux`, `git`, `curl`, its own `venv` support, the `getfacl` the
+Library's start-up guard reads ACLs with, and `bubblewrap` and `socat`, which
+a dispatched run's sandbox needs on Linux; an older machine stuck on Ubuntu
+22.04, or any machine without a Python new enough to read a job declaration,
+also needs `python3.11` itself — measured by running Builder's backend
 repositories in a container, not by reading them. Those are one installer's work and they are
 this crew's to do. What it does NOT do is fix code that names one machine, or
 make the Library's ownership guard portable: those belong to the crews that
@@ -121,23 +122,47 @@ NEEDS = (
         "proof": ["curl", "--version"],
     },
     {
+        "program": "gpg",
+        "why": "orient-deploy verifies that every commit it deploys is a merge GitHub "
+               "signed, and a clean Debian 12 has only gpgv",
+        "apt": "gnupg",
+        "brew": "gnupg",
+        "proof": ["gpg", "--version"],
+    },
+    {
         "program": "python3.11",
         "why": "job declarations are TOML, and tomllib arrived in 3.11",
         "apt": "python3.11",
         "brew": "python@3.11",
         # NOT a version check. `import tomllib` is the capability the
-        # interpreter is wanted for, and 22.04's package is a release
-        # candidate whose version string invites an argument this avoids.
-        "proof": ["python3.11", "-c", "import tomllib"],
+        # interpreter is wanted for, and 22.04's package used to install as a
+        # release candidate whose version string invited an argument this
+        # avoids. `works()` special-cases this program, through
+        # `python311_binary()`: the proof below is checked against the system
+        # `python3` first — Ubuntu 24.04's is 3.12, Debian 12's is 3.11.2 — so
+        # a machine whose stock Python already qualifies is never told to
+        # install a second one it does not need, and against the explicit
+        # `python3.11` package only when the system one does not qualify, as
+        # on Ubuntu 22.04's stock 3.10.
+        "proof": ["python3.11", "-I", "-c", "import tomllib"],
     },
     {
         # Debian and Ubuntu split `venv`'s pip bootstrap into its own package,
-        # so `python3.11` imports tomllib and still cannot build the venv every
-        # deploy area needs: `install-backend` failed on exactly that in a
-        # debian:bookworm rehearsal, after this command had reported every
-        # requirement present. Listed after `python3.11`, which it needs.
+        # so an interpreter that imports tomllib can still be unable to build
+        # the venv every deploy area needs: `install-backend` failed on
+        # exactly that in a debian:bookworm rehearsal, after this command had
+        # reported every requirement present. Listed after `python3.11`,
+        # which it needs.
+        #
+        # `works()` special-cases this program too, building the venv with
+        # whichever interpreter `python311_binary()` resolved for `python3.11`
+        # above, so the apt package tracks it: `python3-venv`, which apt
+        # resolves to `python3.12-venv` on Ubuntu 24.04, on a machine whose
+        # system `python3` already qualifies, or the explicit
+        # `python3.11-venv` otherwise. The static values below are the
+        # fallback for when neither interpreter is present yet; `plan()`
+        # overrides both on Linux once one is.
         "program": "venv",
-        "binary": "python3.11",
         "why": "install-backend builds a venv with pip in every deploy area",
         "apt": "python3.11-venv",
         # Homebrew's interpreter carries ensurepip, so on macOS this proof
@@ -154,7 +179,7 @@ NEEDS = (
         # bootstrap, so the copying proof refused a Python that install-backend
         # builds every venv with.
         "proof": [
-            "python3.11", "-c",
+            "python3.11", "-I", "-c",
             "import shutil, tempfile, venv\n"
             "d = tempfile.mkdtemp()\n"
             "try:\n"
@@ -214,13 +239,79 @@ def run(argv: list[str], **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(argv, capture_output=True, text=True, check=False, **kwargs)
 
 
+def _has_tomllib(binary: str) -> bool:
+    """Whether `binary` on PATH is a real `import tomllib`, not a version string."""
+    if shutil.which(binary) is None:
+        return False
+    try:
+        # `-I` FOR EVERY PROBE: `-c` puts the current directory first on sys.path, so a
+        # `tomllib.py` planted there would run as root. Isolated mode drops the cwd and
+        # PYTHON* from sys.path. Matches bin/stand-up-backend's own `_has_tomllib`.
+        done = run([binary, "-I", "-c", "import tomllib"], timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return done.returncode == 0
+
+
+def python311_binary() -> str:
+    """Which interpreter job declarations and venvs are built with.
+
+    The system `python3` when it already has tomllib — Ubuntu 24.04's is
+    3.12, Debian 12's is 3.11.2 — so a machine whose stock Python already
+    qualifies is never told to install a second one it does not need.
+    Checked before the explicit `python3.11` package, which an older system,
+    such as Ubuntu 22.04's stock 3.10, still needs. Also what this names when
+    NEITHER is present yet, since `python3.11` is the one apt can install.
+    """
+    if _has_tomllib("python3"):
+        return "python3"
+    if _has_tomllib("python3.11"):
+        return "python3.11"
+    return "python3.11"
+
+
+def _venv_works(binary: str) -> bool:
+    """Whether `binary -m venv` can build a working venv, with pip.
+
+    The same build the `venv` NEED's own proof runs, against whichever
+    interpreter `python311_binary()` resolved rather than always `python3.11`.
+    """
+    if shutil.which(binary) is None:
+        return False
+    try:
+        # `-I` FOR EVERY PROBE, same reason as `_has_tomllib`: without it a `tomllib.py`
+        # or `venv.py` planted in the working directory would be imported as root.
+        done = run(
+            [binary, "-I", "-c",
+             "import shutil, tempfile, venv\n"
+             "d = tempfile.mkdtemp()\n"
+             "try:\n"
+             "    venv.EnvBuilder(with_pip=True, symlinks=True).create(d)\n"
+             "finally:\n"
+             "    shutil.rmtree(d, ignore_errors=True)\n"],
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return done.returncode == 0
+
+
 def works(need: dict) -> bool:
     """Whether this program is present AND does the thing it is wanted for.
 
     Two tests, and the second is the one that catches the trap in the module
     docstring: a program can be on PATH, or a package can have installed
     cleanly, while the capability is absent.
+
+    `python3.11` and `venv` are special-cased: both accept whichever
+    interpreter `python311_binary()` resolves to — the system `python3` on a
+    machine new enough, the explicit `python3.11` package otherwise — rather
+    than always the explicit package.
     """
+    if need["program"] == "python3.11":
+        return _has_tomllib("python3") or _has_tomllib("python3.11")
+    if need["program"] == "venv":
+        return _venv_works(python311_binary())
     if shutil.which(need.get("binary", need["program"])) is None:
         return False
     try:
@@ -271,19 +362,30 @@ def plan(platform: str) -> list[dict]:
     the first thing that failed.
     """
     key = "apt" if platform == "linux" else "brew"
-    return [
-        {
+    items = []
+    for need in NEEDS:
+        if key not in need:
+            continue
+        package = need[key]
+        shows = need.get("shows", " ".join(need["proof"]))
+        # `venv`'s apt package tracks whichever interpreter `python3.11`
+        # resolved to: `python3-venv` (which apt resolves to the matching
+        # minor version, `python3.12-venv` on Ubuntu 24.04) for the system
+        # `python3` on a machine new enough, `python3.11-venv` otherwise.
+        if platform == "linux" and need["program"] == "venv":
+            binary = python311_binary()
+            package = "python3-venv" if binary == "python3" else "python3.11-venv"
+            shows = f"{binary} -m venv (with pip) in a temporary directory"
+        items.append({
             "program": need["program"],
-            "package": need[key],
+            "package": package,
             "why": need["why"],
             "proof": need["proof"],
-            "shows": need.get("shows", " ".join(need["proof"])),
+            "shows": shows,
             "state": "present" if works(need) else "missing",
             "need": need,
-        }
-        for need in NEEDS
-        if key in need
-    ]
+        })
+    return items
 
 
 def refresh_index(install: list[str], manager: str) -> None:
@@ -344,24 +446,33 @@ def outstanding() -> list[str]:
     installer this replaces ended with a list of manual steps in its closing
     text and that is where they stayed.
     """
-    return [
-        (
-            "Ubuntu 22.04's `python3` is 3.10, and installing 3.11 alongside "
-            "does NOT change what `/usr/bin/env python3` resolves to. The "
-            "declaration tools carry `#!/usr/bin/env python3` and refuse under "
-            "3.10, so invoke them explicitly:"
-        ),
-        "    python3.11 bin/install-jobs --help",
-        "    python3.11 tools/jobs-lint check <directory>",
-        "",
-        (
-            "Their shebangs are deliberately not `python3.11`: that would fail "
-            "on a machine whose only interpreter is `python3` at 3.12 or later, "
-            "trading one platform's problem for another's. And nothing here "
-            "repoints the system `python3`, because on Ubuntu that is what apt "
-            "runs under."
-        ),
-        "",
+    lines: list[str] = []
+    # Only on a machine whose own `python3` does not already qualify — an
+    # unsupported one, such as Ubuntu 22.04's stock 3.10 — does installing
+    # `python3.11` alongside leave `/usr/bin/env python3` resolving to the
+    # wrong interpreter. On Debian 12 and Ubuntu 24.04 the system `python3`
+    # is 3.11 or later already, so this note would be noise.
+    if python311_binary() != "python3":
+        lines += [
+            (
+                "This machine's `python3` is older than 3.11, and installing "
+                "`python3.11` alongside does NOT change what `/usr/bin/env "
+                "python3` resolves to. The declaration tools carry `#!/usr/bin/env "
+                "python3` and refuse under the older one, so invoke them explicitly:"
+            ),
+            "    python3.11 bin/install-jobs --help",
+            "    python3.11 tools/jobs-lint check <directory>",
+            "",
+            (
+                "Their shebangs are deliberately not `python3.11`: that would fail "
+                "on a machine whose only interpreter is `python3` at 3.12 or later, "
+                "trading one platform's problem for another's. And nothing here "
+                "repoints the system `python3`, because on Ubuntu that is what apt "
+                "runs under."
+            ),
+            "",
+        ]
+    lines += [
         (
             "The LLM gateway refuses to start without its credentials file, and "
             "that refusal is deliberate rather than something to work around: "
@@ -379,6 +490,7 @@ def outstanding() -> list[str]:
         "",
         "Code that names one machine is each owning crew's to convert, and this does not touch it.",
     ]
+    return lines
 
 
 def install_command(item: dict, platform: str) -> str:

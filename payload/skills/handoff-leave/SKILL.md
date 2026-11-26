@@ -76,6 +76,12 @@ in each section; vague "we worked on stuff" is failure mode.
 <One short paragraph. What should the next session do first? Be specific — "run `make test` then dispatch reviewer on PR #X" beats "continue the work.">
 ```
 
+**Keep user-owned data out of the handoff text.** A guest's details, health, ledger or
+calendar entries, a taste map: name the store that holds them and what the next session
+needs to look up there, never the data itself. A handoff on a crew that is not private
+becomes an Archive record in the Library (see "Record the handoff in the Library"
+below), where other crews' searches can reach it.
+
 ## State a cause only where you observed it
 
 **When you write that something died, give the exit code, the signal, or the reason the
@@ -165,12 +171,51 @@ work-item checkout and naming any release that was refused, quoting the refusal.
 refused release stays held until its grace period ends, and the successor must wait for
 it to end rather than write as you.
 
+## Record the handoff in the Library
+
+Once `handoff.md` is complete on disk (after the two release sections above, so it
+carries their lines), record a copy in the Library. The copy is Archive memory other
+crews' searches can reach, and `/handoff-pickup` reports whether the handoff it resumes
+from was recorded. Work out the crew name first:
+
+```bash
+/bin/bash -c 'if [ -n "$TMUX" ]; then tmux display-message -p "#S" 2>/dev/null; else basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; fi | tr "[:upper:]" "[:lower:]"'
+```
+
+Then call the ops tool `signal_log` with:
+
+- `kind`: `"handoff"`
+- `product`: the crew name that command printed
+- `actor`: this session's own name, the one it passes as `owner` to work-item tools
+- `url`: `file://` followed by the handoff's absolute path
+- `dedup_key`: `handoff:` followed by that same absolute path
+- `body`: the full text of `handoff.md`, exactly as written
+
+**The file stays where it is.** `co-rollover` reads it, `co-rollover-state.json` sits
+beside it, and `/handoff-pickup` reads it. The Library record is a copy.
+
+**A failure here leaves only the file, and the handoff is still complete.** The Library
+refuses a private crew's handoff with `HTTP 404: no such item, or none this identity may
+see`, which keeps that crew's handoffs out of the Library as intended. A crew whose
+session holds no ops tools cannot call `signal_log` at all. Either way, and on any other
+error, do not retry another way: say in the ack that the Library copy was not written,
+quoting the error, or saying that the session has no `signal_log` tool.
+
+**Record once, after the last edit.** The `dedup_key` makes the write idempotent: a
+second `signal_log` with the same key returns the first record's id with
+`"idempotent": true` and leaves its body as it was. An edit made after recording reaches
+the file only, and the file is what `/handoff-pickup` reads.
+
 ## On completion
 
-Surface a one-line ack to the operator with the path:
+Surface a one-line ack to the operator with the path, and whether the Library copy was
+written:
 
-> Handoff at `$(builder-root)/agent-runs/2026-05-20/co-shop-2245/handoff.md`. Pick up
-> next session with `/handoff-pickup`.
+> Handoff at `$(builder-root)/agent-runs/2026-05-20/co-shop-2245/handoff.md`, recorded
+> in the Library as `sig_…`. Pick up next session with `/handoff-pickup`.
+
+When the Library write failed, replace the middle clause with "not recorded in the
+Library: <the error, quoted>".
 
 Don't ask the operator if the doc looks right; it can always be edited later. Don't post
 to Slack. Don't dispatch further workers — this is a session-end skill, not a

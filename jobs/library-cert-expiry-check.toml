@@ -1,0 +1,44 @@
+name = "library-cert-expiry-check"
+description = "Warns when the Library's own served certificate, or any active registered machine certificate, is within 21 days of expiry. Without it a certificate can lapse with nobody told until the listener using it stops answering."
+label = "com.convivy.library.cert-expiry-check"
+command = [
+  "{deploy}/library/.venv/bin/python3",
+  "{deploy}/library/bin/cert_expiry_check.py",
+]
+platforms = ["macos", "linux"]
+scope = "system"
+account = "library"
+# `_library` on macOS: see jobs/library.toml's own account-macos comment.
+account-macos = "_library"
+enabled-by-default = true
+working-directory = "{deploy}/library"
+
+[log]
+stdout = "{state}/library-cert-expiry-check.log"
+stderr = "{state}/library-cert-expiry-check.log"
+
+# THE SAME DATABASE PATHS library.toml GIVES THE SERVER, because the checker
+# opens LIBRARY_DB directly and writes its warning through store.insert_signal,
+# which attaches LIBRARY_COLD_DB on every write that carries a dedup key — every
+# write this job makes. `tools/test_install_jobs.py` pins both to library.toml's.
+# LIBRARY_TLS_CERT/_KEY/_CA ARE SET HERE, UNLIKE THE LIBRARY'S OWN UPSTREAM
+# PLIST, because that plist relies on mtls.py's bare defaults
+# (`~/.library/tls/...`) and library.toml does not: it points the listener's
+# own TLS files at `{state}/library/tls/...` instead, so the checker is told
+# the same path or it would warn about a certificate at a path nothing serves.
+[environment]
+HOME = "{home}"
+LIBRARY_DB = "{state}/library/library.db"
+LIBRARY_COLD_DB = "{state}/library/cold.db"
+LIBRARY_TLS_CERT = "{state}/library/tls/server.crt"
+LIBRARY_TLS_KEY = "{state}/library/tls/server.key"
+LIBRARY_TLS_CA = "{state}/library/tls/ca.crt"
+LIBRARY_WRITES_ENABLED = "1"
+PATH = "{bin}:/usr/bin:/bin"
+
+# A one-shot check, not a server: RunAtLoad covers a restart, a sleep or a
+# prior failure as soon as the job loads, and every-seconds repeats it daily
+# after that, meeting the at-least-daily warning this job exists to give.
+[schedule]
+at-load = true
+every-seconds = 86400

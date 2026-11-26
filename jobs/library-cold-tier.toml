@@ -7,7 +7,9 @@ command = [
 ]
 platforms = ["macos", "linux"]
 scope = "system"
-account = "agents"
+account = "library"
+# `_library` on macOS: see jobs/library.toml's own account-macos comment.
+account-macos = "_library"
 enabled-by-default = true
 working-directory = "{deploy}/library"
 

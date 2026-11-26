@@ -2,22 +2,37 @@
 """The root-owned half of Builder's install.
 
     sudo <absolute python3> -I /opt/builder/src/shipwright@<sha>/bin/install-privileged \
-        --shape two --org <name> --release <tag> [--shipwright-repo <name>]
+        --shape two --org <name> [--release <tag>] [--agent-platform-repo <name>] \
+        [--shipwright-repo <name>] [--library-repo <name>] [--convivy-orient-repo <name>] \
+        [--commit <repo>=<sha>]...
     sudo <absolute python3> -I /opt/builder/src/shipwright@<sha>/bin/install-privileged \
         --shape three --org <name> [--release <tag>] [--agent-platform-repo <name>] \
-        [--shipwright-repo <name>] [--library-repo <name>] [--commit <repo>=<sha>]... \
-        [--consent ask|yes|no]
+        [--shipwright-repo <name>] [--library-repo <name>] [--convivy-orient-repo <name>] \
+        [--commit <repo>=<sha>]... [--consent ask|yes|no]
     sudo /opt/builder/libexec/update-privileged
 
-`--shape two` installs the shipwright-only root half: the bare copy, the extracted
-tree, the install record, the settings and the entry point. It fetches shipwright
-anonymously over HTTPS from the organisation `install.json` records, takes the
-release by tag, and never fetches agent-platform or library. It places no review
-launcher, no sudo rule, no approver key and no reviewers' tools.
+`--shape two` installs the root half that holds all four repositories: the bare
+copy, the extracted tree and the install record for each of shipwright,
+agent-platform, library and convivy-orient, plus the settings and the entry
+point. It fetches each anonymously over HTTPS from the organisation
+`install.json` records, taking the release by tag — named by `--release`, or the
+tag a prior install of this shape recorded, when `--release` is not given — except
+that convivy-orient falls back to a token minted from the Orient read key
+(`etc/orient-read-app.pem`, placed with `github-gate --place-key --orient-read`)
+when an anonymous probe of it answers 401, which happens only when an
+install's organisation keeps that one repository private. Naming `--commit
+<repo>=<sha>` for one or more of the four repositories checks each against
+that repository's own tag before anything is fetched from it, exactly as
+shape three's own `--commit` does; a repository named with no `--commit`
+fetches the tag with no such check, and naming one with no `--release` to
+check it against is refused. It places `libexec/model-provider` from
+agent-platform's tree, and on a Mac the pinned Python shape three also
+places. It places no review launcher, no sudo rule, no approver key and no
+reviewers' tools.
 
 `--shape three` installs the three-account root half: the review launcher, the
 reviewers' tools, the one sudo rule that reaches the launcher, and a root-owned
-tree and record line for library. Nothing yet reads that tree.
+tree and record line for library and for convivy-orient. Nothing yet reads either tree.
 
 **This runs only from its own extracted tree.** It refuses unless its file sits at
 `<prefix>/src/shipwright@<sha>/bin/install-privileged` and every directory from the
@@ -36,22 +51,31 @@ this file.
 **Root installs only a commit confirmed by a signed release, or by GitHub's own `main`.**
 With a release tag — named by `--release`, or the tag a prior anonymous install of this
 shape recorded, read when `--release` is not given — root fetches shipwright,
-agent-platform and (on the three-account shape) library anonymously over HTTPS, each by
-that tag, following a four-step order (ls-remote, recorded-tag check, fetch without
-force, peel and ancestry) so a tag moved backward, or a recorded tag moved forward, is
-refused. On the three-account shape, naming a tag with `--release` also requires
-`--commit <repo>=<sha>` for every one of the three repositories, each checked against
-the tag's own commit before anything is fetched from that repository; a mismatch is
-refused and chooses nothing. The two-account shape always takes this path. With no tag
-at all — the three-account shape's only other case — root instead mints a read token
-from the approver key for each repository, fetches `refs/heads/main` alone into a bare
-copy under `<prefix>/src`, and revokes the token; the commit it installs is the fetched
-head, or the one named with `--commit <repo>=<sha>`, refused unless it is an ancestor of
-that fetched `main`. Each commit is extracted with `git archive` into its own root-owned
-tree, refused if it holds a symbolic link, a submodule or any other special entry.
-Everything placed comes from those trees alone, read without following a link. Nothing
-under the `agents` home or a deploy area is read, except the instruction-file diff that
-the operator is shown and may consent to on the three-account shape.
+agent-platform, library and convivy-orient anonymously over HTTPS, each by that tag,
+following a four-step order (ls-remote, recorded-tag check, fetch without force, peel
+and ancestry) so a tag moved backward, or a recorded tag moved forward, is refused. On
+the two-account shape, convivy-orient alone falls back to a token minted from the Orient
+read key when one anonymous HTTPS probe of it (a GET of its `info/refs`, the same request
+`git` makes to learn whether a remote takes the smart protocol) answers 401, which happens
+only when that install's organisation keeps convivy-orient private; the other three
+repositories are always anonymous. A probe that answers neither 200 nor 401 — another
+status, a redirect, or a connection that fails outright — refuses rather than guessing,
+naming what the probe saw. On the two-account shape, `--commit <repo>=<sha>` is accepted
+for any of the four repositories, each checked against the tag's own commit before
+anything is fetched from that repository; a mismatch is refused and chooses nothing, and
+so is a `--commit` given with no `--release`, since a plain replay carries no tag to
+check it against. On the three-account shape, naming a tag with `--release` instead
+requires `--commit` for every one of the four repositories, checked the same way. The
+two-account shape always takes the tag path. With no tag at all — the three-account
+shape's only other case — root instead mints
+a read token from the approver key for each repository, fetches `refs/heads/main` alone
+into a bare copy under `<prefix>/src`, and revokes the token; the commit it installs is
+the fetched head, or the one named with `--commit <repo>=<sha>`, refused unless it is an
+ancestor of that fetched `main`. Each commit is extracted with `git archive` into its own
+root-owned tree, refused if it holds a symbolic link, a submodule or any other special
+entry. Everything placed comes from those trees alone, read without following a link.
+Nothing under the `agents` home or a deploy area is read, except the instruction-file diff
+that the operator is shown and may consent to on the three-account shape.
 
 **Nothing live changes until everything is built.** The launcher, library, sudo
 rule, reviewers' tools and venv are staged beside their live paths and checked. Only
@@ -62,14 +86,47 @@ arguments. It runs the copy in the newest tree it has installed, under `env -i`.
 newer shipwright commit is installed by running that commit's copy, and the entry
 point moves only when that copy succeeds.
 
+**Both shapes place the deploy step's keyring and entry point.** GitHub's web-flow
+public key, shipped as `payload/etc/github-web-flow.asc`, goes to
+`etc/github-web-flow.asc`, and `libexec/orient-deploy` is rewritten to run the newest
+tree's `orient-deploy`. Neither does anything until a person turns on following
+Orient's `main`.
+
+**Root keeps the root half it replaces, and puts it back with no download.**
+Each run that places a new root half first saves the record it is about to
+replace as `src/installed.previous`, in the same staged swap as the new
+record, so a kill before the swap leaves neither written and a kill after
+leaves both. Nothing removes a tree from `src` once extracted, so the old
+release's trees are still on the machine.
+
+    sudo <absolute python3> -I /opt/builder/src/shipwright@<old sha>/bin/install-privileged \
+        --shape two|three --restore-previous
+
+`--restore-previous` reinstalls, from the trees `installed.previous` names, checked to
+be root-owned, what each shape itself places: on shape three, the review launcher, the
+model-provider tool, root's own copy of agent-platform's library and the sudo rule; on
+shape two, the model-provider tool alone, since shape two places none of the rest. Both
+shapes restore the web-flow keyring and rewrite both entry points to that shipwright
+tree. It fetches nothing and makes no git call: the reviewers' own venv, Claude binary
+and instruction file, which only a network fetch rebuilds, are left as they are. It
+refuses, changing nothing, when no saved record exists, a tree it names is missing, or
+one is not root-owned. It is the only way root's half moves to an older commit, and only
+the administrator's `sudo` starts it.
+
 **Settings persist, and only the settings that name this install do.** The first
 run writes `install.json` beside the slots: the organisation, the repository names
-(shipwright, agent-platform and, on the three-account shape, library) and the shape.
+(shipwright, agent-platform, library and convivy-orient) and the shape.
 An `entities` list an operator hand-places there carries forward byte-for-byte, on
-either shape; on a multi-entity install, the three-account shape also derives an
-`accounts` map from it fresh on every run, for the review launcher's own use. Test
-settings never persist. They come from `fixtures.json` under the prefix, and only
-where the prefix is not the real install root.
+either shape, and so does `follow_orient_main`, which only `orient-deploy --enable`
+writes. `approver_app_id` is different: every run derives it fresh from the
+root-only id slot `github-gate --place-key` fills once GitHub has vouched for
+the key, that slot being the single source, since a key may be placed before
+install.json exists at all; where no id is placed, the value already in
+install.json carries forward byte-for-byte instead. On a multi-entity install,
+the three-account shape also derives an `accounts` map from `entities` fresh on
+every run, for the review launcher's own use. Test settings never persist.
+They come from `fixtures.json` under the prefix, and only where the prefix is
+not the real install root.
 """
 
 from __future__ import annotations
@@ -77,6 +134,7 @@ from __future__ import annotations
 import argparse
 import base64
 import difflib
+import grp
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -84,6 +142,7 @@ import json
 import os
 import pathlib
 import platform as platform_mod
+import pwd
 import re
 import secrets
 import shlex
@@ -92,6 +151,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import urllib.error
 import urllib.request
 
 HERE_FILE = pathlib.Path(__file__).resolve()
@@ -155,12 +215,17 @@ Refused = gg.Refused
 # provision-accounts actually created.
 ae = _load_sibling("account_entities", "account_entities.py")
 
-ROLES = ("agent-platform", "library", "shipwright")
+ROLES = ("agent-platform", "library", "shipwright", "convivy-orient")
 MAIN = "refs/heads/main"
 CONFIG = "install.json"
 FIXTURES = "fixtures.json"
+# The record `src/installed` held just before this run replaces it, staged in
+# the same swap as the new one so `--restore-previous` can read what to put
+# back. Named relative to `src/`, beside `installed` itself.
+PREVIOUS_RECORDS_NAME = "installed.previous"
 
 # The files placed from each tree. Paths are relative to the tree's root.
+# LAUNCHER's own shebang is rewritten in place; see rewrite_launcher_shebang.
 LAUNCHER = "bin/review-launch"
 MODEL_PROVIDER = "sbin/model-provider"
 LIBRARY = "lib/agent-platform"
@@ -199,7 +264,7 @@ CLEAN_ENV = {"PATH": SYSTEM_PATH, "HOME": "/var/root", "LANG": "C"}
 # The argv the updater and the handoff run under. `env -i` clears what the
 # caller exported, PYTHONPATH and PATH included.
 ENTRY_ARGV = ["/usr/bin/env", "-i", f"PATH={SYSTEM_PATH}", "HOME=/var/root"]
-INTERPRETERS = {"Darwin": "/opt/homebrew/bin/python3", "Linux": "/usr/bin/python3"}
+INTERPRETERS = {"Darwin": "/opt/homebrew/bin/python3.11", "Linux": "/usr/bin/python3"}
 CLAUDE_PLATFORMS = {
     ("Darwin", "arm64"): "darwin-arm64",
     ("Linux", "x86_64"): "linux-x64",
@@ -229,6 +294,7 @@ DEFAULTS = {
     "agent_platform_repo": "agent-platform",
     "shipwright_repo": "shipwright",
     "library_repo": "library",
+    "convivy_orient_repo": "convivy-orient",
     "download_base": DEFAULT_DOWNLOAD_BASE,
     "api_base": gg.API,
     "sudoers_dir": DEFAULT_SUDOERS_DIR,
@@ -239,13 +305,14 @@ DEFAULTS = {
     "require_root": True,
 }
 # What install.json keeps. Every other setting is a test setting. An install.json
-# written before library_repo existed has none, and still loads: merged_config
-# fills it from DEFAULTS.
-PERSISTED = ("org", "agent_platform_repo", "shipwright_repo", "library_repo", "shape")
-# Shape two fetches only shipwright and never agent-platform, so its record
-# names neither. The three keys are the organisation, the repository name and
-# the shape, as the plan's Handoff sets out.
-PERSISTED_TWO = ("org", "shipwright_repo", "shape")
+# written before library_repo or convivy_orient_repo existed has neither, and still
+# loads: merged_config fills them from DEFAULTS.
+PERSISTED = ("org", "agent_platform_repo", "shipwright_repo", "library_repo",
+             "convivy_orient_repo", "shape", "library_account")
+# Shape two fetches all four repositories, so its record names all four,
+# beside the organisation and the shape, as the plan's Handoff sets out.
+PERSISTED_TWO = ("org", "shipwright_repo", "agent_platform_repo", "library_repo",
+                 "convivy_orient_repo", "shape")
 # Shape three's entities, read by account_entities rather than merged into a
 # flag-settable setting: tolerated here so an entities list an operator
 # placed in install.json by hand does not refuse as an unknown key, and
@@ -256,16 +323,57 @@ ENTITIES_KEY = "entities"
 # tolerated as an unknown key the same way ENTITIES_KEY is, since this only
 # ever writes it fresh from `entities` and never reads it back into cfg.
 ACCOUNTS_KEY = "accounts"
+# Whether this install follows Orient's `main`: only `orient-deploy --enable`
+# writes it, and only `true` turns the deploy step on. Tolerated and carried
+# forward byte-for-byte the same way ENTITIES_KEY is, never fabricated, so a
+# fresh install has no such key and a replay never drops one a person set.
+FOLLOW_ORIENT_MAIN_KEY = "follow_orient_main"
+# The approver App's id, a public value (every check-run response carries
+# app.id), kept here so an account without the key's root-only slot can still
+# read which App it signs for. Tolerated as an unknown key the same way
+# ENTITIES_KEY is. Every run derives it fresh from the id slot
+# `github-gate --place-key` writes once GitHub has vouched for the key, since
+# that slot is the single source and a key may be placed before install.json
+# exists at all; where no id is placed, the stored value carries forward
+# byte-for-byte, never fabricated.
+APPROVER_APP_ID_KEY = "approver_app_id"
+CARRIED_KEYS = (ENTITIES_KEY, FOLLOW_ORIENT_MAIN_KEY, APPROVER_APP_ID_KEY)
+# GitHub's web-flow public key, the keyring root's deploy step verifies each
+# merge on Orient's `main` against. Read from the tree's payload and placed
+# under the root-only `etc`, on both shapes. A rotation is a reviewed change to
+# the payload file, which the next install places.
+WEB_FLOW_SOURCE = "payload/etc/github-web-flow.asc"
+WEB_FLOW_KEYRING = "etc/github-web-flow.asc"
+# The deploy step's entry point, which the root job runs: it execs the copy of
+# `orient-deploy` in the newest tree this installed, as `update-privileged`
+# does for this file.
+DEPLOY_ENTRY = "libexec/orient-deploy"
 # What fixtures.json may name. Honoured only where the prefix is not the real root.
 FIXTURE_KEYS = ("github_base", "download_base", "api_base", "interpreter", "sudoers_dir",
                 "visudo", "pip_args", "homes", "require_root")
 
 
 def carry_entities(stored: dict, persisted: dict) -> None:
-    """Carry `stored`'s `entities` key into `persisted` byte-for-byte, so
-    neither shape's rewrite of install.json ever drops or fabricates it."""
-    if ENTITIES_KEY in stored:
-        persisted[ENTITIES_KEY] = stored[ENTITIES_KEY]
+    """Carry `stored`'s `entities` and `follow_orient_main` keys into
+    `persisted` byte-for-byte, so neither shape's rewrite of install.json
+    ever drops or fabricates them. `approver_app_id` is not one of these:
+    `approver_app_id_setting` below derives it fresh instead."""
+    for key in (ENTITIES_KEY, FOLLOW_ORIENT_MAIN_KEY):
+        if key in stored:
+            persisted[key] = stored[key]
+
+
+def approver_app_id_setting(stored: dict, prefix: str) -> str | None:
+    """install.json's `approver_app_id`, read fresh from the root-only id
+    slot when `github-gate --place-key` has placed one there: that slot is
+    the single source, and a key may be placed before install.json exists at
+    all, so the id can get ahead of anything install.json remembers on its
+    own. Where no id is placed, `stored`'s own value carries forward
+    byte-for-byte, never fabricated. None when neither names one."""
+    raw = gg.read_slot(os.path.join(prefix, gg.ID_SLOT))
+    if raw:
+        return raw.decode("ascii", "replace").strip()
+    return stored.get(APPROVER_APP_ID_KEY)
 
 
 def account_map(entities: list[str], prefix: str) -> dict:
@@ -286,22 +394,30 @@ def account_map(entities: list[str], prefix: str) -> dict:
     }
 
 
-def persisted_two(stored: dict, cfg: dict) -> dict:
+def persisted_two(stored: dict, cfg: dict, prefix: str) -> dict:
     """What `install_two` writes back to install.json: PERSISTED_TWO's keys,
-    plus `entities` carried forward exactly as stored, when present."""
+    `entities` and `follow_orient_main` carried forward exactly as stored,
+    when present, and `approver_app_id` set from `approver_app_id_setting`."""
     persisted = {k: cfg[k] for k in PERSISTED_TWO if k in cfg}
     carry_entities(stored, persisted)
+    app_id = approver_app_id_setting(stored, prefix)
+    if app_id is not None:
+        persisted[APPROVER_APP_ID_KEY] = app_id
     return persisted
 
 
 def persisted_three(stored: dict, cfg: dict, prefix: str) -> dict:
     """What `install_three` writes back to install.json: PERSISTED's keys,
-    `entities` carried forward exactly as stored, and `accounts` recomputed
-    fresh from `cfg["entities"]` on every run, so a stale map, or one left
-    from an install that has since dropped to one entity, never outlives
-    the change."""
+    `entities` and `follow_orient_main` carried forward exactly as stored,
+    `approver_app_id` set from `approver_app_id_setting`, and `accounts`
+    recomputed fresh from `cfg["entities"]` on every run, so a stale map, or
+    one left from an install that has since dropped to one entity, never
+    outlives the change."""
     persisted = {k: cfg[k] for k in PERSISTED}
     carry_entities(stored, persisted)
+    app_id = approver_app_id_setting(stored, prefix)
+    if app_id is not None:
+        persisted[APPROVER_APP_ID_KEY] = app_id
     accounts = account_map(cfg["entities"], prefix)
     if accounts:
         persisted[ACCOUNTS_KEY] = accounts
@@ -315,19 +431,27 @@ def token() -> str:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog=PROG, description="The root-owned half of Builder's install.")
     p.add_argument("--shape", choices=("two", "three"), default=None,
-                   help="the install shape: two (shipwright-only root half) or three "
-                        "(the review launcher, reviewers' tools and sudo rule)")
+                   help="the install shape: two (all four repositories, no review "
+                        "launcher) or three (also the review launcher, reviewers' "
+                        "tools and sudo rule)")
     p.add_argument("--release", default=None, metavar="TAG",
                    help="the release tag to install (shape two, or shape three fetched "
                         "anonymously)")
     p.add_argument("--org", help="the GitHub organisation that holds the repositories")
     p.add_argument("--agent-platform-repo", help="the agent-platform repository's name")
     p.add_argument("--shipwright-repo", help="the shipwright repository's name")
-    p.add_argument("--library-repo", help="the library repository's name (shape three)")
+    p.add_argument("--library-repo", help="the library repository's name")
+    p.add_argument("--convivy-orient-repo", help="the convivy-orient repository's name")
     p.add_argument("--commit", action="append", default=[], metavar="REPO=SHA",
-                   help="install this commit of REPO instead of its main (repeatable)")
+                   help="check REPO's tag against this commit before fetching it (shape two, "
+                        "optional, or shape three given --release, required for every "
+                        "repository); install this commit of REPO instead of its main (shape "
+                        "three with no --release). Repeatable.")
     p.add_argument("--consent", choices=("ask", "yes", "no"), default=None,
                    help="answer the instruction-file question without asking")
+    p.add_argument("--restore-previous", action="store_true",
+                   help="reinstall the root half this install last replaced, from the "
+                        "trees already on the machine; fetches nothing")
     return p
 
 
@@ -392,6 +516,31 @@ def read_tree_file(tree: str, rel: str) -> bytes:
     if data is None:
         raise Refused(f"{rel} is missing from {tree}. Nothing was changed.")
     return data
+
+
+# The launcher's own shebang names agent-platform's build account's interpreter
+# (a Homebrew path on macOS), which root cannot run. Matched here so the line
+# this installs instead, naming the interpreter `cfg["interpreter"]` resolved
+# for root's own platform, replaces a line of the same shape rather than an
+# upstream launcher that changed underneath this check.
+LAUNCHER_SHEBANG = re.compile(r"^#!\S+/python3(?:\.\d+)?[ \t]+-I\b")
+
+
+def rewrite_launcher_shebang(data: bytes, interpreter: str) -> bytes:
+    """`data` (the launcher as agent-platform ships it) with its first line
+    replaced by a shebang naming `interpreter`, the root interpreter resolved
+    for this platform, so sudo can run the file it places. Refused, naming
+    the line, when the first line is not `#!` followed by a path ending in
+    `python3` (optionally versioned) and `-I`."""
+    newline = data.find(b"\n")
+    first_line = data if newline == -1 else data[:newline]
+    text = first_line.decode("utf-8", "replace")
+    if not LAUNCHER_SHEBANG.match(text):
+        raise Refused(f"{LAUNCHER}'s first line is {printable(text)!r}, not a #! line naming a "
+                      f"python3 interpreter with -I. Refusing to place it rewritten. "
+                      f"Nothing was changed.")
+    rest = b"" if newline == -1 else data[newline:]
+    return f"#!{interpreter} -I".encode("utf-8") + rest
 
 
 def own_tree(path: str) -> None:
@@ -486,13 +635,14 @@ def fixture_settings(prefix: str) -> dict:
 
 
 def merged_config(stored: dict, fixtures: dict, args: argparse.Namespace) -> dict:
-    extra = sorted(set(stored) - set(PERSISTED) - {ENTITIES_KEY, ACCOUNTS_KEY})
+    extra = sorted(set(stored) - set(PERSISTED) - {*CARRIED_KEYS, ACCOUNTS_KEY})
     if extra:
         raise Refused(f"{CONFIG} names {', '.join(extra)}, which is not a persisted setting. "
                       f"Nothing was changed.")
     cfg = {**DEFAULTS, **{k: stored[k] for k in PERSISTED if k in stored}, **fixtures}
     for key, value in (("org", args.org), ("agent_platform_repo", args.agent_platform_repo),
                        ("shipwright_repo", args.shipwright_repo), ("library_repo", args.library_repo),
+                       ("convivy_orient_repo", args.convivy_orient_repo),
                        ("shape", args.shape)):
         if value is not None:
             cfg[key] = value
@@ -630,12 +780,13 @@ def is_on_main(bare: str, sha: str) -> bool:
 TAG = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)(\.?[0-9]+)?)?$")
 
 
-def remote_tag_commit(url: str, tag: str) -> str:
+def remote_tag_commit(url: str, tag: str, *, token_value: str | None = None) -> str:
     """The commit the remote's tag resolves to, read with `git ls-remote` under the
     cleared environment. Takes the peeled line (`refs/tags/<tag>^{}`) for an
-    annotated tag; the unpeeled line names the tag object. Changes no local ref."""
+    annotated tag; the unpeeled line names the tag object. Changes no local ref.
+    `token_value`, given, is sent the same way `git_in` sends any other token."""
     done = git_in("", "ls-remote", "--quiet", url,
-                  f"refs/tags/{tag}", f"refs/tags/{tag}^{{}}")
+                  f"refs/tags/{tag}", f"refs/tags/{tag}^{{}}", token_value=token_value)
     if done.returncode:
         raise Refused(f"git could not read tag {tag} from {url}: {tail(done.stderr)}. "
                       f"Nothing was fetched.")
@@ -680,12 +831,12 @@ def last_recorded_commit(records: str, name: str) -> str | None:
     return None
 
 
-def fetch_tag(bare: str, url: str, tag: str) -> None:
+def fetch_tag(bare: str, url: str, tag: str, *, token_value: str | None = None) -> None:
     """Fetch `main` and the tag without force, so a tag that moved on the remote is
     refused rather than overwritten. A failed fetch is a refusal; root never retries
     with force."""
     done = git_in(bare, "fetch", "--no-write-fetch-head", "--quiet", url,
-                  f"{MAIN}:{MAIN}", f"refs/tags/{tag}:refs/tags/{tag}")
+                  f"{MAIN}:{MAIN}", f"refs/tags/{tag}:refs/tags/{tag}", token_value=token_value)
     if done.returncode:
         raise Refused(f"git could not fetch tag {tag} from {url}: {tail(done.stderr)}. "
                       f"Nothing was installed from it.")
@@ -714,14 +865,16 @@ def parse_release_tag(value: str) -> str:
 
 
 def fetch_release_tag(bare: str, name: str, url: str, tag: str, prior_records: str,
-                      expected: str | None = None) -> str:
+                      expected: str | None = None, *, token_value: str | None = None) -> str:
     """One repository's tag, fetched by the four-step order (ls-remote, recorded-tag
     check, fetch without force, peel and ancestry): a tag moved backward, or a recorded
     tag moved forward, is refused. `expected`, when given, is the commit `--commit` named
     for `name`; a mismatch with the remote's own tag is refused before anything is
-    fetched from this repository, and chooses nothing. Returns the peeled commit."""
+    fetched from this repository, and chooses nothing. `token_value`, given, is sent with
+    every step that reaches the remote, for convivy-orient's fallback on the two-account
+    shape. Returns the peeled commit."""
     # Step 1: read the tag's commit from the remote. Changes no local ref.
-    remote_commit = remote_tag_commit(url, tag)
+    remote_commit = remote_tag_commit(url, tag, token_value=token_value)
     print(f"remote: tag {tag} -> {remote_commit}")
 
     if expected is not None and expected != remote_commit:
@@ -736,7 +889,7 @@ def fetch_release_tag(bare: str, name: str, url: str, tag: str, prior_records: s
 
     # Step 3: fetch main and the tag without force. A failed fetch is a refusal.
     ensure_bare(bare)
-    fetch_tag(bare, url, tag)
+    fetch_tag(bare, url, tag, token_value=token_value)
 
     # Step 4: peel, verify against the remote commit, and check ancestry.
     peeled = peeled_tag_commit(bare, tag)
@@ -751,6 +904,68 @@ def fetch_release_tag(bare: str, name: str, url: str, tag: str, prior_records: s
                       f"install last recorded for {name}. A tag moved backward is refused. "
                       f"Nothing was installed.")
     return peeled
+
+
+# How long the visibility probe gets to answer, below.
+ORIENT_VISIBILITY_TIMEOUT = 15
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuses to follow a redirect: the probe's own status reaches the caller as
+    an HTTPError instead of a followed response."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def orient_visible(url: str) -> bool:
+    """Whether `url`'s repository is public over anonymous HTTPS: one GET of
+    `<url>.git/info/refs?service=git-upload-pack`, the request `git` itself makes
+    to learn whether a remote takes the smart protocol, with no credential and no
+    redirect followed. True on 200 (public). False on 401 (private: the two-account
+    shape's convivy-orient fetch needs the Orient read key). Any other status, a
+    redirect, a connection that fails, or a timeout refuses, naming what happened;
+    nothing is changed.
+
+    A `url` that is not http or https (a test fixture's `file://` remote) is always
+    public: there is no HTTP credential concept for it, and a repository missing
+    there fails the ordinary four-step order's own `ls-remote` instead, exactly as
+    it does for the other three repositories."""
+    if not url.startswith(("http://", "https://")):
+        return True
+    probe = f"{url}.git/info/refs?service=git-upload-pack"
+    opener = urllib.request.build_opener(_NoRedirect(), urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(probe, timeout=ORIENT_VISIBILITY_TIMEOUT) as resp:
+            status = resp.status
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+    except (urllib.error.URLError, OSError) as exc:
+        raise Refused(f"could not read {probe} ({exc}). Nothing was changed.")
+    if status == 200:
+        return True
+    if status == 401:
+        return False
+    raise Refused(f"{probe} answered {status}, neither 200 (public) nor 401 (private). "
+                  f"Nothing was changed.")
+
+
+def convivy_orient_token(cfg: dict, prefix: str, name: str, url: str, tag: str
+                         ) -> tuple[str | None, object | None]:
+    """Whether the two-account shape's convivy-orient fetch needs a credential,
+    decided by `orient_visible`. (None, None) when `url` is public: the organisation
+    publishes convivy-orient, so this never reads the Orient read key slot. Otherwise
+    a token minted from the placed Orient read key, reusing `read_token` exactly as
+    `orient-deploy` does, and the bound `GitHub.revoke` the caller runs on that token
+    once the fetch using it finishes, in a `finally`, win or lose; refuses, naming
+    `github-gate --place-key --orient-read`, when no key is placed, before anything
+    else is fetched."""
+    if orient_visible(url):
+        return None, None
+    key_path, app_id = gg.placed_key(prefix, orient_read=True)
+    jwt = gg.app_jwt(key_path, app_id)
+    gh = gg.GitHub(api=cfg["api_base"])
+    return read_token(gh, jwt, cfg["org"], name), gh.revoke
 
 
 def extract(prefix: str, bare: str, name: str, sha: str) -> str:
@@ -801,6 +1016,25 @@ def stage_library(plan: Plan, tree: str, dst: str) -> None:
 
 # Accounts and the instruction file.
 
+# **`library_account` TELLS THE LIBRARY IT RUNS IN ITS OWN ACCOUNT.** The Library's
+# person-save route reads it from this file to decide whether a save crossed an
+# account boundary (the Library's protocol, on saving a person): absent means
+# no boundary, and a name the machine lacks, or one the Library does not run as, is
+# refused. `shape` cannot answer that, because shape two gains a Library account
+# only later. The value is worked out on every shape-three run rather than carried
+# from the stored file, so an update rewrites it instead of dropping it, and a run
+# whose account is missing refuses before anything is written. The names match
+# `LIBRARY_ACCOUNT_NAMES` in bin/provision-accounts, which creates the account first;
+# tools/test_install_privileged.py checks that the two tables agree.
+LIBRARY_ACCOUNT_NAMES = {"macos": "_library", "linux": "library"}
+
+
+def library_account(cfg: dict) -> str:
+    name = LIBRARY_ACCOUNT_NAMES["macos" if platform_mod.system() == "Darwin" else "linux"]
+    home_of(cfg, name)
+    return name
+
+
 def home_of(cfg: dict, account: str) -> str:
     if account in cfg["homes"]:
         return cfg["homes"][account]
@@ -817,6 +1051,32 @@ def home_of(cfg: dict, account: str) -> str:
         raise Refused(f"the directory service has no account {account}. Create it with "
                       f"bin/provision-accounts --shape three first.")
     return value
+
+
+# Duplicated from `bin/provision-accounts`' own `ORIENT_ACCOUNT_NAMES` and
+# `ORIENT_TUNNEL_GROUP` the same way `LIBRARY_ACCOUNT_NAMES` above is:
+# tools/test_install_privileged.py checks that the account-name tables agree.
+# `verify_ownership` reads both to recognise `{prefix}/run/orient`, the socket
+# directory provision-accounts creates and owns as Orient.
+ORIENT_ACCOUNT_NAMES = {"macos": "_orient", "linux": "orient"}
+ORIENT_TUNNEL_GROUP = "orient-tunnel"
+
+
+def orient_identity() -> tuple[int | None, int | None]:
+    """(Orient's own account's uid, ORIENT_TUNNEL_GROUP's gid) on this platform,
+    each None when the directory service has not created it yet. Looked up
+    fresh on every call, not cached, so a run sees an account or group
+    bin/provision-accounts just created."""
+    name = ORIENT_ACCOUNT_NAMES["macos" if platform_mod.system() == "Darwin" else "linux"]
+    try:
+        uid = pwd.getpwnam(name).pw_uid
+    except KeyError:
+        uid = None
+    try:
+        gid = grp.getgrnam(ORIENT_TUNNEL_GROUP).gr_gid
+    except KeyError:
+        gid = None
+    return uid, gid
 
 
 def consent(mode: str) -> bool:
@@ -897,7 +1157,8 @@ def stage_venv(cfg: dict, ap_tree: str, rv: str, plan: Plan) -> None:
     made = subprocess.run([venv_interpreter(cfg), "-I", "-m", "venv", staging], env=CLEAN_ENV,
                           cwd="/", capture_output=True, check=False)
     if made.returncode:
-        raise Refused(f"could not create the reviewers' venv: {tail(made.stderr)}. "
+        # venv prints its "ensurepip is not available" refusal on stdout.
+        raise Refused(f"could not create the reviewers' venv: {tail(made.stderr or made.stdout)}. "
                       f"Nothing that is live was replaced.")
     pip_env = dict(CLEAN_ENV, PIP_NO_INPUT="1", PIP_DISABLE_PIP_VERSION_CHECK="1",
                    PIP_NO_CACHE_DIR="1", PIP_CONFIG_FILE=os.devnull)
@@ -1099,6 +1360,25 @@ def write_updater(prefix: str, interpreter: str, sha: str, shape: str) -> None:
             f"exec {' '.join(ENTRY_ARGV)} {shlex.quote(interpreter)} -I {shlex.quote(target)} "
             f"--shape {shape}\n")
     write_atomic(os.path.join(prefix, "libexec", "update-privileged"), text.encode("utf-8"), 0o755)
+    write_deploy_entry(prefix, interpreter, sha)
+
+
+def write_deploy_entry(prefix: str, interpreter: str, sha: str) -> None:
+    """`libexec/orient-deploy`, which execs this tree's `orient-deploy` under the
+    cleared environment. Written on every install, so the root job always runs
+    the newest tree's copy; the program itself does nothing unless install.json
+    turns the deploy step on. `SUDO_USER` alone is carried through, so a person's
+    `--accept` records who ran it."""
+    target = os.path.join(prefix, "src", f"shipwright@{sha}", "bin", "orient-deploy")
+    text = (f"#!/bin/sh\n"
+            f"exec {' '.join(ENTRY_ARGV)} \"SUDO_USER=${{SUDO_USER:-}}\" "
+            f"{shlex.quote(interpreter)} -I {shlex.quote(target)} \"$@\"\n")
+    write_atomic(os.path.join(prefix, DEPLOY_ENTRY), text.encode("utf-8"), 0o755)
+
+
+def web_flow_keyring(sw_tree: str) -> bytes:
+    """The web-flow public key this tree ships, refused when it is missing."""
+    return read_tree_file(sw_tree, WEB_FLOW_SOURCE)
 
 
 def hand_off(cfg: dict, args, sw_tree: str, shas: dict[str, str], tag: str | None = None) -> int:
@@ -1116,16 +1396,85 @@ def hand_off(cfg: dict, args, sw_tree: str, shas: dict[str, str], tag: str | Non
     return subprocess.run(argv, cwd="/", check=False).returncode
 
 
+# Where a three-account job's logs go: `bin/stand-up-backend` passes this as
+# install-jobs' `--log-dir`. The directory is root's, but install-jobs'
+# `make_account_log` hands each file in it to the job's account by descriptor,
+# so the account can write its own log and cannot create, rename or re-point an
+# entry. Those files are the only paths under the prefix that another account
+# owns by design.
+LOG_DIR = os.path.join("var", "log")
+
+# Where Orient's socket directory lives, relative to the prefix, and the exact
+# mode it must carry: `bin/provision-accounts` creates {prefix}/run/orient
+# itself, owned by Orient's own account, group ORIENT_TUNNEL_GROUP, mode
+# 0o750. ORIENT_SOCKET_DIR_MODE is duplicated from provision-accounts' own
+# constant of the same name the way ORIENT_ACCOUNT_NAMES above is:
+# tools/test_install_privileged.py checks that it agrees too.
+ORIENT_SOCKET_DIR = os.path.join("run", "orient")
+ORIENT_SOCKET_DIR_MODE = 0o750
+
+
 def verify_ownership(prefix: str) -> list[str]:
-    """Every path under the prefix owned by root with no group or other write bit."""
+    """Every path under the prefix owned by root with no group or other write bit,
+    except the job logs directly inside {prefix}/var/log, and {prefix}/run/orient
+    itself.
+
+    **A JOB'S LOG FILE BELONGS TO ITS ACCOUNT.** Without this exception every run
+    after the jobs first started refused here, on the agents-owned logs install-jobs
+    had made, so neither an update nor a rerun of the privileged half could ever
+    finish (Debian upgrade rehearsal, 2026-11-15). Root never executes or trusts a
+    log. The exception covers only a regular file with one link and no group or
+    other write bit, directly in that directory; the directory itself, anything
+    nested in it and anything else under the prefix must still be root's.
+
+    **ORIENT'S SOCKET DIRECTORY BELONGS TO ORIENT.** Without this exception every
+    three-account install, and every update's privileged step, refused here on
+    {prefix}/run/orient, the socket directory bin/provision-accounts creates and
+    owns as Orient on purpose (Debian rehearsal, 2026-11-19). The exception
+    covers only that one path, and only when it is a real directory (not a
+    symlink) owned by Orient's own account, with group ORIENT_TUNNEL_GROUP and
+    at EXACTLY mode ORIENT_SOCKET_DIR_MODE, the same mode provision-accounts'
+    own add_dir_rows compares against, never merely clear of the group and
+    other write bits: uvicorn makes the socket inside it mode 0666, so this
+    directory's mode is the only thing that decides who can reach it, and a
+    looser mode such
+    as 0755 would pass a write-bit-only check while letting any local account
+    connect. Anything else there is refused with a message naming the mode it
+    must read and the mode it actually reads. Root never executes or reads
+    anything there, so this walk does not descend into it: the socket Orient
+    creates inside it is never checked. {prefix}/run itself, and everything
+    else under the prefix, must still be root's.
+    """
     bad: list[str] = []
+    log_dir = os.path.join(prefix, LOG_DIR)
+    orient_dir = os.path.join(prefix, ORIENT_SOCKET_DIR)
+    orient_uid, tunnel_gid = orient_identity()
     top = os.lstat(prefix)
     if top.st_uid != gg.ROOT_UID or top.st_mode & 0o022:
         bad.append(prefix)
     for dirpath, dirnames, filenames in os.walk(prefix):
+        for name in list(dirnames):
+            path = os.path.join(dirpath, name)
+            if path != orient_dir:
+                continue
+            dirnames.remove(name)
+            st = os.lstat(path)
+            found_mode = stat.S_IMODE(st.st_mode)
+            if not stat.S_ISDIR(st.st_mode):
+                bad.append(f"{path} is not a plain directory")
+            elif (orient_uid is None or st.st_uid != orient_uid
+                  or tunnel_gid is None or st.st_gid != tunnel_gid):
+                bad.append(f"{path} is not owned by Orient's own account and the "
+                           f"{ORIENT_TUNNEL_GROUP} group")
+            elif found_mode != ORIENT_SOCKET_DIR_MODE:
+                bad.append(f"{path} must read exactly mode {ORIENT_SOCKET_DIR_MODE:04o} "
+                           f"(reads {found_mode:04o})")
         for name in dirnames + filenames:
             path = os.path.join(dirpath, name)
             st = os.lstat(path)
+            if (dirpath == log_dir and stat.S_ISREG(st.st_mode) and st.st_nlink == 1
+                    and not st.st_mode & 0o022):
+                continue
             if st.st_uid != gg.ROOT_UID or (not stat.S_ISLNK(st.st_mode) and st.st_mode & 0o022):
                 bad.append(path)
     return bad
@@ -1133,13 +1482,27 @@ def verify_ownership(prefix: str) -> list[str]:
 
 # The run.
 
+def stage_previous_records(prefix: str, new_records: bytes, plan: Plan) -> None:
+    """Stage the current `src/installed`, before this run replaces it, as
+    `src/installed.previous` — in the same swap as the new record, so
+    `--restore-previous` can later read what this run is about to replace.
+    A first install, with no `src/installed` yet, stages nothing, and nor
+    does a replay whose new record is byte-identical to the current one: it
+    replaces nothing, so there is nothing to save as what it replaced."""
+    current = read_beneath(prefix, ("src", "installed"), one_name=True)
+    if current is not None and current != new_records:
+        stage_file(plan, os.path.join(prefix, "src", PREVIOUS_RECORDS_NAME), current, 0o644)
+
+
 def stage_all(cfg: dict, args, sw_tree: str, ap_tree: str, ap_sha: str, records: str, plan: Plan) -> None:
     prefix = cfg["prefix"]
     libexec = os.path.join(prefix, "libexec")
     make_dir(libexec, 0o755)
     launcher = os.path.join(libexec, "review-launch")
-    stage_file(plan, launcher, read_tree_file(ap_tree, LAUNCHER), 0o755)
-    print(f"launcher: agent-platform@{ap_sha} {LAUNCHER} -> libexec/review-launch")
+    stage_file(plan, launcher, rewrite_launcher_shebang(read_tree_file(ap_tree, LAUNCHER), cfg["interpreter"]),
+               0o755)
+    print(f"launcher: agent-platform@{ap_sha} {LAUNCHER} -> libexec/review-launch, "
+          f"shebang {cfg['interpreter']} -I")
     # The tool and the directory it writes in, and never the record itself: only
     # `model-provider enable` or `disable` under sudo can name the operator and
     # the time, so an install enables no provider.
@@ -1152,6 +1515,54 @@ def stage_all(cfg: dict, args, sw_tree: str, ap_tree: str, ap_sha: str, records:
     stage_sudo_rule(cfg, sw_tree, launcher, plan)
     print(f"sudo rule: {cfg['sudoers_dir']}/{SUDOERS_NAME}")
     stage_reviewers(cfg, args, ap_tree, sw_tree, plan)
+    stage_file(plan, os.path.join(prefix, WEB_FLOW_KEYRING), web_flow_keyring(sw_tree), 0o644)
+    print(f"web-flow keyring: {WEB_FLOW_SOURCE} -> {WEB_FLOW_KEYRING}")
+    new_records = records.encode("utf-8")
+    stage_previous_records(prefix, new_records, plan)
+    stage_file(plan, os.path.join(prefix, "src", "installed"), new_records, 0o644)
+
+
+def stage_restore_three(cfg: dict, sw_tree: str, ap_tree: str, ap_sha: str, records: str, plan: Plan) -> None:
+    """Reinstall exactly the parts of `stage_all` that read nothing but the
+    trees already on the machine: the review launcher, the model-provider
+    tool, root's own copy of agent-platform's library, the sudo rule and the
+    web-flow keyring. The reviewers' own venv, Claude binary and instruction
+    file are left as they are — rebuilding them needs the network, and
+    `--restore-previous` fetches nothing."""
+    prefix = cfg["prefix"]
+    libexec = os.path.join(prefix, "libexec")
+    make_dir(libexec, 0o755)
+    launcher = os.path.join(libexec, "review-launch")
+    stage_file(plan, launcher, rewrite_launcher_shebang(read_tree_file(ap_tree, LAUNCHER), cfg["interpreter"]),
+               0o755)
+    print(f"launcher: agent-platform@{ap_sha} {LAUNCHER} -> libexec/review-launch, "
+          f"shebang {cfg['interpreter']} -I")
+    stage_file(plan, os.path.join(libexec, "model-provider"),
+               read_tree_file(ap_tree, MODEL_PROVIDER), 0o755)
+    make_dir(os.path.join(prefix, "config"), 0o755)
+    print(f"model-provider: agent-platform@{ap_sha} {MODEL_PROVIDER} -> libexec/model-provider")
+    make_dir(os.path.join(prefix, "lib"), 0o755)
+    stage_library(plan, ap_tree, os.path.join(prefix, "lib", "agent-platform"))
+    stage_sudo_rule(cfg, sw_tree, launcher, plan)
+    print(f"sudo rule: {cfg['sudoers_dir']}/{SUDOERS_NAME}")
+    stage_file(plan, os.path.join(prefix, WEB_FLOW_KEYRING), web_flow_keyring(sw_tree), 0o644)
+    print(f"web-flow keyring: {WEB_FLOW_SOURCE} -> {WEB_FLOW_KEYRING}")
+    stage_file(plan, os.path.join(prefix, "src", "installed"), records.encode("utf-8"), 0o644)
+
+
+def stage_restore_two(cfg: dict, ap_tree: str, ap_sha: str, sw_tree: str, records: str, plan: Plan) -> None:
+    """Reinstall exactly the parts `install_two` itself places: model-provider
+    and the web-flow keyring, from the trees already on the machine. Shape
+    two carries no review launcher, no root-owned library mirror and no sudo
+    rule — see `install_two` — so none of those is staged here either.
+    Fetches nothing and makes no git call."""
+    prefix = cfg["prefix"]
+    make_dir(os.path.join(prefix, "libexec"), 0o755)
+    stage_file(plan, os.path.join(prefix, "libexec", "model-provider"),
+               read_tree_file(ap_tree, MODEL_PROVIDER), 0o755)
+    print(f"model-provider: agent-platform@{ap_sha} {MODEL_PROVIDER} -> libexec/model-provider")
+    stage_file(plan, os.path.join(prefix, WEB_FLOW_KEYRING), web_flow_keyring(sw_tree), 0o644)
+    print(f"web-flow keyring: {WEB_FLOW_SOURCE} -> {WEB_FLOW_KEYRING}")
     stage_file(plan, os.path.join(prefix, "src", "installed"), records.encode("utf-8"), 0o644)
 
 
@@ -1167,6 +1578,8 @@ def install(args: argparse.Namespace) -> int:
         raise Refused("this installs the root-owned half, and only root may run it. "
                       "Run it with sudo.")
     print(f"{PROG}: running {HERE_FILE}")
+    if args.restore_previous:
+        return restore_previous(cfg, args)
     if cfg["shape"] == "two":
         return install_two(cfg, args)
     return install_three(cfg, args)
@@ -1186,27 +1599,40 @@ def latest_recorded_tag(records: str) -> str | None:
 
 
 def install_two(cfg: dict, args: argparse.Namespace) -> int:
-    """The shipwright-only root half: fetch anonymously, take the release by tag,
-    install the bare copy, the extracted tree, the record and the entry point."""
-    # Shape two takes none of the three-account flags. Refusing before anything
-    # is written keeps a stray --commit from looking like a pin: it is silently
-    # ignored today, so `--shape two --commit shipwright=<sha>` reads as a pin
-    # and is not.
-    if args.commit:
-        raise Refused(f"--commit is not taken by shape two. Shape two fetches the "
-                      f"release by tag and never pins a commit. Nothing was changed.")
+    """The root half that holds all four repositories: fetch each anonymously by
+    tag, except convivy-orient's fallback to a minted token, extract each tree,
+    place model-provider and the entry point, and record what was installed.
+
+    `--commit <repo>=<sha>`, one per repository and optional, is checked
+    against each tag's own commit before anything is fetched from that
+    repository — the same check shape three's anonymous path makes
+    (`fetch_release_tag`'s `expected`). Refused together with a plain
+    replay, which carries no `--release` to check it against, so a stray
+    `--commit` is never silently ignored."""
     if args.consent is not None:
         raise Refused(f"--consent is not taken by shape two. The instruction-file "
                       f"diff is a shape-three step. Nothing was changed.")
-    if args.agent_platform_repo is not None:
-        raise Refused(f"--agent-platform-repo is not taken by shape two. Shape two "
-                      f"fetches shipwright alone and never agent-platform. "
-                      f"Nothing was changed.")
-    if args.library_repo is not None:
-        raise Refused(f"--library-repo is not taken by shape two. Shape two "
-                      f"fetches shipwright alone and never library. "
-                      f"Nothing was changed.")
+    names = {r: cfg[f"{r.replace('-', '_')}_repo"] for r in ROLES}
+    commits = parse_commits(args.commit, names)
     prefix = cfg["prefix"]
+
+    # When --release is not given, the updater is replaying the recorded shape.
+    # Read the tag the last install recorded. Resolved, and `--commit` checked
+    # against it, before anything is created: a refusal here must leave even
+    # the settings file and the directories untouched.
+    installed_path = os.path.join(prefix, "src", "installed")
+    prior_records = (read_beneath(prefix, ("src", "installed")) or b"").decode("utf-8") \
+        if os.path.lexists(installed_path) else ""
+    if args.release:
+        tag = parse_release_tag(args.release)
+    else:
+        if commits:
+            raise Refused(f"--commit names a commit to check against a tag, and no --release "
+                          f"names a tag to check it against. Nothing was changed.")
+        tag = latest_recorded_tag(prior_records)
+        if not tag:
+            raise Refused("name the release tag with --release (e.g. v1.0.0). Nothing was changed.")
+
     make_dir(prefix, 0o755)
     make_dir(os.path.join(prefix, "src"), 0o755)
     make_dir(os.path.join(prefix, "libexec"), 0o755)
@@ -1219,46 +1645,94 @@ def install_two(cfg: dict, args: argparse.Namespace) -> int:
             ae.read_entities(os.path.join(prefix, CONFIG))
         except ae.EntitiesInvalid as exc:
             raise Refused(str(exc))
-    persisted = persisted_two(stored, cfg)
+    persisted = persisted_two(stored, cfg, prefix)
     data = (json.dumps(persisted, indent=2, sort_keys=True) + "\n").encode("utf-8")
     if read_beneath(prefix, (CONFIG,)) != data:
         write_atomic(os.path.join(prefix, CONFIG), data, 0o644)
 
-    # When --release is not given, the updater is replaying the recorded shape.
-    # Read the tag the last install recorded.
-    installed_path = os.path.join(prefix, "src", "installed")
-    prior_records = (read_beneath(prefix, ("src", "installed")) or b"").decode("utf-8") \
-        if os.path.lexists(installed_path) else ""
-    if args.release:
-        tag = parse_release_tag(args.release)
-    else:
-        tag = latest_recorded_tag(prior_records)
-        if not tag:
-            raise Refused("name the release tag with --release (e.g. v1.0.0). Nothing was changed.")
-    name = cfg["shipwright_repo"]
-    url = f"{cfg['github_base'].rstrip('/')}/{cfg['org']}/{name}"
-    bare = os.path.join(prefix, "src", f"{name}.git")
+    sw_name = cfg["shipwright_repo"]
+    sw_url = f"{cfg['github_base'].rstrip('/')}/{cfg['org']}/{sw_name}"
+    sw_bare = os.path.join(prefix, "src", f"{sw_name}.git")
+    sw_peeled = fetch_release_tag(sw_bare, sw_name, sw_url, tag, prior_records, commits.get(sw_name))
+    sw_tree = extract(prefix, sw_bare, sw_name, sw_peeled)
+    print(f"source: {sw_name} at {sw_peeled} from {sw_tree}")
 
-    peeled = fetch_release_tag(bare, name, url, tag, prior_records)
-    sw_tree = extract(prefix, bare, name, peeled)
-    print(f"source: {name} at {peeled} from {sw_tree}")
-
-    if RUN_SHA != peeled:
+    if RUN_SHA != sw_peeled:
         return hand_off_two(cfg, args, sw_tree, tag)
 
-    records = f"tag {name} {tag} {peeled}\n{name} {peeled}\n"
-    write_atomic(os.path.join(prefix, "src", "installed"), records.encode("utf-8"), 0o644)
-    write_updater(prefix, cfg["interpreter"], peeled, cfg["shape"])
-    print(f"installed: {name}@{peeled}; entry point "
+    # convivy-orient's credential need is resolved next, before agent-platform
+    # or library is fetched, so a missing key refuses before anything else
+    # (beyond shipwright, needed to reach this copy) is fetched.
+    orient_name = cfg["convivy_orient_repo"]
+    orient_url = f"{cfg['github_base'].rstrip('/')}/{cfg['org']}/{orient_name}"
+    orient_token, orient_revoke = convivy_orient_token(cfg, prefix, orient_name, orient_url, tag)
+
+    # The token exists from here on, so everything up to the end of the
+    # convivy-orient fetch sits inside the `try`: a refusal from the
+    # agent-platform or library fetch below revokes it too.
+    try:
+        ap_name = cfg["agent_platform_repo"]
+        ap_url = f"{cfg['github_base'].rstrip('/')}/{cfg['org']}/{ap_name}"
+        ap_bare = os.path.join(prefix, "src", f"{ap_name}.git")
+        ap_peeled = fetch_release_tag(ap_bare, ap_name, ap_url, tag, prior_records, commits.get(ap_name))
+        ap_tree = extract(prefix, ap_bare, ap_name, ap_peeled)
+        print(f"source: {ap_name} at {ap_peeled} from {ap_tree}")
+
+        lib_name = cfg["library_repo"]
+        lib_url = f"{cfg['github_base'].rstrip('/')}/{cfg['org']}/{lib_name}"
+        lib_bare = os.path.join(prefix, "src", f"{lib_name}.git")
+        lib_peeled = fetch_release_tag(lib_bare, lib_name, lib_url, tag, prior_records, commits.get(lib_name))
+        lib_tree = extract(prefix, lib_bare, lib_name, lib_peeled)
+        print(f"source: {lib_name} at {lib_peeled} from {lib_tree}")
+
+        orient_bare = os.path.join(prefix, "src", f"{orient_name}.git")
+        orient_peeled = fetch_release_tag(orient_bare, orient_name, orient_url, tag, prior_records,
+                                          commits.get(orient_name), token_value=orient_token)
+    finally:
+        if orient_revoke is not None:
+            orient_revoke(orient_token)
+    orient_tree = extract(prefix, orient_bare, orient_name, orient_peeled)
+    print(f"source: {orient_name} at {orient_peeled} from {orient_tree}")
+
+    install_pinned_python(cfg)
+    records = (f"tag {sw_name} {tag} {sw_peeled}\n{sw_name} {sw_peeled}\n"
+              f"tag {ap_name} {tag} {ap_peeled}\n{ap_name} {ap_peeled}\n"
+              f"tag {lib_name} {tag} {lib_peeled}\n{lib_name} {lib_peeled}\n"
+              f"tag {orient_name} {tag} {orient_peeled}\n{orient_name} {orient_peeled}\n")
+    if platform_mod.system() == "Darwin":
+        records += f"python {PYTHON_VERSION} {PYTHON_SHA256}\n"
+    keyring = web_flow_keyring(sw_tree)
+    make_dir(os.path.join(prefix, "etc"), 0o700)
+    write_atomic(os.path.join(prefix, WEB_FLOW_KEYRING), keyring, 0o644)
+    print(f"web-flow keyring: {WEB_FLOW_SOURCE} -> {WEB_FLOW_KEYRING}")
+    write_atomic(os.path.join(prefix, "libexec", "model-provider"),
+                read_tree_file(ap_tree, MODEL_PROVIDER), 0o755)
+    print(f"model-provider: {ap_name}@{ap_peeled} {MODEL_PROVIDER} -> libexec/model-provider")
+    # Saved before it is replaced, the same way `stage_previous_records` saves
+    # shape three's, so `--restore-previous` has something to read back: a
+    # first install, with no `src/installed` yet, saves nothing, and nor does
+    # a replay whose new record is byte-identical to the current one.
+    new_records = records.encode("utf-8")
+    current_records = read_beneath(prefix, ("src", "installed"))
+    if current_records is not None and current_records != new_records:
+        write_atomic(os.path.join(prefix, "src", PREVIOUS_RECORDS_NAME), current_records, 0o644)
+    write_atomic(os.path.join(prefix, "src", "installed"), new_records, 0o644)
+    write_updater(prefix, cfg["interpreter"], sw_peeled, cfg["shape"])
+    print(f"installed: {sw_name}@{sw_peeled}, {ap_name}@{ap_peeled}, {lib_name}@{lib_peeled}, "
+          f"{orient_name}@{orient_peeled}; entry point "
           f"{os.path.join(prefix, 'libexec', 'update-privileged')}")
     return 0
 
 
 def hand_off_two(cfg: dict, args, sw_tree: str, tag: str) -> int:
-    """Run the newer commit's own copy on the shape-two path."""
+    """Run the newer commit's own copy on the shape-two path. Any `--commit` pins
+    are carried on unchanged, so the newer copy still checks agent-platform,
+    library and convivy-orient against them when it fetches those repositories."""
     argv = [*ENTRY_ARGV, cfg["interpreter"], "-I",
             os.path.join(sw_tree, "bin", "install-privileged"),
             "--shape", cfg["shape"], "--release", tag]
+    for item in args.commit:
+        argv += ["--commit", item]
     print(f"{PROG}: handing off to {sw_tree}")
     return subprocess.run(argv, cwd="/", check=False).returncode
 
@@ -1279,6 +1753,7 @@ def install_three(cfg: dict, args: argparse.Namespace) -> int:
                           f"every repository it names; missing: {', '.join(missing)}. "
                           f"Nothing was changed.")
 
+    cfg["library_account"] = library_account(cfg)
     make_dir(prefix, 0o755)
     make_dir(os.path.join(prefix, "etc"), 0o700)
     make_dir(os.path.join(prefix, "src"), 0o755)
@@ -1376,6 +1851,7 @@ def finish_three(cfg: dict, args: argparse.Namespace,
 
     ap_name, ap_sha, ap_tree = trees["agent-platform"]
     lib_name, lib_sha, _lib_tree = trees["library"]
+    orient_name, orient_sha, _orient_tree = trees["convivy-orient"]
     records = "".join((f"tag {n} {tag} {s}\n" if tag else "") + f"{n} {s}\n"
                       for n, s, _ in trees.values())
     if platform_mod.system() == "Darwin":
@@ -1392,7 +1868,83 @@ def finish_three(cfg: dict, args: argparse.Namespace,
         raise Refused("these paths are not root-owned, or another account can write them: "
                       + ", ".join(bad) + ". The entry point was not rewritten.")
     write_updater(prefix, cfg["interpreter"], sw_sha, cfg["shape"])
-    print(f"installed: {sw_name}@{sw_sha}, {ap_name}@{ap_sha}, {lib_name}@{lib_sha}; entry point "
+    print(f"installed: {sw_name}@{sw_sha}, {ap_name}@{ap_sha}, {lib_name}@{lib_sha}, "
+          f"{orient_name}@{orient_sha}; entry point "
+          f"{os.path.join(prefix, 'libexec', 'update-privileged')}")
+    return 0
+
+
+def previous_trees(prefix: str, records: str, names: dict[str, str]) -> dict[str, tuple[str, str, str]]:
+    """Each role's `(name, sha, tree path)` the saved record names, checked that the
+    tree exists and is root-owned — never read from, and never fetched.
+
+    A refusal names every role that is missing a commit, missing its tree, or
+    whose tree is not root-owned, and changes nothing.
+    """
+    trees: dict[str, tuple[str, str, str]] = {}
+    problems: list[str] = []
+    for role in ROLES:
+        name = names[role]
+        sha = last_recorded_commit(records, name)
+        if sha is None:
+            problems.append(f"{name}: the saved record names no commit for it")
+            continue
+        tree = os.path.join(prefix, "src", f"{name}@{sha}")
+        if not os.path.isdir(tree) or os.path.islink(tree):
+            problems.append(f"{name}: {tree} is missing")
+            continue
+        st = os.lstat(tree)
+        if st.st_uid != gg.ROOT_UID or st.st_mode & 0o022:
+            problems.append(f"{name}: {tree} is not root-owned, or another account can write it")
+            continue
+        trees[role] = (name, sha, tree)
+    if problems:
+        raise Refused("the saved record at src/" + PREVIOUS_RECORDS_NAME + " cannot be restored:\n"
+                      + "\n".join(f"  {p}" for p in problems) + "\nNothing was changed.")
+    return trees
+
+
+def restore_previous(cfg: dict, args: argparse.Namespace) -> int:
+    """Reinstall the root half `src/installed.previous` names, from the trees already
+    on the machine. Fetches nothing and makes no git call."""
+    prefix = cfg["prefix"]
+    path = os.path.join(prefix, "src", PREVIOUS_RECORDS_NAME)
+    if not os.path.lexists(path):
+        raise Refused(f"no saved record of a replaced root half at {path}. Nothing was changed.")
+    check_settings_file(path)
+    records = (read_beneath(prefix, ("src", PREVIOUS_RECORDS_NAME), one_name=True) or b"").decode("utf-8")
+    names = {r: cfg[f"{r.replace('-', '_')}_repo"] for r in ROLES}
+    trees = previous_trees(prefix, records, names)
+    sw_name, sw_sha, sw_tree = trees["shipwright"]
+    if RUN_SHA != sw_sha:
+        raise Refused(
+            f"this copy is shipwright@{RUN_SHA}, and the saved record names {sw_sha} for "
+            f"shipwright. Run --restore-previous from the tree src/{PREVIOUS_RECORDS_NAME} "
+            f"names: sudo <python3> -I {os.path.join(prefix, 'src', f'shipwright@{sw_sha}', 'bin', PROG)} "
+            f"--shape {cfg['shape']} --restore-previous. Nothing was changed.")
+    ap_name, ap_sha, ap_tree = trees["agent-platform"]
+    if cfg["shape"] == "three":
+        try:
+            cfg["entities"] = ae.read_entities(os.path.join(prefix, CONFIG))
+        except ae.EntitiesInvalid as exc:
+            raise Refused(str(exc))
+
+    plan = Plan()
+    try:
+        if cfg["shape"] == "two":
+            stage_restore_two(cfg, ap_tree, ap_sha, sw_tree, records, plan)
+        else:
+            stage_restore_three(cfg, sw_tree, ap_tree, ap_sha, records, plan)
+    except BaseException:
+        plan.discard()
+        raise
+    plan.swap()
+    bad = verify_ownership(prefix)
+    if bad:
+        raise Refused("these paths are not root-owned, or another account can write them: "
+                      + ", ".join(bad) + ". The entry point was not rewritten.")
+    write_updater(prefix, cfg["interpreter"], sw_sha, cfg["shape"])
+    print(f"restored: {sw_name}@{sw_sha}, {ap_name}@{ap_sha}; entry point "
           f"{os.path.join(prefix, 'libexec', 'update-privileged')}")
     return 0
 

@@ -1,0 +1,39 @@
+name = "orient-backup"
+description = "Backs up Orient's own database every six hours, verified, into a destination under Orient's own account's home, on the shapes where Orient has its own account. agents' own backup job never gets a readable copy of it."
+label = "com.convivy.orient-backup"
+command = [
+  "{python}",
+  "{bin}/builder-backup",
+  "--orient-only",
+  "--orient-db", "{home}/.orient-control/control.db",
+  "--dest", "{state}/builder-backup",
+]
+platforms = ["macos", "linux"]
+scope = "system"
+account = "orient"
+# `_orient` on macOS: see jobs/orient.toml's own account-macos comment.
+account-macos = "_orient"
+# THE SINGLE-ACCOUNT SHAPE ALREADY BACKS UP ORIENT, in the same pass
+# jobs/builder-backup.toml runs as the operator; converting this job to run
+# as the operator too would back up the same database a second time. See
+# tools/jobs/FORMAT.md, "account-only".
+account-only = true
+enabled-by-default = true
+
+[log]
+stdout = "{state}/orient-backup.log"
+stderr = "{state}/orient-backup.log"
+
+# `{bin}/builder-backup`, NEVER `{deploy}/builder-payload/bin/builder-backup`:
+# Orient's own account cannot read agents' deploy area, so this names the copy
+# under Orient's own `.local/bin` instead, the same way `jobs/library-backup.
+# toml` names `{bin}/builder-backup` under the Library account's own home.
+# `bin/place-orient` places that copy before this job's first run, the way
+# `bin/hand-library-inputs` already places the Library's.
+[environment]
+HOME = "{home}"
+PATH = "{bin}:/usr/bin:/bin"
+
+[schedule]
+at-load = true
+every-seconds = 21600

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Stand Builder's backend up with one command, by calling the four that do it.
 
-    bin/stand-up-backend --shape single|three              provision, place, register, supervise
-    bin/stand-up-backend --shape single|three --activate   ...and start the jobs marked default-on
-    bin/stand-up-backend --shape single|three --status     what each step reports, changing nothing
-    bin/stand-up-backend --shape single|three --dry-run    say what would happen, change nothing
-    bin/stand-up-backend --shape single|three --check      report only; 1 work left, 2 something refused
+    bin/stand-up-backend --shape single|two|three              provision, place, register, supervise
+    bin/stand-up-backend --shape single|two|three --activate   ...and start the jobs marked default-on
+    bin/stand-up-backend --shape single|two|three --status     what each step reports, changing nothing
+    bin/stand-up-backend --shape single|two|three --dry-run    say what would happen, change nothing
+    bin/stand-up-backend --shape single|two|three --check      report only; 1 work left, 2 something refused
 
 ## THE OPERATOR NAMES THE SHAPE, AND THIS NEVER FALLS BACK FROM ONE TO THE OTHER
 
@@ -22,9 +22,20 @@ leaves the machine as it found it. Quietly installing the single-account
 pieces instead would hand the operator the shape they did not choose, and the
 one that gives up the boundary they chose the other for.
 
-`--shape two` is not built yet in this release: it refuses before changing
-anything, naming `--shape three` as the install that builds the `reviewers`
-account alongside `agents`.
+`--shape two` installs the operator plus one `agents` account, with reviews
+running as `agents` rather than as a dedicated `reviewers` account. It runs
+the same steps as `--shape three`, as the same accounts (see `runs_as`).
+**It checks for its own preflight before any step runs**,
+and refuses, naming every missing or forbidden piece at once, when the
+`agents` account is missing, when root's record names no shipwright, library,
+convivy-orient or agent-platform commit (or, on a Mac, no pinned Python), or
+when the machine carries a three-account piece: a `reviewers` account, the
+review launcher, or the review sudo rule. Root is asked about the sudo rule
+only when nothing else refused, so a run refusing for another reason may
+name the rule on its next run rather than this one. The launcher counts because
+`agentctl` routes every review through it whenever it is on disk, so a
+two-account install that carried one would quietly try to run three-account
+reviews. `--migrate-from` is refused with `--shape two`, as not built.
 
 **THIS EXISTS BECAUSE FIVE STEPS IN AN UNENFORCED ORDER IS NOT AN INSTALL.**
 Each of the four commands below is complete, refuses rather than half-doing its
@@ -39,13 +50,19 @@ has to run in the right order, holding two facts nobody wrote down:
   a job pointed at a missing area undoes the rule that a service serves only from
   its deploy area.
 
-**THE THREE-ACCOUNT SHAPE RUNS THREE STEPS AS `agents` AND SUPERVISION AS ROOT.**
+**THE THREE-ACCOUNT SHAPE RUNS THREE STEPS AS `agents` AND THREE AS ROOT.**
 `place`, `link` and `register` run through `sudo -u agents -H`, so the deploy areas,
-the linked commands and the MCP registration are the backend account's. `supervise`
+the linked commands and the MCP registration are the backend account's.
+`hand-library-inputs` runs root's own copy right after `place`, and gives the
+Library account its own copy of the mint script and the roster source from
+root's trees, and of the projects registry seed, the operator config file and
+the knowledge snapshot from `agents`'. `supervise`
 runs root's own copy of `install-jobs`, from the commit `install-privileged` recorded,
 under the cleared environment `update-privileged` uses, and renders the declarations
-for `agents`. `provision` is left out: it installs packages, which needs an administrator
-this shape does not run as.
+for `agents`. `deliver-library-credentials` runs root's own copy the same way, right
+after it, and hands `agents` every credential `supervise` just had the Library mint
+under its own account's home. `provision` is left out: it installs packages, which
+needs an administrator this shape does not run as.
 
 **`place` RUNS FROM A TREE WITH NO `.git`, SO ITS SOURCE CHECKOUTS HAVE TO BE
 NAMED.** This runs from the root-owned tree `install-privileged` extracted, which
@@ -60,7 +77,7 @@ operator's own checkout.
 migration wrote under the root-owned prefix. A real run is root's, and root runs only the
 copy `install-privileged` extracted and recorded, invoked by its absolute path:
 
-    sudo /opt/homebrew/bin/python3 -I /opt/builder/src/shipwright@<sha>/bin/stand-up-backend \
+    sudo /opt/homebrew/bin/python3.11 -I /opt/builder/src/shipwright@<sha>/bin/stand-up-backend \
         --shape three --migrate-from <operator home>
 
 Root refuses to start from any other copy, before it reads anything, unless that file, every
@@ -141,16 +158,20 @@ way a manual `agentctl kb sync` would.
 
 ## What it never does
 
-**It writes no credentials of its own.** The Library's job declaration mints
-Orient's two and the work-queue tools' one, once each, and no installer
-copies or overwrites a credential. The one exception is `bootstrap-library`,
-which runs after `supervise` and makes the operator the Library's first
-person: it is `bootstrap_library.py`, the Library's own one-time command,
-that mints the operator's administrator credential, once, and this never
-prints or logs the raw token. It provisions no chat webhooks, Slack's
-included, although `agent-platform/install.sh` lists them as a manual step:
-an installer that sets up a surface nobody reads is worse than one that omits
-it.
+**It mints no credential of its own.** The Library's job declaration mints
+Orient's, the work-queue tools' and every registered crew's, once each, and
+no installer copies or overwrites one that already exists. On the two- and
+three-account shapes, where the Library mints under its own account's home
+(company decision 0025 point 5), `deliver-library-credentials` copies each
+one, once, into `agents`' own home, where the accounts that use them look
+for them — never minting a new one and never replacing a delivered copy
+that is already there. The one exception is `bootstrap-library`, which runs
+after it and makes the operator the Library's first person: it is
+`bootstrap_library.py`, the Library's own one-time command, that mints the
+operator's administrator credential, once, and this never prints or logs the
+raw token. It provisions no chat webhooks, Slack's included, although
+`agent-platform/install.sh` lists them as a manual step: an installer that
+sets up a surface nobody reads is worse than one that omits it.
 """
 
 from __future__ import annotations
@@ -205,11 +226,30 @@ import account_entities as ae  # noqa: E402
 #   sync-knowledge-index `--check` and `--status` both `1 if` the Library is
 #                      not answering right now (main); a real run has no
 #                      non-crash `1` either — it refuses (2) or runs
+#   deliver-library-credentials `--check` 1 if anything is still
+#                      undelivered (main); `--status` always 0, the same
+#                      report; a real run has no non-crash `1` either — it
+#                      refuses (2) or delivers
+#   hand-library-inputs `--check` 1 if anything is still uncarried (main);
+#                      `--status` always 0, the same report; a real run has
+#                      no non-crash `1` either — it refuses (2) or carries
+#   place-orient       `--check` 1 when its own install-backend placement
+#                      is stale OR a {bin} link is still pending/occupied
+#                      (main); `--status` returns the placement's own exit
+#                      code alone — the link report it also prints is not
+#                      reflected in that code; a real run has no non-crash
+#                      `1` either — it refuses (2) or links
+#   migrate-orient-account `--check` and `--status` both `1 if` the migration
+#                      is still pending (main); a REAL run also has a
+#                      non-crash `1` here, because this step's real run
+#                      passes `--check` too (`root_migrate_orient_account`),
+#                      never the actual migration, so work left there means
+#                      the same thing it means under `--check`
 #
 # Under `--dry-run` no tool reports pending work through its code at all, so a
 # `1` there is an uncaught exception in every case and the mode appears nowhere
-# below. `None` means a real run, and only `install-jobs` has a non-crash `1`
-# there.
+# below. `None` means a real run, and `install-jobs` and `migrate-orient-account`
+# are the only tools with a non-crash `1` there.
 STEPS = (
     {
         "name": "provision",
@@ -235,6 +275,156 @@ STEPS = (
         "name": "place",
         "tool": "install-backend",
         "why": "put the code where a service can serve it, from a published ref",
+        "modes": {"dry-run": "--dry-run", "check": "--check", "status": "--status"},
+        "work_left_modes": ("check", "status"),
+        "needs_311": False,
+    },
+    {
+        "name": "migrate-library-account",
+        "tool": "migrate-library-account",
+        "why": "move an existing install's Library from agents to its own account, if it is still there",
+        # **ONLY ON THE SHAPES THAT GIVE THE LIBRARY ITS OWN ACCOUNT**
+        # (`steps_for`), and **AFTER `place` AND BEFORE `hand-library-inputs`**:
+        # this is what creates the Library's own account when an upgrade is
+        # the first thing to need one, and every step after it that runs as
+        # that account (`hand-library-inputs`, `place-library`) needs it to
+        # exist already. A fresh install, or one already migrated, finds
+        # nothing to do and changes nothing.
+        "modes": {"dry-run": "--dry-run", "check": "--check", "status": "--status"},
+        "work_left_modes": ("check", "status"),
+        "needs_311": False,
+    },
+    {
+        "name": "hand-library-inputs",
+        "tool": "hand-library-inputs",
+        "why": "give the Library its own code from root's trees and its own data from agents, as copies",
+        # **ONLY ON THE SHAPES THAT GIVE THE LIBRARY ITS OWN ACCOUNT**
+        # (`steps_for`), and **AFTER `place` AND BEFORE `place-library`**:
+        # `place-library` is the first step that runs as the Library's own
+        # account at all, and its job declaration's `prepare` needs the mint
+        # script and the roster source already in that account's own home
+        # before `supervise` installs it.
+        "modes": {"dry-run": "--dry-run", "check": "--check", "status": "--status"},
+        "work_left_modes": ("check", "status"),
+        "needs_311": False,
+    },
+    {
+        "name": "place-library",
+        "tool": "install-backend",
+        "why": "put the Library's own code in its own account's deploy area, "
+               "where its job declaration looks for it",
+        # **ONLY ON THE SHAPES THAT GIVE THE LIBRARY ITS OWN ACCOUNT**
+        # (`steps_for`). `place` above runs as `agents` and would put the
+        # Library's code under `agents`' home, which that account's own job
+        # declaration never looks at once it has its own account — see
+        # `runs_as`.
+        "modes": {"dry-run": "--dry-run", "check": "--check", "status": "--status"},
+        "work_left_modes": ("check", "status"),
+        "needs_311": False,
+    },
+    {
+        "name": "migrate-orient-account",
+        "tool": "migrate-orient-account",
+        "why": "move an existing install's Orient from agents to its own account, if it is still there",
+        # **ONLY ON THE SHAPES THAT GIVE ORIENT ITS OWN ACCOUNT** (`steps_for`),
+        # and **AFTER `place` AND BEFORE `place-orient`**, the same way
+        # `migrate-library-account` sits before `hand-library-inputs` and
+        # `place-library`: this is what creates Orient's own account when an
+        # upgrade is the first thing to need one. A fresh install, or one
+        # already migrated, finds nothing to do and changes nothing.
+        #
+        # **A REAL RUN NEVER PERFORMS THE MIGRATION.** `migrate-orient-account`
+        # refuses without `--deploy-signals-bound`, asserting that Orient's
+        # crew has bound the instruction block that reads `deploy_failure` and
+        # `deploy_stall` to its own sessions (its own spec step 7) — a fact
+        # about another crew's session configuration nothing on this machine
+        # can read or verify. So this step's real run passes `--check` too
+        # (`root_migrate_orient_account`): nothing pending is a quiet no-op,
+        # and work left stops the chain here, naming the exact command the
+        # operator runs once that binding is confirmed, before `place-orient`
+        # and the steps after it that depend on Orient having moved.
+        "modes": {"dry-run": "--dry-run", "check": "--check", "status": "--status"},
+        "work_left_modes": ("check", "status", None),
+        "needs_311": False,
+    },
+    {
+        "name": "place-orient",
+        "tool": "place-orient",
+        "why": "put Orient's own code in its own account's deploy area, and "
+               "link the commands its job runs by bare name",
+        # **ONLY ON THE SHAPES THAT GIVE ORIENT ITS OWN ACCOUNT** (`steps_for`,
+        # `LIBRARY_SHAPES`). Both of what it needs already exist by the time
+        # this command starts at all: `provision-accounts` creates Orient's
+        # own account before `stand-up-backend` ever runs, the same way it
+        # creates the Library's, and `install-privileged` extracts and
+        # records Orient's own tree the same way it records the Library's —
+        # `bin/place-orient`'s own `orient_tree` reads that record directly,
+        # the way `library_tree_args` reads it for `place-library`. So this
+        # step's position among the others here does not matter; it sits
+        # beside `place-library` because both do the same kind of thing for
+        # a different account.
+        "modes": {"dry-run": "--dry-run", "check": "--check", "status": "--status"},
+        "work_left_modes": ("check", "status"),
+        "needs_311": False,
+    },
+    {
+        "name": "agent-platform-shared",
+        "tool": "install-agent-platform-shared",
+        "why": "deploy-pin the shared agent-platform area the document service runs "
+               "agentctl from, under agents' own home",
+        # **ONLY ON THE SHAPES THAT GIVE ORIENT ITS OWN ACCOUNT** (`steps_for`,
+        # `LIBRARY_SHAPES`): the document service, and the in-process route it
+        # replaces, both run under `agentctl kb apply` presenting
+        # `kb-person-save-token`, which `deliver-library-credentials` only
+        # ever delivers where the Library has its own account too — the same
+        # shapes. Runs as `agents`, the account the document service runs as,
+        # from root's own bare copy of agent-platform at the commit
+        # `install-privileged` recorded — never `agents`' own checkout. The
+        # Bosun owns `bin/install-agent-platform-shared`; this only calls it,
+        # the same split `bin/migrate-orient-account`'s own
+        # `install_agent_platform_shared` already draws. That tool has no
+        # `--dry-run` or `--check` of its own, so every reporting mode maps
+        # to its `--status`, which always exits 0 — never a reliable "work
+        # left" signal, so `work_left_modes` is empty here.
+        "modes": {"dry-run": "--status", "check": "--status", "status": "--status"},
+        "work_left_modes": (),
+        "needs_311": False,
+    },
+    {
+        "name": "document-service",
+        "tool": "install-document-service",
+        "why": "install the document service jobs/orient.toml's own ORIENT_KB_DOCUMENT_SOCKET "
+               "names, so a fresh install's document saves reach a socket something serves",
+        # **ONLY ON THE SHAPES THAT GIVE ORIENT ITS OWN ACCOUNT** (`steps_for`,
+        # `LIBRARY_SHAPES`), and **AFTER `agent-platform-shared` AND BEFORE
+        # `supervise` STARTS ORIENT'S JOB**: the shared area this step
+        # deploys is where `agentctl` runs from, and `jobs/orient.toml`
+        # names the service's socket on every install, migrated or fresh, so
+        # this has to be in place before Orient's own job is ever started,
+        # not only after a migration moves Orient off `agents`. Root's own
+        # copy of `install-document-service` loads `bin/migrate-orient-
+        # account`'s own `install_document_service()` rather than a second
+        # copy of what it does.
+        "modes": {"dry-run": "--dry-run", "check": "--check", "status": "--status"},
+        "work_left_modes": ("check", "status"),
+        "needs_311": False,
+    },
+    {
+        "name": "orient-statement-key",
+        "tool": "make-orient-statement-key",
+        "why": "make Orient's own statement key and place its public half in the operator's "
+               "kb-verifier.json and the Library's orient-statement-key.json, so Orient's save "
+               "path can commit a document; made only when --persons is given",
+        # **ONLY ON THE SHAPES THAT GIVE ORIENT ITS OWN ACCOUNT** (`steps_for`,
+        # `LIBRARY_SHAPES`), **ALONGSIDE `document-service` AND BEFORE
+        # `supervise` STARTS ORIENT'S JOB**: a fresh two- or three-account
+        # install never runs `migrate-orient-account`'s real migration, since
+        # there is nothing on it to migrate, so nothing else ever makes the
+        # key or places it before Orient's job first tries to save a
+        # document. Root's own copy of `make-orient-statement-key` loads
+        # `bin/migrate-orient-account`'s own `run_orient_make_statement_key()`
+        # and `place_statement_key_in_verifier()` rather than a second copy
+        # of what they do.
         "modes": {"dry-run": "--dry-run", "check": "--check", "status": "--status"},
         "work_left_modes": ("check", "status"),
         "needs_311": False,
@@ -277,6 +467,20 @@ STEPS = (
         "needs_311": True,
     },
     {
+        "name": "deliver-library-credentials",
+        "tool": "deliver-library-credentials",
+        "why": "hand the Library's mints to the accounts that use them",
+        # **ONLY ON THE SHAPES THAT GIVE THE LIBRARY ITS OWN ACCOUNT**
+        # (`steps_for`), and **AFTER `supervise` AND NOT BEFORE IT**: that is
+        # the step that installs `jobs/library.toml` and runs its `prepare`,
+        # which is what mints the credentials this delivers. `knowledge-index`
+        # below needs Orient's own credential delivered to `agents` before it
+        # can ask the Library anything, so this runs before it too.
+        "modes": {"dry-run": "--dry-run", "check": "--check", "status": "--status"},
+        "work_left_modes": ("check", "status"),
+        "needs_311": False,
+    },
+    {
         "name": "library-person",
         "tool": "bootstrap-library",
         "why": "make the operator the Library's first person, once",
@@ -286,6 +490,25 @@ STEPS = (
         # `supervise` has run that migration.
         "modes": {"dry-run": "--dry-run", "check": "--check", "status": "--status"},
         "work_left_modes": ("check", "status"),
+        "needs_311": True,
+    },
+    {
+        "name": "library-person-save",
+        "tool": "place-person-save",
+        "why": "place the six person-save inputs that need no Orient key, as the "
+               "Library's own account",
+        # **ONLY ON THE SHAPES THAT GIVE THE LIBRARY ITS OWN ACCOUNT**
+        # (`steps_for`). Runs root's own copy of `place-person-save --as-library`,
+        # which drops into the Library account's own uid and gid before placing
+        # anything, the same way `deliver-library-credentials` and
+        # `hand-library-inputs` drop into it for their own reads and writes.
+        # `--root-ca`, `--app-key` and `--app-config` are the operator's own
+        # sources (`--root-ca`/`--app-key`/`--app-config` on this command);
+        # omitting any of them skips this step's real run and says so, since
+        # the Library refuses every person-save until they are placed, Orient-
+        # signed or Deck-signed — this never stops the rest of the chain.
+        "modes": {"dry-run": "--check", "check": "--check", "status": "--check"},
+        "work_left_modes": ("dry-run", "check", "status"),
         "needs_311": True,
     },
     {
@@ -311,7 +534,7 @@ class Refused(Exception):
 
 SHAPES = {
     "single": "one account, the operator's own, with no administrator",
-    "two": "the operator and an `agents` account, reviews run as `agents` — not built yet in this release",
+    "two": "the operator and an `agents` account, reviews run as `agents`",
     "three": "the agents and reviewers accounts and a root-owned privileged half",
 }
 
@@ -343,7 +566,38 @@ PRIVILEGED_INSTALLER = Path("bin", "install-privileged")
 # PRIVILEGED_PREFIX, never from the agents checkout (step 3's rule).
 AGENTS = "agents"
 SUDO = "/usr/bin/sudo"
-AS_AGENTS = [SUDO, "-u", AGENTS, "-H"]
+# `umask 022`, NEVER THE INHERITED LOGIN UMASK: on Ubuntu 24.04,
+# USERGROUPS_ENAB and pam_umask give `agents`' own login session umask 0002,
+# and `sudo -u`'s PAM session applies the same umask inside this prefix, so
+# whatever a step run as `agents` creates (`place`'s deploy tree, `link`'s
+# own links, `register`'s own files) would come out group-writable without
+# this. The wrapping shell takes the real command as its own positional
+# arguments and `exec`s it, so `launch`'s own `[*prefix, argv[0], "-u",
+# *argv[1:]]` still appends the interpreter and the tool's argv unchanged.
+AS_AGENTS = [SUDO, "-u", AGENTS, "-H", "sh", "-c", 'umask 022 && exec "$@"', "sh"]
+
+# THE LIBRARY'S OWN ACCOUNT, company decision 0025 point 5 — duplicated from
+# `provision-accounts`' `LIBRARY_ACCOUNT_NAMES`/`LIBRARY_SHAPES` rather than
+# loaded as a module, the way this file already duplicates `AGENTS` rather
+# than loading `provision-accounts` for it. Its home is mode 700, so `place`
+# and `supervise`'s `agents`/root runs can never read into it, which is why
+# `place-library` and `library-person` run as this account instead, on both
+# shapes (see `runs_as`).
+LIBRARY_ACCOUNT_NAMES = {"macos": "_library", "linux": "library"}
+LIBRARY_SHAPES = ("two", "three")
+# Where the Bosun's `install-agent-platform-shared` builds the area, under
+# `agents`' own home — duplicated from `bin/migrate-orient-account`'s own
+# constant of the same name, the same way every other path and account name
+# shared between the two files is duplicated rather than imported.
+AGENT_PLATFORM_SHARED_REL = Path(".local", "deploy", "agent-platform-shared")
+# `install-backend`'s own `PLACEABLE`, minus `"library"`: what `place` places
+# on the shapes where `place-library` places the Library separately.
+# Duplicated rather than imported (`install-backend` is a command, not a
+# module this loads); `tools/test_stand_up_backend.py`'s own
+# "NON_LIBRARY_PLACEABLE tracks install-backend's real PLACEABLE" check loads
+# the real tool and compares this list against its `PLACEABLE` so this cannot
+# drift from it unnoticed.
+NON_LIBRARY_PLACEABLE = ("agent-platform", "convivy-orient", "write-better", "llm-gateway")
 # BY ABSOLUTE PATH wherever root runs them, as SSH_KEYGEN is: a bare name resolves through PATH,
 # and an earlier PATH directory the operator or agents can write would supply the program root runs.
 GIT = "/usr/bin/git"
@@ -356,8 +610,14 @@ CLEAN_ENV = ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "HOME=/
 # The same interpreters update-privileged names. The Homebrew one is the
 # operator's, which step 2 accepts in the design: root runs it, and `agents`
 # is in neither `admin` nor `staff`, so `agents` cannot change it.
-ROOT_INTERPRETERS = {"darwin": "/opt/homebrew/bin/python3", "linux": "/usr/bin/python3"}
+ROOT_INTERPRETERS = {"darwin": "/opt/homebrew/bin/python3.11", "linux": "/usr/bin/python3"}
 SHA = re.compile(r"[0-9a-f]{40}")
+SHA256 = re.compile(r"[0-9a-f]{64}")
+# The versioned binary `install-privileged` extracts the pinned standalone
+# CPython to, under `{prefix}/python/{version}/bin/`. Hardcoded there the same
+# way, rather than derived from the recorded version: a standalone build names
+# its binary after its major.minor only, not its full patch version.
+PINNED_PYTHON_BIN = "python3.11"
 
 
 def _account_exists(name: str) -> bool:
@@ -379,6 +639,24 @@ def installed_sha(record_text: str | None, name: str) -> str | None:
     for line in record_text.splitlines():
         fields = line.split()
         if len(fields) == 2 and fields[0] == name and SHA.fullmatch(fields[1]):
+            return fields[1]
+    return None
+
+
+def installed_python(record_text: str | None) -> str | None:
+    """The version of the pinned standalone CPython install-privileged recorded for a
+    Mac's three-account install, or None.
+
+    Mirrors `installed_sha`: only a `python <version> <sha256>` line counts, and only
+    the version is read back — the path it builds is deterministic, and the sha256 is
+    install-privileged's own record of what it already checked before writing the line,
+    not something this reader re-verifies.
+    """
+    if record_text is None:
+        return None
+    for line in record_text.splitlines():
+        fields = line.split()
+        if len(fields) == 3 and fields[0] == "python" and SHA256.fullmatch(fields[2]):
             return fields[1]
     return None
 
@@ -410,6 +688,22 @@ def _owned_by(path: Path, owner: int) -> str | None:
     return None
 
 
+def ancestry_problem(path: Path, owner: int, top: Path) -> str | None:
+    """Why `path` is not trusted as `owner`'s alone, or None when it is.
+
+    Every component from `path` up to and including `top` must belong to `owner` with
+    no group or other write bit and must not be a symlink. Shared by `tree_problem`'s
+    own walk and by anything else that must trust a single root-owned file along its
+    whole path, such as the Library's pinned interpreter.
+    """
+    for part in [path, *path.parents]:
+        if part == top or top in part.parents:
+            problem = _owned_by(part, owner)
+            if problem:
+                return problem
+    return None
+
+
 def tree_problem(script: Path, owner: int, top: Path) -> str | None:
     """Why root must not run `script` and the trees beside it, or None when it may.
 
@@ -417,11 +711,9 @@ def tree_problem(script: Path, owner: int, top: Path) -> str | None:
     from `script` up to `top` must belong to `owner` with no group or other write bit and must not
     be a symlink. So must everything under the `bin`, `tools` and `jobs` trees beside `script`.
     """
-    for part in [script, *script.parents]:
-        if part == top or top in part.parents:
-            problem = _owned_by(part, owner)
-            if problem:
-                return problem
+    problem = ancestry_problem(script, owner, top)
+    if problem:
+        return problem
     tree = script.parent.parent
     for name in ROOT_OWNED_TREES:
         base = tree / name
@@ -503,6 +795,128 @@ def refuse_three_shape(lacks: list[str]) -> Refused:
         f"`--shape single`.")
 
 
+# THE TWO-ACCOUNT SHAPE'S OWN THREE-ACCOUNT PIECES, which it must carry none
+# of — see `two_shape_lacks`. `agentctl` routes every review through the
+# launcher whenever it is on disk, so a machine carrying one left over from
+# an earlier three-account install would quietly run three-account reviews.
+REVIEWERS = "reviewers"
+REVIEW_LAUNCHER = PRIVILEGED_PREFIX / "libexec" / "review-launch"
+REVIEW_SUDOERS = Path("/etc/sudoers.d/builder-review")
+
+
+def present_to_root(path: Path, run=subprocess.run) -> bool | None:
+    """Whether anything is at `path`, asked of root because this account
+    cannot look: True, False, or None when root's answer could not be read.
+
+    **ROOT ANSWERS IN A WORD, NEVER AN EXIT CODE.** `test -e` exits 1 for an
+    absent path, and so does a `sudo` that could not authenticate, so an
+    exit code alone would read a failed `sudo` as a clean machine. Root
+    prints `present` or `absent`, and anything else is None.
+    """
+    try:
+        done = run([SUDO, "/bin/sh", "-c",
+                    'if test -e "$1" || test -L "$1"; then echo present; else echo absent; fi',
+                    "sh", str(path)],
+                   capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    answer = done.stdout.strip() if done.returncode == 0 else ""
+    return {"present": True, "absent": False}.get(answer)
+
+
+def path_present(path: Path, ask_root=present_to_root) -> bool | None:
+    """Whether anything is at `path`, a dangling link included.
+
+    **A DIRECTORY THIS ACCOUNT CANNOT SEARCH IS ASKED OF ROOT.** On Debian
+    and Ubuntu `/etc/sudoers.d` is mode 750 and root's, so the operator's
+    own `stat` of a file in it is refused whether or not the file exists.
+    Before Python 3.12, `Path.is_file()` raises on that refusal; from 3.12
+    it returns False, which would read every such machine as clean.
+    """
+    try:
+        os.lstat(path)
+        return True
+    except FileNotFoundError:
+        return False
+    except PermissionError:
+        return ask_root(path)
+
+
+def two_shape_lacks(exists=_account_exists, record: Path = INSTALLED_RECORD,
+                    launcher: Path = REVIEW_LAUNCHER, sudoers: Path = REVIEW_SUDOERS,
+                    platform: str = sys.platform,
+                    ask_root=present_to_root) -> list[str]:
+    """What the two-account shape needs and this machine lacks, or a
+    three-account piece it must carry none of, one line each.
+
+    **THE AGENTS ACCOUNT IS ASKED OF THE DIRECTORY, THE SAME WAY
+    `three_shape_lacks` ASKS FOR ITS OWN PAIR**, because this shape is always
+    the bare `agents` account: two-account installs predate per-entity
+    naming, so unlike `three_shape_lacks` this reads no entities list. The
+    privileged half is looked for in the record `install-privileged`
+    writes, once per repository it fetches (shipwright, library,
+    convivy-orient, agent-platform), since the steps this runs cannot work
+    without the trees that record names. On a Mac it also needs the
+    pinned-Python line `library_python_args` reads, for the same reason:
+    `place-library` needs that interpreter to build the Library's venv.
+
+    **THE THREE-ACCOUNT PIECES ARE CHECKED FOR TOO, NOT ONLY THE TWO-ACCOUNT
+    ONES.** A `reviewers` account, the review launcher and the review sudo
+    rule are each a piece of the three-account shape this one must not
+    carry — the launcher because `agentctl` would otherwise route every
+    review through it.
+    """
+    lacks = []
+    if not exists(AGENTS):
+        lacks.append(f"the `{AGENTS}` account, which `sudo bin/provision-accounts --shape two` creates")
+    record_text = _read_record(record)
+    for name in ("shipwright", "library", "convivy-orient", "agent-platform"):
+        if installed_sha(record_text, name) is None:
+            lacks.append(
+                f"the privileged half is not installed: {record} names no {name} "
+                f"commit. Run `sudo bin/install-privileged --shape two` as the steps "
+                f"in the installer plan say")
+    if platform == "darwin" and installed_python(record_text) is None:
+        lacks.append(
+            f"the privileged half is not installed: {record} names no pinned Python. "
+            f"Run `sudo bin/install-privileged --shape two`, which installs and "
+            f"records one")
+    if exists(REVIEWERS):
+        lacks.append(
+            f"a `{REVIEWERS}` account exists on this machine, which is a "
+            f"three-account piece a two-account install must not carry")
+    if launcher.is_file() and os.access(launcher, os.X_OK):
+        lacks.append(
+            f"{launcher} exists and is executable: agentctl routes every review "
+            f"through it whenever it is on disk, so a two-account install that "
+            f"carried it would quietly run three-account reviews")
+    # ROOT IS ASKED ONLY WHEN NOTHING ELSE HAS REFUSED. A run that refuses
+    # anyway never prompts for a password to learn one more refusal; once
+    # the rest is fixed, the next run asks.
+    sudo_rule = path_present(sudoers, ask_root if not lacks else (lambda _path: False))
+    if sudo_rule is None:
+        lacks.append(
+            f"whether {sudoers}, the review sudo rule a three-account install "
+            f"places, exists: this account cannot read its directory, and root's "
+            f"answer through sudo could not be read")
+    elif sudo_rule:
+        lacks.append(
+            f"{sudoers} exists, which is the review sudo rule a three-account "
+            f"install places")
+    return lacks
+
+
+def refuse_two_shape(lacks: list[str]) -> Refused:
+    listed = "\n".join(f"  - {line}" for line in lacks)
+    return Refused(
+        f"the two-account shape cannot be installed on this machine. It lacks, or "
+        f"carries what it must not:\n"
+        f"{listed}\n"
+        f"Nothing was installed or changed, and the three-account shape was not "
+        f"installed in its place. To install with a `reviewers` account instead, "
+        f"run with `--shape three`.")
+
+
 LINGER_REFUSED = (
     "lingering could not be enabled for {user}, so Builder's jobs will stop when "
     "{user} logs out and start again at the next login. Whoever administers this "
@@ -553,7 +967,8 @@ def best_interpreter() -> str | None:
     Returning None rather than raising is what lets a REPORTING mode say which
     step cannot run and still print the other three. Raising from inside the
     step loop threw the whole report away on the one machine the docstring is
-    about: a fresh 22.04 box, first `--dry-run`, before `python3.11` exists.
+    about: a fresh Mac, first `--dry-run`, before Homebrew's `python3.11`
+    exists.
 
     **ROOT NAMES NO INTERPRETER IT WAS NOT GIVEN.** Its own interpreter is the one the
     sudo command named by absolute path, and PATH is never searched: an earlier PATH
@@ -616,14 +1031,15 @@ def resolve_operator_name(explicit: str | None, best: str | None) -> tuple[str, 
     --print-operator-name` as a subprocess, in THIS process's own context —
     the operator's, never through `AS_AGENTS`.
 
-    **ONLY FOR `--shape three`.** Its `library-person` step runs as `agents`
-    (`runs_as`), and `bootstrap-library`'s own fallback chain, run from
-    there, would read `agents`' git config and account name rather than the
-    operator's. Resolving it here, before the step drops to `agents`, and
-    always passing the result as `--operator-name`, is what keeps the
-    Library's first administrator named after the person installing it.
-    `bin/bootstrap-library` is the one place the chain itself is defined;
-    this never duplicates it.
+    **ONLY FOR THE SHAPES THAT GIVE THE LIBRARY ITS OWN ACCOUNT**
+    (`LIBRARY_SHAPES`). Its `library-person` step runs as the Library's own
+    account there (`runs_as`), and that account's own fallback chain, run
+    from there, would read its own git config and account name rather than
+    the operator's. Resolving it here, before the step drops to that account,
+    and always passing the
+    result as `--operator-name`, is what keeps the Library's first
+    administrator named after the person installing it. `bin/bootstrap-library`
+    is the one place the chain itself is defined; this never duplicates it.
 
     **RUN UNDER THE SAME 3.11 INTERPRETER THE `needs_311` STEPS USE**,
     refusing with the same message when none is found: `bootstrap-library`
@@ -653,7 +1069,68 @@ def resolve_operator_name(explicit: str | None, best: str | None) -> tuple[str, 
     return lines[0], lines[1]
 
 
-def argv_for(step: dict, args, mode: str | None, best: str | None) -> list[str]:
+def library_tree_args(shape: str) -> list[str]:
+    """`--from-tree library=<tree>` and `--expect-commit library=<sha>` for
+    `place-library`, naming the root-owned tree `install-privileged` already
+    extracted and recorded.
+
+    **THE LIBRARY HAS NO `.git` FOR `install-backend` TO RESOLVE A REF
+    FROM.** Its code reaches the Library's account only as this tree, never
+    a clone, so that nothing the `agents` account can edit becomes the
+    Library's code. It is named directly rather than left for
+    `install-backend`'s own default resolution, which needs a checkout.
+    Refused before anything runs, naming `install-privileged --shape
+    {shape}` as the fix, when the record has no library line or the tree it
+    names is missing.
+    """
+    sha = installed_sha(_read_record(INSTALLED_RECORD), "library")
+    if sha is None:
+        raise Refused(
+            f"{INSTALLED_RECORD} names no library commit, so there is no tree to place "
+            f"the Library from. Run `sudo bin/install-privileged --shape {shape}`, which "
+            f"records one. Nothing was installed.")
+    tree = PRIVILEGED_PREFIX / "src" / f"library@{sha}"
+    if not tree.is_dir():
+        raise Refused(
+            f"{tree} is missing, so there is no library tree to place. Run "
+            f"`sudo bin/install-privileged --shape {shape}`, which extracts one. "
+            f"Nothing was installed.")
+    return ["--from-tree", f"library={tree}", "--expect-commit", f"library={sha}"]
+
+
+def library_python_args(shape: str) -> list[str]:
+    """`--python <interpreter>` for `place-library`, naming the checksum-verified
+    standalone CPython `install-privileged` extracted under `/opt/builder` and
+    recorded (decision 3: `serve.sh` refuses Homebrew's, so the Library's venv
+    must be built with this interpreter rather than `best_interpreter()`'s choice,
+    which every other `place`/`place-library` run is given instead).
+
+    **MAC ONLY** — the caller in `argv_for` asks for this only under
+    `sys.platform == "darwin"`. Linux keeps the interpreter `argv_for` already
+    passes every `place-library` run, which already passes `serve.sh`'s walk.
+
+    Refused before anything runs, naming `install-privileged --shape {shape}` as
+    the fix, when the record has no python line, or the interpreter it names is
+    missing, a symlink, or not owned by root alone along its whole path.
+    """
+    version = installed_python(_read_record(INSTALLED_RECORD))
+    if version is None:
+        raise Refused(
+            f"{INSTALLED_RECORD} names no pinned Python, so there is no interpreter to "
+            f"build the Library's venv with. Run `sudo bin/install-privileged --shape "
+            f"{shape}`, which installs and records one. Nothing was installed.")
+    interpreter = PRIVILEGED_PREFIX / "python" / version / "bin" / PINNED_PYTHON_BIN
+    problem = ancestry_problem(interpreter, ROOT_UID, ROOT_TOP)
+    if problem:
+        raise Refused(
+            f"{interpreter} is not an interpreter the Library's venv may be built "
+            f"with: {problem}. Run `sudo bin/install-privileged --shape {shape}`, "
+            f"which re-installs and records one. Nothing was installed.")
+    return ["--python", str(interpreter)]
+
+
+def argv_for(step: dict, args, mode: str | None, best: str | None,
+             platform: str = sys.platform) -> list[str]:
     """The exact command line for one step, from what that tool accepts.
 
     Each tool takes a different subset, so this is a table rather than a loop:
@@ -669,7 +1146,19 @@ def argv_for(step: dict, args, mode: str | None, best: str | None) -> list[str]:
         # The single-account shape has no administrator: name what is missing
         # and how to install it, never sudo.
         argv.append("--no-install")
-    if step["name"] in ("place", "register", "library-person", "knowledge-index") and args.deploy is not None:
+    if step["name"] == "link" and args.shape in ("two", "three"):
+        # **THIS STEP RUNS AS `agents` THROUGH `sudo -u agents -H`** (`runs_as`),
+        # and `sudo` replaces PATH with its own `secure_path` before `link-commands`
+        # ever starts — never agents' own `~/.profile`, which on Debian puts
+        # `~/.local/bin` first. Left unchecked, this step's own PATH check
+        # reads sudo's PATH rather than the one agents actually logs in with,
+        # so it can never report `ok` on such a machine. `--login-path` asks
+        # agents' own login shell instead, which this process already is.
+        # **NEVER ON THE SINGLE-ACCOUNT SHAPE**, where the operator runs this
+        # directly, in their own shell, with no sudo in between — there the
+        # process's own PATH already answers the question this exists to fix.
+        argv.append("--login-path")
+    if step["name"] in ("place", "register", "knowledge-index") and args.deploy is not None:
         argv += ["--deploy", str(args.deploy)]
     if step["name"] == "place" and args.source is not None:
         # **--shape three ONLY.** `place` runs as `agents`, from the root-owned
@@ -679,10 +1168,32 @@ def argv_for(step: dict, args, mode: str | None, best: str | None) -> list[str]:
         # its own clones of the release instead, made as `agents` and never the
         # operator's own checkout (step 1's rule).
         argv += ["--from", str(args.source)]
+    if step["name"] == "library-person" and args.deploy is not None and args.shape not in LIBRARY_SHAPES:
+        # **NEVER ON THE SHAPES WITH A LIBRARY ACCOUNT.** `install-jobs`'
+        # `resolve()` ignores `--deploy` for an account-scoped job, which the
+        # Library's own declaration now is, and always resolves `{deploy}`
+        # against that account's home instead (`Machine.for_account`). Passing
+        # `--deploy` here too would send this to a different place than
+        # `supervise` resolves for the same job, so it is left out whenever
+        # that resolution applies — the single-account shape, where the
+        # Library has no account of its own, is unaffected.
+        argv += ["--deploy", str(args.deploy)]
+    if step["name"] == "place" and args.shape in LIBRARY_SHAPES:
+        # **THE LIBRARY IS PLACED SEPARATELY, BY `place-library`**, so it is
+        # left out here rather than placed twice — once under `agents`' home,
+        # where its job declaration no longer looks, and once under its own.
+        for name in NON_LIBRARY_PLACEABLE:
+            argv += ["--only", name]
     if step["name"] == "place" and best is not None:
         # `--python` defaults to whatever invoked the tool. On 22.04 that is
         # the stock 3.10, and a deploy venv built with it is a worse floor than
         # one built with the interpreter provision just installed.
+        argv += ["--python", best]
+    if step["name"] == "place-library" and platform != "darwin" and best is not None:
+        # **LINUX ONLY, UNCHANGED.** `best` already passes `serve.sh`'s walk
+        # there (decision 3). The darwin branch is below, after the tree args,
+        # so a record naming no library commit at all is still reported as
+        # that, never masked by the python check.
         argv += ["--python", best]
     if step["name"] == "place" and args.seed_registry:
         argv += ["--seed-registry"]
@@ -694,6 +1205,19 @@ def argv_for(step: dict, args, mode: str | None, best: str | None) -> list[str]:
         # verified; install-backend refuses one its clone does not hold.
         for value in args.commit:
             argv += ["--commit", value]
+    if step["name"] == "place-library":
+        # **NEVER `--release`**: the Library has no clone and no `.git` to
+        # resolve a tag in, only the root-owned tree named below, and
+        # `install-backend`'s own `--release`/`--from-tree` are mutually
+        # exclusive.
+        argv += ["--only", "library", *library_tree_args(args.shape)]
+        if platform == "darwin":
+            # **serve.sh REFUSES HOMEBREW'S PYTHON** (decision 3): `best` is
+            # whatever `best_interpreter()` found on this machine's own PATH,
+            # which on a Mac is Homebrew's. The Library's venv is built with
+            # the pinned, checksum-verified standalone CPython root installed
+            # instead, named by `library_python_args`.
+            argv += library_python_args(args.shape)
     if step["name"] == "supervise":
         argv += ["--jobs", str(declarations_dir(args))]
         if args.shape == "single":
@@ -705,12 +1229,21 @@ def argv_for(step: dict, args, mode: str | None, best: str | None) -> list[str]:
             argv += ["--activate"]
     if step["name"] == "library-person":
         argv += ["--jobs", str(declarations_dir(args))]
-        if args.shape == "three":
+        if args.shape in LIBRARY_SHAPES:
+            # **`bootstrap-library` RUNS AS THE LIBRARY'S OWN ACCOUNT HERE**
+            # (`runs_as`), which has no `builder-root` linked into its own
+            # bin directory — `link` only ever links into `agents`'. Left to
+            # its own fallback, `bootstrap-library` would find no root and
+            # refuse on `{root}`, which `LIBRARY_KNOWLEDGE_ROOT` needs. `agents`
+            # answers instead, the same root every account's deploy area
+            # shares, the way `root_supervise` already asks for `supervise`.
+            argv += ["--root", agents_builder_root(agents_home())]
             # `--shape single` runs this step as the operator, and
-            # `bootstrap-library` resolves the name for itself there,
-            # exactly as on main. `--shape three` runs it as `agents`, so the
-            # name is resolved here instead, as a subprocess in this
-            # process's own context, and always passed through.
+            # `bootstrap-library` resolves the name for itself there, exactly
+            # as on main. The two- and three-account shapes run it as the
+            # Library's own account instead, so the name is resolved here,
+            # as a subprocess in THIS process's own context (the
+            # operator's), and always passed through.
             name, source = resolve_operator_name(args.operator_name, best)
             print(f"{PROG}: library-person's operator name: {name!r} (from {source})")
             argv += ["--operator-name", name]
@@ -722,26 +1255,104 @@ def argv_for(step: dict, args, mode: str | None, best: str | None) -> list[str]:
 def steps_for(shape: str) -> tuple:
     """The steps this shape runs, in order.
 
-    **THE THREE-ACCOUNT SHAPE LEAVES OUT `provision`.** That step installs
-    packages, which needs an administrator, and this shape runs as `agents`
-    and as root, never as the operator. Whether the interpreter exists is what
+    **THE TWO- AND THREE-ACCOUNT SHAPES LEAVE OUT `provision`.** That step
+    installs packages, which needs an administrator, and these shapes run as
+    `agents`, the Library's and Orient's accounts and root, never as the
+    operator. `agents` holds no sudo rule on either shape, so `provision` run
+    as `agents` could only fail at its `sudo apt-get` fallback. Whether the interpreter exists is what
     `place` refuses on, and `place` says which command installs it.
+
+    **`migrate-library-account`, `hand-library-inputs`, `place-library` AND
+    `deliver-library-credentials` RUN ONLY WHERE THE LIBRARY HAS ITS OWN
+    ACCOUNT**, the two- and three-account shapes (`LIBRARY_SHAPES`). The
+    single-account shape runs the Library as the operator, so `place`
+    already puts everything where its job looks, there is no other account
+    for anything to be carried or delivered to, and no agents-side Library
+    state ever exists to migrate.
+
+    **`migrate-orient-account` AND `place-orient` RUN ONLY ON THOSE SAME
+    SHAPES**, because `provision-accounts` gives Orient its own account on
+    exactly the shapes it gives the Library one (`LIBRARY_SHAPES`). The
+    single-account shape runs Orient as the operator, so `place` already
+    puts its code where its job looks, there is no `{bin}` link for it to
+    write, and no agents-side Orient state ever exists to migrate.
+
+    **`agent-platform-shared`, `document-service`, `orient-statement-key` AND
+    `library-person-save` RUN ONLY ON THOSE SAME SHAPES TOO.** The document
+    service, Orient's own statement key and the Library credential's
+    delivery all exist only where Orient and the Library each have their
+    own account; the single-account shape's operator-run install has no
+    separate `agents` home to deploy the shared area under, and
+    `bin/place-person-save`'s own operator path (not this one) already
+    places its six entries there directly.
     """
-    if shape == "three":
-        return tuple(step for step in STEPS if step["name"] != "provision")
-    return STEPS
+    steps = tuple(step for step in STEPS if step["name"] != "provision") \
+        if shape in ("two", "three") else STEPS
+    if shape not in LIBRARY_SHAPES:
+        steps = tuple(
+            step for step in steps
+            if step["name"] not in (
+                "migrate-library-account", "hand-library-inputs", "place-library",
+                "deliver-library-credentials", "migrate-orient-account", "place-orient",
+                "agent-platform-shared", "document-service", "orient-statement-key",
+                "library-person-save",
+            )
+        )
+    return steps
 
 
 def runs_as(step: dict, shape: str) -> str:
-    """Who runs one step: the operator, `agents`, or root's own copy.
+    """Who runs one step: the operator, `agents`, the Library's own account,
+    or root's own copy.
 
-    In the single-account shape everything is the operator's. In the three-account
-    shape the backend's steps are `agents`', and supervision is root's, because a
-    system-scope job is installed by root whatever account it runs as.
+    In the single-account shape everything is the operator's. In the
+    two- and three-account shapes the backend's steps are `agents`', except
+    `supervise`, `deliver-library-credentials`, `hand-library-inputs`,
+    `migrate-library-account`, `migrate-orient-account` and `place-orient`,
+    which are root's, and `place-library` and `library-person`, which are
+    the Library's own account's on both. `supervise` is root's because a
+    system-scope job is installed by root whatever account it runs as;
+    `deliver-library-credentials`, `hand-library-inputs`,
+    `migrate-library-account` and `migrate-orient-account` are root's
+    because each reads one account's own home and writes the other's, and
+    neither account can do the other's half. `place-orient` is root's
+    because `bin/place-orient` itself refuses to run as anything but root:
+    it places Orient's code as `sudo -u` Orient's own account and writes
+    its `{bin}` links through a child dropped to that account, never
+    reading or writing that home directly as root. `place-library` and
+    `library-person` are the Library's own account's on both shapes: its
+    home is mode 700, so neither `agents` nor root's own run of
+    `install-jobs` can read or
+    write into it, and the Library's own job declaration resolves
+    `{deploy}` and `{home}` against that account, never `agents`'.
+    `library-person-save` is root's too, for the same reason `place-library`
+    is the Library's own account's rather than root reading or writing that
+    home directly: `bin/place-person-save --as-library` refuses to run as
+    anything but root and drops into the Library account's own uid and gid
+    itself, the same way `bin/place-orient` drops into Orient's.
+    `agent-platform-shared` runs as `agents` directly — unlike the root-run
+    steps above, it only ever reads root's own bare copy of agent-platform
+    (which `agents` may read without root's mediation) and writes `agents`'
+    own home, so no step here needs to coordinate two restricted-permission
+    homes at once for it. `document-service` is root's, for the same reason
+    `supervise` is: it writes a system-scope LaunchDaemon, which only root
+    may install, and it chowns a directory under `/var/db` to `agents` and
+    Orient's own group, which only root may do. `orient-statement-key` is
+    root's for the same reason `place-orient` is: it runs Orient's own
+    account through `sudo -u`, which only root may do, and writes the
+    operator's own `kb-verifier.json`, which `agents` may not reach.
     """
     if shape == "single":
         return "operator"
-    return "root" if step["name"] == "supervise" else "agents"
+    if step["name"] in (
+        "supervise", "deliver-library-credentials", "hand-library-inputs",
+        "migrate-library-account", "migrate-orient-account", "place-orient",
+        "document-service", "orient-statement-key", "library-person-save",
+    ):
+        return "root"
+    if step["name"] in ("place-library", "library-person"):
+        return "library"
+    return "agents"
 
 
 def agents_home() -> str:
@@ -751,6 +1362,12 @@ def agents_home() -> str:
     except KeyError:
         raise Refused(f"the `{AGENTS}` account does not exist. Run "
                       f"`sudo bin/provision-accounts --shape three`. Nothing was installed.")
+
+
+def library_account_name(platform: str | None = None) -> str:
+    """The Library's own account name on `platform` (default: this machine's)."""
+    platform = platform or ("macos" if sys.platform == "darwin" else "linux")
+    return LIBRARY_ACCOUNT_NAMES[platform]
 
 
 def agents_builder_root(home: str, run=None) -> str:
@@ -773,6 +1390,35 @@ def agents_builder_root(home: str, run=None) -> str:
     return root
 
 
+def root_tool(name: str) -> tuple[Path, str]:
+    """The absolute path of `name` in the root-owned tree `install-privileged`
+    extracted and recorded, and the interpreter root runs it with.
+
+    Shared by every step that runs as root's own copy rather than the agents
+    checkout that invoked this: `supervise` for `install-jobs`,
+    `deliver-library-credentials` for the tool of the same name.
+
+    **THAT TREE IS CHECKED AS THE RUNNING COPY IS, BEFORE ROOT RUNS ANYTHING IN
+    IT.** The record names a commit that can differ from the copy the operator
+    typed, so the running copy's check does not cover it.
+    """
+    sha = installed_sha(_read_record(INSTALLED_RECORD), "shipwright")
+    if sha is None:
+        raise Refused(f"{INSTALLED_RECORD} names no shipwright commit, so root has no "
+                      f"copy to run {name} from. Nothing was installed.")
+    tree = PRIVILEGED_PREFIX / "src" / f"shipwright@{sha}"
+    tool = tree / "bin" / name
+    if not tool.is_file():
+        raise Refused(f"{tool} is missing, so root has no copy of {name} to run. "
+                      f"Re-run install-privileged. Nothing was installed.")
+    problem = tree_problem(tool, ROOT_UID, ROOT_TOP)
+    if problem:
+        raise Refused(f"{tool} is not a copy root may run: {problem}. Re-run install-privileged. "
+                      f"Nothing was installed.")
+    interpreter = ROOT_INTERPRETERS["darwin" if sys.platform == "darwin" else "linux"]
+    return tool, interpreter
+
+
 def root_supervise(args, mode: str | None, run=None) -> tuple[list[str], list[str]]:
     """The root-run supervision command, and the arguments a person reads for it.
 
@@ -782,38 +1428,330 @@ def root_supervise(args, mode: str | None, run=None) -> tuple[list[str], list[st
     invoked it. `--home` and `--root` name `agents`' home and root, because the
     job declarations are rendered for that account, and `--jobs` names the
     declarations in the same tree the code runs from.
-
-    **THAT TREE IS CHECKED AS THE RUNNING COPY IS, BEFORE ROOT RUNS ANYTHING IN IT.** The record names
-    a commit that can differ from the copy the operator typed, so the running copy's check does not
-    cover it.
     """
-    sha = installed_sha(_read_record(INSTALLED_RECORD), "shipwright")
-    if sha is None:
-        raise Refused(f"{INSTALLED_RECORD} names no shipwright commit, so root has no "
-                      f"copy to supervise from. Nothing was installed.")
-    tree = PRIVILEGED_PREFIX / "src" / f"shipwright@{sha}"
-    tool = tree / "bin" / "install-jobs"
-    if not tool.is_file():
-        raise Refused(f"{tool} is missing, so root has no copy of install-jobs to run. "
-                      f"Re-run install-privileged. Nothing was installed.")
-    problem = tree_problem(tool, ROOT_UID, ROOT_TOP)
-    if problem:
-        raise Refused(f"{tool} is not a copy root may run: {problem}. Re-run install-privileged. "
-                      f"Nothing was installed.")
+    tool, interpreter = root_tool("install-jobs")
+    tree = tool.parent.parent
     home = agents_home()
     # THE LOGS OF THE ACCOUNT'S JOBS GO UNDER THE ROOT-OWNED PREFIX, not the account's home, so root never
-    # opens a log path the account can re-point (see install-jobs' `resolve`).
+    # opens a log path the account can re-point (see install-jobs' `resolve`). The record of units this
+    # run writes goes there too, for the same reason: --home is agents' own, so install-jobs' default
+    # record location is a directory agents owns, which a root run refuses to keep a record under.
     flags = ["--home", home, "--root", agents_builder_root(home, run),
-             "--jobs", str(tree / "jobs"), "--log-dir", str(PRIVILEGED_PREFIX / "var" / "log")]
+             "--jobs", str(tree / "jobs"), "--log-dir", str(PRIVILEGED_PREFIX / "var" / "log"),
+             "--record", str(PRIVILEGED_PREFIX / "var" / "install-jobs" / "units.json")]
     if args.deploy is not None:
         flags += ["--deploy", str(args.deploy)]
     if mode is not None:
         flags.append({"dry-run": "--dry-run", "check": "--check", "status": "--status"}[mode])
     if args.activate:
         flags.append("--activate")
-    interpreter = ROOT_INTERPRETERS["darwin" if sys.platform == "darwin" else "linux"]
     shown = [str(tool), *flags]
     return [SUDO, *CLEAN_ENV, interpreter, "-I", "-u", *shown], shown
+
+
+def root_deliver_library_credentials(mode: str | None) -> tuple[list[str], list[str]]:
+    """The root-run delivery command, and the arguments a person reads for it.
+
+    **ROOT RUNS ITS OWN COPY, THE SAME WAY `root_supervise` DOES**, and for
+    the same reason: it has to read the Library's own account's home, which
+    only the Library's account and root may do, and write into `agents`',
+    which the Library's account may not. This tool takes no `--home`,
+    `--root` or `--jobs`: both account homes, and the Library's own name on
+    this platform, are resolved from the directory service directly, the way
+    `bin/provision-accounts` already resolves them for account creation.
+    """
+    tool, interpreter = root_tool("deliver-library-credentials")
+    flags = []
+    if mode is not None:
+        flags.append({"dry-run": "--dry-run", "check": "--check", "status": "--status"}[mode])
+    shown = [str(tool), *flags]
+    return [SUDO, *CLEAN_ENV, interpreter, "-I", "-u", *shown], shown
+
+
+def root_hand_library_inputs(mode: str | None) -> tuple[list[str], list[str]]:
+    """The root-run carrying command, and the arguments a person reads for it.
+
+    **ROOT RUNS ITS OWN COPY, THE SAME WAY `root_deliver_library_credentials`
+    DOES**, and for the same reason: it has to read root's own trees, read
+    `agents`' own home, and write the Library's own account's home, and no
+    other account may do all three. This tool takes no `--home`, `--root` or
+    `--jobs`: every path it needs — both account homes, the Library's own
+    name on this platform, and root's own record of what is installed —
+    is resolved from the directory service and from `/opt/builder` directly,
+    the same way `deliver-library-credentials` already resolves its own.
+    """
+    tool, interpreter = root_tool("hand-library-inputs")
+    flags = []
+    if mode is not None:
+        flags.append({"dry-run": "--dry-run", "check": "--check", "status": "--status"}[mode])
+    shown = [str(tool), *flags]
+    return [SUDO, *CLEAN_ENV, interpreter, "-I", "-u", *shown], shown
+
+
+def root_migrate_library_account(shape: str, mode: str | None) -> tuple[list[str], list[str]]:
+    """The root-run migration command, and the arguments a person reads for it.
+
+    **ROOT RUNS ITS OWN COPY, THE SAME WAY `root_hand_library_inputs` DOES**:
+    this stops the Library's units, reads `agents`' own home and writes the
+    Library account's, which only root may do on both sides. `--shape` is the
+    one argument it needs that the other root-run tools do not, since it is
+    what lets this create the Library's own account when an upgrade is the
+    first thing to need one.
+    """
+    tool, interpreter = root_tool("migrate-library-account")
+    flags = ["--shape", shape]
+    if mode is not None:
+        flags.append({"dry-run": "--dry-run", "check": "--check", "status": "--status"}[mode])
+    shown = [str(tool), *flags]
+    return [SUDO, *CLEAN_ENV, interpreter, "-I", "-u", *shown], shown
+
+
+def root_migrate_orient_account(shape: str, mode: str | None) -> tuple[list[str], list[str]]:
+    """The root-run migration-status command, and the arguments a person reads for it.
+
+    **NEVER THE REAL MIGRATION, AND NEVER `--deploy-signals-bound`, EVEN IN A
+    REAL RUN.** `migrate-orient-account` itself refuses to migrate without
+    that flag, which asserts that Orient's crew has bound the instruction
+    block that reads `deploy_failure` and `deploy_stall` to its own sessions
+    (its own spec step 7) — a fact about another crew's session
+    configuration nothing on this machine can read or verify. So every mode
+    this passes, a real run included, is one of its reporting flags: `mode`
+    is `None` only for a real run of `stand-up-backend` itself, and that is
+    mapped to `--check` here rather than left to call the tool with no mode
+    at all, which is what would perform the migration.
+    """
+    tool, interpreter = root_tool("migrate-orient-account")
+    flags = ["--shape", shape,
+             {"dry-run": "--dry-run", "check": "--check", "status": "--status"}.get(mode, "--check")]
+    shown = [str(tool), *flags]
+    return [SUDO, *CLEAN_ENV, interpreter, "-I", "-u", *shown], shown
+
+
+def orient_migration_left_message(shape: str, tool: str) -> str:
+    """What this reports in place of `migrate-orient-account --check`'s own
+    stdout, when a real run finds Orient's migration pending.
+
+    **THE ONE PLACE `--deploy-signals-bound` IS NAMED TO THE OPERATOR.**
+    `--check` itself never mentions that flag, since its own reporting modes
+    need it not. This step leaves the migration to a person precisely
+    because whether Orient's crew has bound the instruction block that reads
+    `deploy_failure` and `deploy_stall` to its own sessions is a fact this
+    machine cannot verify, so the chain stops here and names the command
+    that performs the migration once that binding is confirmed.
+    """
+    interpreter = ROOT_INTERPRETERS["darwin" if sys.platform == "darwin" else "linux"]
+    return (
+        f"Orient's state is still under {AGENTS} — migration is pending, and this "
+        f"never performs it unattended. Once Orient's crew has bound the instruction "
+        f"block that reads deploy_failure and deploy_stall to its own sessions, run:\n"
+        f"    sudo {interpreter} -I {tool} --shape {shape} --deploy-signals-bound\n"
+        f"Nothing after this step ran."
+    )
+
+
+def with_orient_migration_message(result: dict, shape: str, mode: str | None) -> dict:
+    """`result`, with its stderr replaced by `orient_migration_left_message`
+    when it is the `migrate-orient-account` step reporting pending work from
+    a real run — otherwise `result` unchanged.
+
+    **ONLY `migrate-orient-account`, ONLY `mode is None`, ONLY `code == 1`.**
+    `root_migrate_orient_account` runs `--check` in place of the real
+    migration for every mode, a real run (`mode is None`) included, so a `1`
+    there is that `--check`'s own report of pending work, never a crash. Its
+    own stdout never names `--deploy-signals-bound`, since its reporting
+    modes need it not, so this is where the operator is told the command
+    that performs the migration. Nothing pending (`0`) is a quiet no-op, and
+    a crash reported some other way (a negative code, or `2` from `launch`
+    itself raising `Refused`) is left to speak for itself.
+    """
+    if (mode is None and result["step"]["name"] == "migrate-orient-account"
+            and result["code"] == 1 and result["argv"]):
+        result["stderr"] = orient_migration_left_message(shape, result["argv"][0])
+    return result
+
+
+def root_place_orient(mode: str | None) -> tuple[list[str], list[str]]:
+    """The root-run Orient placement command, and the arguments a person reads for it.
+
+    **ROOT RUNS ITS OWN COPY, THE SAME WAY `root_deliver_library_credentials`
+    DOES**, and for the same reason: `bin/place-orient` itself refuses to run
+    as anything but root (it places Orient's code as `sudo -u` Orient's own
+    account and writes `{bin}` links only through a child already dropped to
+    that account). This tool takes no `--home`, `--root` or `--jobs`:
+    Orient's own account name and home, and root's own record of what
+    `install-privileged` extracted, are resolved from the directory service
+    and from `/opt/builder` directly, the same way `deliver-library-credentials`
+    already resolves its own.
+    """
+    tool, interpreter = root_tool("place-orient")
+    flags = []
+    if mode is not None:
+        flags.append({"dry-run": "--dry-run", "check": "--check", "status": "--status"}[mode])
+    shown = [str(tool), *flags]
+    return [SUDO, *CLEAN_ENV, interpreter, "-I", "-u", *shown], shown
+
+
+def root_install_document_service(mode: str | None) -> tuple[list[str], list[str]]:
+    """The root-run document-service installation command, and the
+    arguments a person reads for it.
+
+    **ROOT RUNS ITS OWN COPY, THE SAME WAY `root_place_orient` DOES**, and
+    for the same reason: `bin/install-document-service` itself refuses to
+    run as anything but root (it writes a system-scope LaunchDaemon and
+    chowns a directory under `/var/db`). This tool takes no arguments:
+    Orient's own group, `agents`' own uid and home, and root's own record
+    of what `install-privileged` extracted, are resolved from the directory
+    service and from `/opt/builder` directly, the same way
+    `root_place_orient` already resolves its own.
+    """
+    tool, interpreter = root_tool("install-document-service")
+    flags = []
+    if mode is not None:
+        flags.append({"dry-run": "--dry-run", "check": "--check", "status": "--status"}[mode])
+    shown = [str(tool), *flags]
+    return [SUDO, *CLEAN_ENV, interpreter, "-I", "-u", *shown], shown
+
+
+def orient_key_operator() -> str:
+    """The operator whose kb-verifier.json gets Orient's statement key: this
+    process's own login, or `SUDO_USER` when this process runs as root.
+    Raises `Refused` when root has no `SUDO_USER` to name, which `run_step`
+    reports as that step's refusal (exit 2) like any other."""
+    if os.getuid() != 0:
+        return pwd.getpwuid(os.getuid()).pw_name
+    operator = os.environ.get("SUDO_USER")
+    if not operator or operator == "root":
+        raise Refused("running as root with no SUDO_USER, so the operator whose "
+                      "kb-verifier.json gets Orient's statement key is unknown. Run this "
+                      "as the operator.")
+    return operator
+
+
+def root_make_orient_statement_key(args, mode: str | None) -> tuple[list[str], list[str]]:
+    """The root-run statement-key command, and the arguments a person reads for it.
+
+    **ROOT RUNS ITS OWN COPY, THE SAME WAY `root_install_document_service`
+    DOES**, and for the same reason: `bin/make-orient-statement-key` itself
+    refuses to run as anything but root (it runs Orient's own account
+    through `sudo -u` and writes the operator's own `kb-verifier.json`).
+
+    **`--operator` IS PASSED EXPLICITLY, NEVER LEFT TO `SUDO_USER`.**
+    `CLEAN_ENV` clears the environment the tool runs under, `SUDO_USER`
+    included, so the tool would otherwise have nothing to resolve the
+    operator from. The operator is this process's own login, from its UID
+    (`getpass.getuser()` reads `USER` and `LOGNAME`, which a `su` or
+    `sudo -E` leaves naming someone else). When this process itself runs
+    as root, under `sudo stand-up-backend`, its UID names root, so the
+    operator is `SUDO_USER` instead, and with none this refuses.
+    """
+    tool, interpreter = root_tool("make-orient-statement-key")
+    operator = orient_key_operator()
+    flags = ["--operator", operator]
+    if mode is not None:
+        flags.append({"dry-run": "--dry-run", "check": "--check", "status": "--status"}[mode])
+    elif getattr(args, "persons", None):
+        # Without it the tool makes nothing and says so: the key is made only in the run
+        # that also writes the Library's copy, which needs the operator's persons.
+        flags += ["--persons", args.persons]
+    shown = [str(tool), *flags]
+    return [SUDO, *CLEAN_ENV, interpreter, "-I", "-u", *shown], shown
+
+
+def root_place_person_save(args, mode: str | None) -> tuple[list[str], list[str]]:
+    """The root-run person-save placement command, and the arguments a
+    person reads for it.
+
+    **ROOT RUNS ITS OWN COPY, THE SAME WAY `root_place_orient` DOES**, and
+    for the same reason: `bin/place-person-save --as-library` itself refuses
+    to run as anything but root, dropping into the Library account's own
+    uid and gid itself rather than letting root place directly into that
+    mode-700 home. Every mode maps to `--as-library --check`, which reads
+    the six entries back without placing anything; a real run additionally
+    carries `--root-ca`, `--app-key` and `--app-config`, the operator's own
+    sources, named on this command the same way. Given none of the three,
+    `--as-library` skips cleanly on its own (exit 0, no root needed) rather
+    than this function refusing — an operator who has not supplied them yet
+    must not have that stop the rest of the install.
+    """
+    tool, interpreter = root_tool("place-person-save")
+    flags = ["--as-library"]
+    if mode is not None:
+        flags.append({"dry-run": "--check", "check": "--check", "status": "--check"}[mode])
+    else:
+        if args.root_ca:
+            flags += ["--root-ca", args.root_ca]
+        if args.app_key:
+            flags += ["--app-key", args.app_key]
+        if args.app_config:
+            flags += ["--app-config", args.app_config]
+    shown = [str(tool), *flags]
+    return [SUDO, *CLEAN_ENV, interpreter, "-I", "-u", *shown], shown
+
+
+def agent_platform_tool_and_bare() -> tuple[Path, str, Path]:
+    """The root-owned `install-agent-platform-shared` in the agent-platform
+    tree `install-privileged` extracted and recorded, its own commit, and
+    root's own bare copy of that repository — the same record
+    `migrate-orient-account`'s own `install_agent_platform_shared` already
+    reads it from, read here the same way `root_tool` reads shipwright's.
+
+    `ancestry_problem`, not `tree_problem`: the latter's own `ROOT_OWNED_TREES`
+    assumes a shipwright-shaped layout (`bin`/`tools`/`jobs` beside the
+    script), which agent-platform's own tree is not. Checks both the tool
+    this runs and the bare repository `agents_agent_platform_shared` hands
+    `agents` as `--repo` and `safe.directory`, the same two checks
+    `migrate-orient-account`'s own `install_agent_platform_shared` already
+    carries for the identical operation — so a tool or a bare copy that no
+    longer descends from root is refused before `agents` is ever told to run
+    it.
+    """
+    sha = installed_sha(_read_record(INSTALLED_RECORD), "agent-platform")
+    if sha is None:
+        raise Refused(f"{INSTALLED_RECORD} names no agent-platform commit, so there is no "
+                      f"tree to deploy the shared area from. Nothing was installed.")
+    tree = PRIVILEGED_PREFIX / "src" / f"agent-platform@{sha}"
+    tool = tree / "bin" / "install-agent-platform-shared"
+    if not tool.is_file():
+        raise Refused(f"{tool} is missing. Re-run install-privileged. Nothing was installed.")
+    problem = ancestry_problem(tool, ROOT_UID, ROOT_TOP)
+    if problem:
+        raise Refused(f"{tool} is not a copy this may run: {problem}. Re-run install-privileged. "
+                      f"Nothing was installed.")
+    bare = PRIVILEGED_PREFIX / "src" / "agent-platform.git"
+    problem = ancestry_problem(bare, ROOT_UID, ROOT_TOP)
+    if problem:
+        raise Refused(f"{bare} is not a repository this may install from as {AGENTS}: {problem}. "
+                      f"Re-run install-privileged. Nothing was installed.")
+    return tool, sha, bare
+
+
+def agents_agent_platform_shared(mode: str | None) -> tuple[list[str], list[str]]:
+    """The `agents`-run shared-area deploy command, and the arguments a
+    person reads for it.
+
+    **RUNS AS `agents` DIRECTLY, THROUGH `sudo -u agents`, NEVER ROOT'S OWN
+    COPY OF A SHIPWRIGHT SCRIPT.** Unlike `root_place_orient` and
+    `root_place_person_save`, this reads only root's own bare copy of
+    agent-platform (which `agents` may read without root's mediation) and
+    writes only `agents`' own home, so no step needs to coordinate two
+    restricted-permission homes here. `safe.directory` and a `PATH` naming
+    the pinned interpreter's own directory are the same two fixes
+    `migrate-orient-account`'s own `install_agent_platform_shared` already
+    carries, for the same reasons: git refuses a repository another account
+    owns without the former, and the install's own Python is not on `sudo`'s
+    PATH without the latter.
+    """
+    tool, sha, bare = agent_platform_tool_and_bare()
+    deploy_dir = Path(agents_home()) / AGENT_PLATFORM_SHARED_REL
+    path = f"{os.path.dirname(ROOT_INTERPRETERS['darwin' if sys.platform == 'darwin' else 'linux'])}:" \
+          f"/usr/bin:/bin:/usr/sbin:/sbin"
+    argv = [SUDO, "-u", AGENTS, "-H", "/usr/bin/env", f"PATH={path}", "GIT_CONFIG_COUNT=1",
+            "GIT_CONFIG_KEY_0=safe.directory", f"GIT_CONFIG_VALUE_0={bare}",
+            str(tool), f"--repo={bare}", f"--ref={sha}", "--allow-non-main",
+            f"--deploy-dir={deploy_dir}"]
+    if mode in ("dry-run", "check", "status"):
+        argv.append("--status")
+    return argv, argv[8:]
 
 
 def launch(step: dict, args, mode: str | None, best: str | None, run=None) -> tuple[list[str], list[str]]:
@@ -826,9 +1764,37 @@ def launch(step: dict, args, mode: str | None, best: str | None, run=None) -> tu
     """
     who = runs_as(step, args.shape)
     if who == "root":
+        if step["name"] == "deliver-library-credentials":
+            return root_deliver_library_credentials(mode)
+        if step["name"] == "hand-library-inputs":
+            return root_hand_library_inputs(mode)
+        if step["name"] == "migrate-library-account":
+            return root_migrate_library_account(args.shape, mode)
+        if step["name"] == "migrate-orient-account":
+            return root_migrate_orient_account(args.shape, mode)
+        if step["name"] == "place-orient":
+            return root_place_orient(mode)
+        if step["name"] == "document-service":
+            return root_install_document_service(mode)
+        if step["name"] == "orient-statement-key":
+            return root_make_orient_statement_key(args, mode)
+        if step["name"] == "library-person-save":
+            return root_place_person_save(args, mode)
         return root_supervise(args, mode, run)
+    if who == "agents" and step["name"] == "agent-platform-shared":
+        return agents_agent_platform_shared(mode)
     argv = argv_for(step, args, mode, best)
-    prefix = AS_AGENTS if who == "agents" else []
+    if who == "agents":
+        prefix = AS_AGENTS
+    elif who == "library":
+        # Wrapped the same way as AS_AGENTS, and for the same reason: the Library's
+        # own account is created the same way as `agents` (`useradd --system
+        # --create-home --user-group`), so Ubuntu 24.04's pam_umask gives its
+        # `sudo -u` session the same 0002 umask `agents` gets, and a step run as
+        # it would come out group-writable without this.
+        prefix = [SUDO, "-u", library_account_name(), "-H", "sh", "-c", 'umask 022 && exec "$@"', "sh"]
+    else:
+        prefix = []
     return [*prefix, argv[0], "-u", *argv[1:]], argv[1:]
 
 
@@ -960,15 +1926,24 @@ def report(results: list[dict], args, stopped: dict | None, best: str | None,
     if supervision_skipped(args):
         print(f"  {'not built':<12} {'supervise':<10} "
               f"this repository ships no job declarations — see below")
+        if args.shape in LIBRARY_SHAPES:
+            print(f"  {'not built':<12} {'deliver-library-credentials':<10} "
+                  f"no job declarations means nothing minted anything to deliver")
         print(f"  {'not built':<12} {'library-person':<10} "
               f"no job declarations means no Library job to find a database in")
     print()
 
-    # EVERY refusal's reason, not only the one that stopped the chain. In a
-    # reporting mode nothing stops, so `stopped` is None and these would
-    # otherwise print `REFUSED place` and never say why.
+    # EVERY STEP'S STDERR, NOT GATED ON WHETHER IT FAILED. In a reporting
+    # mode nothing stops, so `stopped` is None and a refusal's own line
+    # would otherwise print `REFUSED place` and never say why — that was
+    # this block's original job. A step can also succeed (`0`) with
+    # something on stderr worth the operator's attention:
+    # `deliver-library-credentials` reports an unroutable crew ops pair
+    # there while it still delivers everything else and still exits 0, so
+    # gating this on a non-zero code would silently drop that report —
+    # `run_step` never echoes stderr live, only through this block.
     for result in results:
-        if result["code"] != 0 and (result["stderr"] or "").strip():
+        if (result["stderr"] or "").strip():
             print(f"what `{result['step']['name']}` said:")
             for line in result["stderr"].strip().splitlines():
                 print(f"    {line}")
@@ -994,7 +1969,10 @@ def report(results: list[dict], args, stopped: dict | None, best: str | None,
     else:
         left = [r["step"]["name"] for r in results if r["code"] != 0]
         if supervision_skipped(args):
-            left += ["supervise", "library-person"]
+            left += ["supervise"]
+            if args.shape in LIBRARY_SHAPES:
+                left += ["deliver-library-credentials"]
+            left += ["library-person"]
         print(f"work left in: {', '.join(left)}")
 
 
@@ -2906,6 +3884,22 @@ def invoked_path(value: Path | None, start: str) -> Path | None:
     return Path(start, value)
 
 
+def person_save_flags_problem(root_ca: str | None, app_key: str | None,
+                               app_config: str | None) -> str | None:
+    """None when `--root-ca`, `--app-key` and `--app-config` are all given or
+    none is; otherwise names which of the three are still missing, for
+    `main()` to refuse with before any step runs. Given through unchecked to
+    `root_place_person_save`, a partial set reaches `place-person-save
+    --as-library`'s own refusal (exit 2) only after `library-person-save`'s
+    turn comes up among the other steps, naming no missing flag of its own."""
+    values = {"--root-ca": root_ca, "--app-key": app_key, "--app-config": app_config}
+    given = [name for name, value in values.items() if value]
+    if not given or len(given) == len(values):
+        return None
+    missing = [name for name in values if name not in given]
+    return ", ".join(missing)
+
+
 def main(argv: list[str]) -> int:
     # THE INVOKING DIRECTORY IS KEPT BEFORE ROOT LEAVES IT, so a relative path argument still names
     # what the operator typed, and not `/`.
@@ -2961,6 +3955,23 @@ def main(argv: list[str]) -> int:
                              "Library's first person (default: git config "
                              "--global user.name, then the account's full "
                              "name, then its login name)")
+    parser.add_argument("--root-ca", default=None,
+                        help="Deck's root certificate (PEM), for the Library's "
+                             "person-save inputs on a shape where the Library "
+                             "has its own account. Given with --app-key and "
+                             "--app-config, places the six entries that need "
+                             "no Orient key; omitted, that step skips cleanly")
+    parser.add_argument("--app-key", default=None,
+                        help="the Library App's RSA private key (PEM), for the "
+                             "Library's person-save inputs")
+    parser.add_argument("--app-config", default=None,
+                        help="JSON naming the Library App's app_id and its repo, "
+                             "for the Library's person-save inputs")
+    parser.add_argument("--persons", default=None,
+                        help="comma-separated emails allowed to sign a person-save. "
+                             "On a shape where Orient has its own account, Orient's "
+                             "statement key is made, and its copy placed for the "
+                             "Library, only in a run that names them")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--status", action="store_true",
                       help="what each step reports, changing nothing")
@@ -2969,6 +3980,12 @@ def main(argv: list[str]) -> int:
     mode.add_argument("--check", action="store_true",
                       help="report only; 1 if work is left, 2 if a step refused")
     args = parser.parse_args(argv)
+    problem = person_save_flags_problem(args.root_ca, args.app_key, args.app_config)
+    if problem:
+        print(f"{PROG}: refusing — missing {problem}; give --root-ca, --app-key and "
+              f"--app-config together, or omit them all to skip placing the Library's "
+              f"person-save inputs. Nothing was changed.", file=sys.stderr)
+        return 2
     try:
         args.release = checked_release(args.release)
     except Refused as exc:
@@ -3008,13 +4025,13 @@ def main(argv: list[str]) -> int:
               f"Run it without sudo. Nothing was changed.", file=sys.stderr)
         return 2
     if args.shape == "two":
-        # BEFORE ANY STEP, IN EVERY MODE. The two-account shape is not built
-        # yet in this release; the install with a reviewers account is
-        # --shape three, and this never silently substitutes it.
-        print(f"{PROG}: the two-account install is not built yet in this release. "
-              f"The install with a reviewers account is `--shape three`. Nothing "
-              f"was installed or changed.", file=sys.stderr)
-        return 2
+        # BEFORE ANY STEP, IN EVERY MODE. A reporting mode would otherwise
+        # describe installing pieces the two-account shape cannot use, or
+        # stay silent about a three-account piece it must not carry.
+        lacks = two_shape_lacks()
+        if lacks:
+            print(f"{PROG}: {refuse_two_shape(lacks)}", file=sys.stderr)
+            return 2
     if args.shape == "three":
         # BEFORE ANY STEP, IN EVERY MODE. A reporting mode would otherwise
         # describe installing pieces the three-account shape cannot use.
@@ -3035,6 +4052,10 @@ def main(argv: list[str]) -> int:
             print(f"{PROG}: name one of --migrate-from and --rollback-to, not both",
                   file=sys.stderr)
             return 2
+        if args.shape == "two":
+            print(f"{PROG}: moving an existing install to the two-account shape is not "
+                  f"built yet in this release. Nothing was changed.", file=sys.stderr)
+            return 2
         if args.shape != "three":
             print(f"{PROG}: the migration moves the backend into the `{AGENTS}` account, "
                   f"which only --shape three has. Nothing was changed.", file=sys.stderr)
@@ -3047,10 +4068,12 @@ def main(argv: list[str]) -> int:
     linger_note = None
     for step in steps_for(args.shape):
         # RE-PROBED UNTIL ONE IS FOUND, because `provision` is what installs it.
-        # Resolved once before the loop, `best` was None on the very machine
-        # this command is written for — a fresh 22.04 box whose `python3` is
-        # 3.10 — so `supervise` refused and `place` built its venvs with the
-        # stock interpreter, both AFTER provision had just installed 3.11.
+        # Resolved once before the loop, `best` was None on the machine this
+        # motivated: a fresh Mac, before provision's Homebrew python3.11
+        # exists, or an unsupported machine such as a 22.04 box whose stock
+        # `python3` is 3.10 — so `supervise` refused and `place` built its
+        # venvs with the stock interpreter, both AFTER provision had just
+        # installed 3.11.
         if best is None:
             try:
                 best = best_interpreter()
@@ -3058,7 +4081,9 @@ def main(argv: list[str]) -> int:
                 # ONLY ROOT RAISES FROM HERE: it names the interpreter it needed, and runs nothing.
                 print(f"{PROG}: {exc}", file=sys.stderr)
                 return 2
-        if step["name"] in ("supervise", "library-person", "knowledge-index") and supervision_skipped(args):
+        if (step["name"] in ("supervise", "deliver-library-credentials", "library-person",
+                             "knowledge-index")
+                and supervision_skipped(args)):
             continue
         # A REAL RUN WITH NO `--activate` STARTED NOTHING, SO THERE IS NO
         # LIBRARY TO ASK. A reporting mode still runs this step: it answers
@@ -3073,7 +4098,8 @@ def main(argv: list[str]) -> int:
             linger_note = enable_linger(pwd.getpwuid(os.getuid()).pw_name)
             if linger_note:
                 print(f"{PROG}: {linger_note}\n")
-        result = run_step(step, args, chosen, best)
+        result = with_orient_migration_message(
+            run_step(step, args, chosen, best), args.shape, chosen)
         results.append(result)
         # ANY non-zero stops a real run, not only a refusal. A crash exits 1
         # and a signal death is negative, and continuing past either installs

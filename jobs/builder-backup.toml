@@ -1,5 +1,5 @@
 name = "builder-backup"
-description = "Backs up the Library's database and cold store, Orient's database, the Library's blobs and the knowledge repository every six hours, verifies each copy, and records when it last succeeded. The machine's own backups carry the copy off it."
+description = "Backs up the knowledge repository every six hours, verified, and records when it last succeeded; on the single-account shape, also Orient's database and the Library's database, cold store and blobs. The machine's own backups carry the copy off it."
 label = "com.convivy.builder-backup"
 command = [
   "{python}",
@@ -24,6 +24,27 @@ stderr = "{state}/builder-backup.log"
 [environment]
 HOME = "{home}"
 PATH = "{bin}:/usr/bin:/bin"
+
+# ON THE SHAPES WITH A LIBRARY ACCOUNT AND AN ORIENT ACCOUNT, `agents` MUST
+# NEVER GET A READABLE COPY OF THE LIBRARY'S DATABASE, COLD STORE OR BLOBS,
+# NOR OF ORIENT'S DATABASE. `--library-state` above still resolves under
+# `agents`' own home there, which is no longer where the Library's files live
+# (jobs/library.toml's own `own-root` comment) — this is what used to fail the
+# job outright with "no Library database"; the default `--orient-db` resolves
+# the same way, under `agents`' own home, which is no longer where Orient's
+# database lives either (jobs/orient.toml's own `directories` comment). The
+# `BUILDER_BACKUP_SKIP_LIBRARY` and `BUILDER_BACKUP_SKIP_ORIENT` environment
+# variables, which `payload/bin/builder-backup` reads as `--skip-library`'s
+# and `--skip-orient`'s own defaults, tell it to back up only the knowledge
+# repository instead; `jobs/library-backup.toml` and `jobs/orient-backup.toml`
+# are the jobs that back up the Library's own three pieces and Orient's own
+# database, each running as its own account. `account-environment` applies
+# only while `agents` is in force (FORMAT.md, "account-environment"), so
+# `--single-account` drops this entry with the account and the command above
+# keeps backing up everything in one pass, exactly as it does today.
+[account-environment]
+BUILDER_BACKUP_SKIP_LIBRARY = "1"
+BUILDER_BACKUP_SKIP_ORIENT = "1"
 
 [schedule]
 at-load = true

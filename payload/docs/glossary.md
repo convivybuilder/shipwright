@@ -27,10 +27,10 @@ merge check in the Library, and that check approves every merge it is asked abou
 [What does not work yet](install-status.md) says. [Customizing Builder](customizing.md#the-agent-policy)
 shows how to change it.
 
-**`agents`** — The account the three-account install runs Builder as. The steward, every crew's
-session, the agents they put to work, the Library and Builder's background jobs all run there, and
-`~/builder` is in it. It holds none of your credentials and has no administrator rights. You reach
-it over SSH and read what it writes through its group.
+**`agents`** — The account the two- and three-account installs run Builder as. The steward, every
+crew's session, the agents they put to work, and Builder's background jobs other than the
+Library's own all run there, and `~/builder` is in it. It holds none of your credentials and has no
+administrator rights. You reach it over SSH and read what it writes through its group.
 
 **approver** — The GitHub App that posts review checks on the three-account install. Its key is read
 only by the machine's administrator account and the program that runs a review, so no agent can post
@@ -148,6 +148,13 @@ Archives for records of what happened. Every change goes through it, except a ch
 knowledge repository with git, by you, by a crew's session or by the install's update of the starter
 set, which [Customizing Builder](customizing.md) describes.
 
+**`library`/`_library`** — The account the two- and three-account installs run the Library as, with
+no login of its own: `_library` on a Mac, the platform's own naming convention for an account like
+this one, and `library` on a Linux machine, where no such convention applies. It owns the Library's
+database, its credentials and its state, and nothing reaches any of that but the Library's own
+network listener — not even `agents` or `reviewers`. A no-login account does not count toward a
+shape's name.
+
 **library card** — The credential a call slip is traded for, bound to one agent for its working life.
 The Individuator holds it and makes every Library request for the agent, and the Library can
 withdraw it at any time.
@@ -248,15 +255,18 @@ application is called Terminal. In a path typed there, `~` stands for your accou
 
 **three-account install** — The install shape that runs Builder as `agents` and its reviews as
 `reviewers`, with the administrator password, so a merge waits on review checks no agent can post.
-This release installs only the single-account shape; the three-account install comes in a later
-release.
+This release installs the single-account and two-account shapes; the three-account install comes
+in a later release.
 
 **tmux** — A background program that keeps terminal sessions running after you close the window, so
 you can leave a session working and come back to it.
 
 **two-account install** — The install shape that runs Builder as `agents`, with reviews also running
 as `agents` rather than a separate account, so the account that writes a change is the same one that
-reviews it. It is designed and not built.
+reviews it, and its findings are called advice rather than a review check. The merge rule it relies
+on, which would refuse every update to `main` except a pull request the operator merges, comes in a
+later release; meanwhile the operator merges each pull request from another device, through
+GitHub's own web page.
 
 **vault** — One of the Library's three parts, which are the Reference Room, the Chart House and the
 Archives. Each holds a different kind of thing under its own rules.

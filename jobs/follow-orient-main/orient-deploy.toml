@@ -1,0 +1,27 @@
+name = "orient-deploy"
+description = "On an install that follows Orient's main, fetches main as root every five minutes, checks that every commit since the deployed one is a merge GitHub signed, and places and restarts Orient on it."
+label = "com.convivy.orient-deploy"
+# THE ENTRY POINT ROOT'S INSTALL REWRITES ON EVERY RUN, so the job always runs
+# the copy in root's newest installed tree. Nothing another account writes
+# starts it, delays it or tells it what to deploy.
+command = ["/opt/builder/libexec/orient-deploy"]
+platforms = ["macos", "linux"]
+# Root's own job: no `account`, so it runs as root and installs as a
+# LaunchDaemon or a system unit.
+scope = "system"
+enabled-by-default = true
+
+# IN ITS OWN DIRECTORY, NOT `jobs/` ITSELF, BECAUSE ONLY AN INSTALL THAT FOLLOWS
+# ORIENT'S MAIN RUNS IT. `install-jobs` reads `*.toml` in the directory it is
+# given and never below it, so no install picks this up by default; only
+# `orient-deploy --enable` installs it, naming this directory.
+[log]
+stdout = "/opt/builder/var/log/com.convivy.orient-deploy.out"
+stderr = "/opt/builder/var/log/com.convivy.orient-deploy.err"
+
+[environment]
+PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+[schedule]
+at-load = true
+every-seconds = 300

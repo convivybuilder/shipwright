@@ -16,7 +16,7 @@ Builder runs on two machines: a server that runs the sessions, and a Mac laptop 
 | Operating system | Processor |
 |---|---|
 | Debian 12 | 64-bit Intel or AMD |
-| Ubuntu 22.04 | 64-bit Intel or AMD |
+| Ubuntu 24.04 | 64-bit Intel or AMD |
 | macOS 26 | Apple silicon |
 
 **The laptop is any Mac running macOS 14 or later.** It runs Deck, the app you work from, and
@@ -52,6 +52,9 @@ Builder's installers accept other versions of Debian, Ubuntu and macOS, and they
 not on this list because nobody has rehearsed them, so a problem found there is one nobody has seen
 before. Other Linux distributions are not supported: on Linux, the installers install the programs
 Builder needs with `apt-get`, the package manager Debian and Ubuntu use.
+
+Ubuntu 22.04 is one of these: its own Python is older than Builder needs, and apt has no later one
+that works.
 
 ## Where to go next
 

@@ -5,7 +5,7 @@ which on Linux means it can use `sudo`; [Installing Builder](installing.md#words
 explains `sudo` and how to check. On a Mac, follow [Installing on a Mac](install-mac.md). For a Linux
 account that cannot, follow [Installing on Linux, without administrator access](install-linux-without-sudo.md).
 
-It has been tested on Debian 12. On Ubuntu 22.04 it has been tested only as far as the package step.
+It has been tested on Debian 12. On Ubuntu 24.04 it has been tested only as far as the package step.
 
 **The one-command install installs `git`, Python 3.11 and Claude Code itself**, asking for your
 `sudo` password once; [Installing Builder's one-command section](installing.md#the-one-command)
@@ -78,8 +78,20 @@ of them is needed to meet the steward and build a first crew:
   `bin/install-jobs --help`. `stand-up-backend` has already run the steps these check, and printed
   what each one did.
 - **`claude mcp get ops`**, which asks whether the work-queue tools can reach what they need.
-- **A note that Ubuntu 22.04's `python3` is version 3.10.** It does not apply on Debian 12, where
-  `python3` is 3.11.
+- **A note about invoking the declaration tools explicitly with `python3.11`.** It prints only on
+  a machine whose own `python3` is older than 3.11, such as an unsupported Ubuntu 22.04 box. On
+  Debian 12 and Ubuntu 24.04, `python3` is 3.11 or later already, and the note does not print.
+
+## Updating
+
+Move to a later release with:
+
+```
+curl -fsSL https://convivybuilder.org/install.sh | sh -s -- --update --shape single
+```
+
+[Moving to a later release](after-installing.md#moving-to-a-later-release) says what that does,
+and what it refuses.
 
 ## Next
 

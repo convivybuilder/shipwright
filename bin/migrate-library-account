@@ -1,0 +1,1040 @@
+#!/usr/bin/env python3
+"""migrate-library-account — move an existing install's Library to its own account.
+
+    sudo bin/migrate-library-account --shape two|three               migrate what is pending
+    sudo bin/migrate-library-account --shape two|three --dry-run      say what would happen, change nothing
+    sudo bin/migrate-library-account --shape two|three --check       report only; 1 if migration is pending
+    sudo bin/migrate-library-account --shape two|three --status      the same report, changing nothing
+
+**THE PROBLEM THIS CLOSES.** An install from before company decision 0025
+point 5 ran the Library's three jobs (`com.convivy.library`, its cold-tier
+and its cert-expiry-check) as `agents`, with the Library's database,
+vectors, blobs, log and minted `.orient-control` credentials sitting under
+`agents`' own home. On the two- and three-account shapes this release's
+`jobs/library.toml` declares `account = "library"` instead, so running
+`bin/stand-up-backend --shape two|three` again would render and start a
+Library unit pointed at an empty home, leaving the real data stranded and
+unreadable under `agents`. This step closes that gap as part of the same
+run, before `hand-library-inputs` and `place-library` carry anything else to
+the Library's new account.
+
+**WHAT IT DOES, IN ORDER.** Nothing runs when `{agents' home}/.local/state/library`
+does not exist — a fresh install, or an install already migrated, changes
+nothing. Otherwise: it stops the three Library units wherever they are
+currently loaded; takes out of the supervisor whichever of those units'
+definitions still runs as `agents` or out of `agents`' own deploy path
+(see below); creates the Library's own account if it is not there yet, by
+calling `bin/provision-accounts` for this shape, never duplicating what
+that command already does; copies every credential the Library minted under
+`agents`' own `~/.orient-control` into the Library account's own, and the
+whole `{state}/library` directory and its sibling `library.log` into a
+staging area under the Library account's own state directory; verifies the
+copy, by comparing every file's size and the Library database's own table
+row counts against the originals; and only once that verification passes,
+promotes the staging area into place, removes the originals from `agents`'
+own home, and removes `agents`' now-unused `~/.local/deploy/library`. The
+three units are left stopped, with no definition left for them at all where
+one named `agents`: `bin/stand-up-backend`'s own `supervise` step, right
+after this one in its pipeline, renders and starts them fresh, against the
+Library account's own home.
+
+**IT ALSO CLEARS THE OLD UNIT DEFINITIONS LEFT IN THE SUPERVISOR.** A Debian
+12 upgrade rehearsal on 2026-11-15 found moving the state alone leaves the
+Library's system units, `com.convivy.library`, `com.convivy.library.cold-tier`
+and their timers under `/etc/systemd/system` on Linux, or the matching
+launchd daemons in `/Library/LaunchDaemons` on macOS, still naming
+`User=agents`/`UserName=agents` or `agents`' own `~/.local/deploy/library`,
+written there by the old install. `supervise`'s own `install-jobs` step
+keeps no record of a root-owned unit on this shape, so it read that live,
+unrecognised unit as a hand edit and skipped it, leaving the Library
+started as `agents` against a home the state had already left: a `CHDIR`
+failure. This step disables (`systemctl disable --now`) or boots out
+(`launchctl bootout`) each such unit, then removes its file, before
+anything else about this run can succeed. A unit already naming the
+Library account, written by a previous, successful run of this tool or by
+a fresh install that never ran as `agents`, is left running and in place,
+so a rerun after success changes nothing. It keeps a byte-identical copy of
+each one it removes, and its rollback writes every one back and restarts
+the units, exactly as it already does for the state.
+
+**THE COPY NEVER FOLLOWS A SYMLINK, AND REFUSES ANY SPECIAL FILE.** `agents`
+owns the source tree, and every directory and file in it is opened with
+`O_NOFOLLOW` from the descriptor of the one above it, never by a path a
+symlink could redirect. A symlink or anything that is neither a plain file
+nor a plain directory anywhere in the tree refuses the whole run before
+anything is removed.
+
+**ROLLBACK.** A failure any time before the originals under `agents` are
+removed stops the run, deletes whatever was written under the Library
+account's own home, writes back any unit definition this run removed,
+restarts the units this stopped, and says so. Nothing under `agents` is
+ever removed until the copy under the Library account is verified complete.
+
+**ONLY ON THE SHAPES WHERE THE LIBRARY HAS ITS OWN ACCOUNT.** `bin/stand-up-backend`
+runs this only for `--shape two` and `--shape three` (`LIBRARY_SHAPES`); the
+single-account shape runs the Library as the operator and never calls this
+at all.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import hashlib
+import json
+import os
+import plistlib
+import pwd
+import re
+import shutil
+import sqlite3
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+PROG = "migrate-library-account"
+REPO = Path(__file__).resolve().parent.parent
+
+AGENTS = "agents"
+# Duplicated from `bin/provision-accounts`' own `LIBRARY_ACCOUNT_NAMES`
+# rather than imported, the same way `bin/hand-library-inputs` and
+# `bin/deliver-library-credentials` already duplicate it.
+LIBRARY_ACCOUNT_NAMES = {"macos": "_library", "linux": "library"}
+
+SUDO = "/usr/bin/sudo"
+# The same interpreters `bin/stand-up-backend`'s own `ROOT_INTERPRETERS` names,
+# for the root-owned copies of `provision-accounts` and `install-jobs` this
+# runs beside.
+ROOT_INTERPRETERS = {"darwin": "/opt/homebrew/bin/python3.11", "linux": "/usr/bin/python3"}
+
+
+def root_interpreter(platform: str) -> str:
+    """Root's interpreter for this file's own "macos"/"linux" `platform`
+    strings. `ROOT_INTERPRETERS` is keyed by `sys.platform`'s spelling
+    ("darwin"/"linux") so that it stays equal to `bin/stand-up-backend`'s
+    table, which its tests compare; indexing it with "macos" raised
+    KeyError on a Mac."""
+    return ROOT_INTERPRETERS["darwin" if platform == "macos" else "linux"]
+PRIVILEGED_PREFIX = Path("/opt/builder")
+
+# The three Library units `jobs/library.toml`, `jobs/library-cold-tier.toml`
+# and `jobs/library-cert-expiry-check.toml` declare.
+LIBRARY_UNIT_LABELS = (
+    "com.convivy.library",
+    "com.convivy.library.cold-tier",
+    "com.convivy.library.cert-expiry-check",
+)
+# Which of the three schedules a recurring run, and so gets a sibling
+# `.timer` on Linux (see `tools/jobs/render_systemd.needs_timer`):
+# `jobs/library.toml` runs continuously and has none; the other two each
+# declare `[schedule]`. Duplicated here rather than read from the
+# declaration, the same way this file already duplicates every other
+# constant it needs rather than importing `tools/jobs`.
+LIBRARY_UNITS_WITH_TIMER = frozenset({
+    "com.convivy.library.cold-tier", "com.convivy.library.cert-expiry-check",
+})
+SYSTEMD_SYSTEM_DIR = "/etc/systemd/system"
+LAUNCHD_SYSTEM_DIR = "/Library/LaunchDaemons"
+
+STATE_REL = Path(".local", "state")
+LIBRARY_STATE_NAME = "library"
+LIBRARY_LOG_NAME = "library.log"
+ORIENT_CONTROL = ".orient-control"
+DEPLOY_LIBRARY_REL = Path(".local", "deploy", "library")
+
+# Every file name `jobs/library.toml`'s own `prepare` mints directly under
+# `{home}/.orient-control`, duplicated from that file's own paths rather than
+# parsed out of it.
+LIBRARY_CREDENTIAL_NAMES = frozenset({
+    "library-token",
+    "library-token-registry-read-granted",
+    "library-client-token",
+    "library-client-token-post-draft-granted",
+    "ops-mcp-token",
+    "agent-platform-token",
+    "deck-library-token",
+    "agent-platform-registry-reader-token",
+    "agent-platform-registry-writer-token",
+})
+# `mint-crew-ops-credentials`' own per-crew ops-pair names, duplicated from
+# `bin/deliver-library-credentials`' own `CREW_OPS_RE`.
+CREW_OPS_RE = re.compile(r"^ops-(?:co-)?[a-z][a-z0-9-]{0,63}-token$")
+
+# A row count is run in a child dropped to the database's own owner (never
+# by root, straight against a file `agents` or the Library still shapes),
+# bounded by this deadline so an owner who makes a base table enormous
+# cannot make root's `COUNT(*)` run unbounded. Checked by SQLite's own
+# progress handler every `ROW_COUNT_PROGRESS_STEPS` VM instructions, not by
+# `sqlite3.connect`'s `timeout=`, which only bounds the lock wait.
+ROW_COUNT_DEADLINE_SECONDS = 180
+ROW_COUNT_PROGRESS_STEPS = 1000
+
+DIR_OPEN = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+FILE_OPEN = os.O_RDONLY | os.O_NOFOLLOW
+NEW_FILE = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+
+
+class Refused(Exception):
+    """Something the operator has to decide about. Never a stack trace."""
+
+
+# --- accounts, duplicated from bin/deliver-library-credentials ---------------
+
+
+def library_account_name(platform: str | None = None) -> str:
+    platform = platform or ("macos" if sys.platform == "darwin" else "linux")
+    return LIBRARY_ACCOUNT_NAMES[platform]
+
+
+def account_home(name: str) -> str | None:
+    try:
+        return pwd.getpwnam(name).pw_dir
+    except KeyError:
+        return None
+
+
+def account_ids(name: str) -> tuple[int, int] | None:
+    try:
+        entry = pwd.getpwnam(name)
+    except KeyError:
+        return None
+    return entry.pw_uid, entry.pw_gid
+
+
+def owned_by(path: str, uid: int) -> bool:
+    """Whether `path` exists, is a real directory and is owned by `uid`.
+
+    Never follows a symlink: a symlink at an account's home would otherwise
+    read or write through it to wherever it points.
+    """
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return True  # nothing there yet is not foreign; it just does not exist
+    if stat.S_ISLNK(info.st_mode):
+        return False
+    return info.st_uid == uid
+
+
+def is_known_credential(name: str) -> bool:
+    """Whether `name` is a file the Library mints under `.orient-control`."""
+    return name in LIBRARY_CREDENTIAL_NAMES or bool(CREW_OPS_RE.match(name))
+
+
+def mkdir_owned(path: Path, uid: int, gid: int) -> None:
+    """Create `path` and every missing ancestor below one that already
+    exists, each private (`0700`) and owned by `(uid, gid)`.
+
+    Called only under the Library account's own home, already confirmed
+    owned by that account. `Path.mkdir(parents=True)` alone would leave a
+    freshly created intermediate (`.local`, then `.local/state`) owned by
+    root, since this process runs as root throughout — reachable by no
+    other account only because the home directory above it is already
+    private, not because these directories are themselves right.
+    """
+    if path.exists():
+        return
+    mkdir_owned(path.parent, uid, gid)
+    os.mkdir(path, 0o700)
+    os.chown(path, uid, gid)
+
+
+# --- forking and dropping privileges, duplicated from bin/hand-library-inputs --
+
+
+def _drop_privileges(uid: int, gid: int) -> None:
+    """Become `(uid, gid)` in THIS process, with no supplementary groups
+    carried over. Called only in a child that is about to do nothing else
+    but read a file that account owns."""
+    os.setgroups([])
+    os.setgid(gid)
+    os.setuid(uid)
+
+
+def run_as_account(uid: int, gid: int, action, *, drop=None):
+    """Run `action()` — a zero-argument callable returning a JSON-able
+    value — in a child that has dropped to `(uid, gid)` first, and return
+    what it returns, or raise `Refused` with what it raised.
+
+    So that root itself never opens a file only `(uid, gid)` is trusted to
+    shape — the same boundary `bin/hand-library-inputs` and
+    `bin/deliver-library-credentials` already hold for everything they
+    read out of either account's home, with their own copies of this
+    function. `drop` is injected so a test that cannot become another
+    account can stub it; left `None`, it resolves to this module's own
+    `_drop_privileges` dynamically (a plain global lookup, not a bound
+    default), so a test that monkeypatches that name directly reaches
+    every caller that did not pass `drop=` explicitly, the same way those
+    two modules' own tests already do.
+    """
+    if drop is None:
+        drop = _drop_privileges
+    read_fd, write_fd = os.pipe()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            drop(uid, gid)
+            result = action()
+            payload = json.dumps({"ok": True, "result": result}).encode("utf-8")
+        except BaseException as exc:
+            payload = json.dumps({"ok": False, "error": str(exc)}).encode("utf-8")
+        try:
+            with os.fdopen(write_fd, "wb") as out:
+                out.write(len(payload).to_bytes(8, "big"))
+                out.write(payload)
+        finally:
+            os._exit(0)
+    os.close(write_fd)
+    with os.fdopen(read_fd, "rb") as inp:
+        header = inp.read(8)
+        size = int.from_bytes(header, "big") if header else 0
+        data = inp.read(size) if size else b""
+    os.waitpid(pid, 0)
+    decoded = json.loads(data.decode("utf-8")) if data else {"ok": False, "error": "the child reported nothing"}
+    if not decoded.get("ok"):
+        raise Refused(decoded.get("error") or "the child failed silently")
+    return decoded.get("result")
+
+
+# --- detection -----------------------------------------------------------------
+
+
+def agents_library_state(agents_home: Path) -> Path:
+    return agents_home / STATE_REL / LIBRARY_STATE_NAME
+
+
+def needs_migration(agents_home: Path) -> bool:
+    """Whether `agents` still holds the Library's own state directory.
+
+    True only for an install whose Library used to run as `agents`. A fresh
+    install, and an install already migrated (the source was removed once
+    the copy was verified), both answer False, so a rerun changes nothing.
+
+    **THE DATABASE, NOT THE DIRECTORY, MARKS A LIBRARY.** On a fresh install
+    the `place` step, running as `agents`, stages the projects seed in that
+    same directory for `hand-library-inputs` to copy. A Debian 12 rehearsal
+    of a fresh three-account install read that seed as an old Library and
+    refused, since `link` had not yet placed the `builder-root` a migration
+    asks. Only a Library that ran has `library.db`.
+    """
+    state = agents_library_state(agents_home)
+    try:
+        info = os.lstat(state)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        return False
+    try:
+        db = os.lstat(state / "library.db")
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(db.st_mode)
+
+
+# --- accounts and units, called as subprocesses -------------------------------
+
+
+def ensure_library_account(shape: str, platform: str, run=subprocess.run) -> bool:
+    """Create the Library's own account for `shape`, if it is missing.
+
+    Returns whether it was created. Calls `bin/provision-accounts`, the same
+    copy this tool ships beside, rather than duplicating what it already
+    does to create a service account.
+    """
+    name = library_account_name(platform)
+    if account_home(name) is not None:
+        return False
+    tool = REPO / "bin" / "provision-accounts"
+    interpreter = root_interpreter(platform)
+    done = run([interpreter, str(tool), "--shape", shape],
+               capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        raise Refused(
+            f"could not create the {name} account: provision-accounts --shape {shape} exited "
+            f"{done.returncode}: {(done.stderr or done.stdout).strip()}. Nothing was migrated.")
+    if account_home(name) is None:
+        raise Refused(
+            f"provision-accounts --shape {shape} ran but {name} still does not exist. "
+            f"Nothing was migrated.")
+    return True
+
+
+def agents_builder_root(agents_home: str, run=subprocess.run) -> str:
+    """The Builder root `agents` runs with, read by `agents` from its own
+    linked command — the same rule `bin/stand-up-backend`'s own
+    `agents_builder_root` holds: root never runs `builder-root` itself,
+    since another account could have placed it."""
+    link = f"{agents_home}/.local/bin/builder-root"
+    done = run([SUDO, "-u", AGENTS, "-H", link], capture_output=True, text=True, check=False)
+    root = (done.stdout or "").strip()
+    if done.returncode != 0 or not os.path.isabs(root) or "\n" in root:
+        raise Refused(
+            f"could not read the Builder root from {link} as {AGENTS}. The link step places "
+            f"that command, so it has to have run already. Nothing was migrated.")
+    return root
+
+
+def _install_jobs_argv(agents_home: str, root: str, platform: str) -> list[str]:
+    interpreter = root_interpreter(platform)
+    return [
+        interpreter, str(REPO / "bin" / "install-jobs"),
+        "--home", agents_home, "--root", root,
+        "--jobs", str(REPO / "jobs"),
+        "--log-dir", str(PRIVILEGED_PREFIX / "var" / "log"),
+    ]
+
+
+def _install_jobs_output(done) -> str:
+    """Both streams of an `install-jobs` run, each labelled, omitting
+    whichever is empty. `install-jobs` prints why a job failed (a start
+    that did not leave it running, a stop timeout) on stdout, while on
+    Linux systemd's own "Created symlink" lines go to stderr, so reporting
+    only one stream can drop the reason a step failed."""
+    labelled = [f"{label}: {text.strip()}" for label, text in
+                (("stdout", done.stdout or ""), ("stderr", done.stderr or "")) if text.strip()]
+    return "\n".join(labelled)
+
+
+def stop_library_units(agents_home: str, root: str, platform: str, run=subprocess.run) -> None:
+    """Stop the three Library units wherever they are currently loaded.
+
+    Idempotent: a unit that is not running is reported and counts as stopped.
+    """
+    argv = _install_jobs_argv(agents_home, root, platform) + ["--stop", *LIBRARY_UNIT_LABELS]
+    done = run(argv, capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        raise Refused(
+            f"could not stop the Library's units before moving its data: install-jobs --stop "
+            f"exited {done.returncode}: {_install_jobs_output(done)}. Nothing was migrated.")
+
+
+def start_library_units(agents_home: str, root: str, platform: str, run=subprocess.run) -> str | None:
+    """Restart the three Library units, for rollback. Never raises: a
+    rollback that cannot restart them is still reported, but the
+    `Refused` that triggered it must reach the operator, not be replaced
+    by a second one.
+
+    Always asked for all three, even when `stop_library_units` failed
+    partway and may have left one or two of them still running:
+    `install-jobs --start` is already safe to run against a unit that was
+    never stopped — it (re)activates whatever is named, which is a no-op
+    on an already-active unit on Linux and a clean restart of one on
+    macOS (see that command's own comment on `--activate`), never an
+    error for being asked to start something not actually down.
+    """
+    argv = _install_jobs_argv(agents_home, root, platform) + ["--start", *LIBRARY_UNIT_LABELS]
+    try:
+        done = run(argv, capture_output=True, text=True, check=False)
+    except OSError as exc:
+        return str(exc)
+    if done.returncode != 0:
+        return f"install-jobs --start exited {done.returncode}: {_install_jobs_output(done)}"
+    return None
+
+
+# --- the units an old install left running as agents --------------------------
+
+
+def unit_paths(label: str, platform: str, system_dir: str) -> list[Path]:
+    """Every file `label`'s unit occupies in `system_dir`: on macOS, its one
+    property list; on Linux, its `.service` and, for a label that schedules
+    a recurring run, its sibling `.timer`."""
+    if platform == "macos":
+        return [Path(system_dir) / f"{label}.plist"]
+    paths = [Path(system_dir) / f"{label}.service"]
+    if label in LIBRARY_UNITS_WITH_TIMER:
+        paths.append(Path(system_dir) / f"{label}.timer")
+    return paths
+
+
+def unit_names_agents(data: bytes, platform: str, agents_home: Path) -> bool:
+    """Whether a unit's own `.service` or `.plist` bytes still run it as
+    `agents` or out of `agents`' own deploy path, rather than the Library's
+    own account — exactly what an install from before company decision 0025
+    point 5 wrote, and exactly what the 2026-11-15 Debian 12 upgrade
+    rehearsal found still on disk after the state itself had already moved.
+    A unit a previous, successful run of this tool (or a fresh install that
+    never ran as `agents` at all) already wrote for the Library account
+    names neither and answers False.
+    """
+    deploy = str(agents_home / DEPLOY_LIBRARY_REL)
+    if platform == "macos":
+        plist = plistlib.loads(data)
+        return plist.get("UserName") == AGENTS or str(plist.get("WorkingDirectory", "")).startswith(deploy)
+    for line in data.decode("utf-8", "replace").splitlines():
+        stripped = line.strip()
+        if stripped == f"User={AGENTS}" or stripped.startswith(f"WorkingDirectory={deploy}"):
+            return True
+    return False
+
+
+def remove_agents_units(agents_home: Path, platform: str, system_dir: str,
+                         removed: dict[Path, bytes], run=subprocess.run) -> None:
+    """Take out of the supervisor every one of the Library's three units
+    that still names `agents` or its deploy path: disabled
+    (`systemctl disable --now`) or booted out (`launchctl bootout`) first,
+    then removed, the same stop-then-remove order `bin/uninstall-builder`
+    already uses for a system-scope job. A unit already naming the Library
+    account — written by a previous, successful run of this tool, or by a
+    fresh install that never ran as `agents` — is left running and in
+    place, untouched, so a rerun after success changes nothing.
+
+    `supervise`, right after this step in `stand-up-backend`'s own
+    pipeline, renders and starts the Library account's own units fresh;
+    this only has to clear whatever stale definition would otherwise make
+    it find a live unit that "differs from its declaration and from what
+    this installer last wrote there" and skip it (the defect this closes).
+
+    Every file this removes is read whole into `removed`, keyed by its own
+    path, before it is deleted, so a caller whose run fails later can write
+    each one back byte for byte without re-deriving its contents.
+    """
+    for label in LIBRARY_UNIT_LABELS:
+        paths = unit_paths(label, platform, system_dir)
+        try:
+            primary_data = paths[0].read_bytes()
+        except FileNotFoundError:
+            continue
+        if not unit_names_agents(primary_data, platform, agents_home):
+            continue
+        if platform == "macos":
+            run(["launchctl", "bootout", f"system/{label}"], capture_output=True, check=False)
+        else:
+            for path in paths:
+                run(["systemctl", "disable", "--now", path.name], capture_output=True, check=False)
+        removed[paths[0]] = primary_data
+        paths[0].unlink()
+        for path in paths[1:]:
+            try:
+                removed[path] = path.read_bytes()
+            except FileNotFoundError:
+                continue
+            path.unlink()
+    if platform == "linux" and removed and shutil.which("systemctl"):
+        run(["systemctl", "daemon-reload"], capture_output=True, check=False)
+
+
+def restore_agents_units(removed: dict[Path, bytes]) -> None:
+    """Write every unit `remove_agents_units` removed back to its original
+    path, byte for byte.
+
+    The reload and restart that follow are the same `start_library_units`
+    call `rollback` already makes for the state: `install-jobs --start`
+    reloads the supervisor and re-enables each unit itself, against
+    whichever file is on disk, so this only has to put the original bytes
+    back before that call runs.
+    """
+    for path, data in removed.items():
+        path.write_bytes(data)
+
+
+# --- the symlink-safe tree copy -------------------------------------------------
+
+
+def _open_dir(parent_fd: int, name: str, shown: str) -> int:
+    try:
+        return os.open(name, DIR_OPEN, dir_fd=parent_fd)
+    except OSError as exc:
+        raise Refused(f"refusing {shown}: {exc.strerror}. Nothing was migrated.") from exc
+
+
+def _read_hashing(fin, fout=None, chunk_size: int = 1 << 20) -> tuple[int, str]:
+    """Read all of `fin` in chunks, optionally copying each chunk to
+    `fout` as it is read, and return the total byte count and hex SHA-256
+    digest of what was read."""
+    hasher = hashlib.sha256()
+    size = 0
+    while True:
+        chunk = fin.read(chunk_size)
+        if not chunk:
+            break
+        hasher.update(chunk)
+        if fout is not None:
+            fout.write(chunk)
+        size += len(chunk)
+    return size, hasher.hexdigest()
+
+
+def copy_tree(src_fd: int, dst_fd: int, shown: str, uid: int, gid: int,
+              manifest: dict[str, tuple[int, str]] | None = None, rel: str = "") -> None:
+    """Copy every entry under `src_fd` into `dst_fd`, owned by `(uid, gid)`,
+    private (owner-only) permission bits only.
+
+    **NEVER FOLLOWS A SYMLINK, AND REFUSES ANY SPECIAL FILE.** Every entry is
+    looked at with `lstat` against the directory descriptor and then opened
+    with `O_NOFOLLOW` under its own name, so a name swapped for a symlink
+    between the two is still refused rather than followed.
+
+    When `manifest` is given, every regular file's size and hex SHA-256 —
+    computed from the bytes read off its already-open source fd, while
+    they are copied — is recorded into it under its path relative to the
+    top call's own `rel` (empty at the top). `verify_tree_copy` checks the
+    destination against this manifest rather than re-reading the source by
+    path a second time, which an owner who can keep writing to the source
+    for the whole run could otherwise fool with a same-sized swap made
+    after this already read the real bytes.
+    """
+    for name in sorted(os.listdir(src_fd)):
+        info = os.stat(name, dir_fd=src_fd, follow_symlinks=False)
+        entry_shown = f"{shown}/{name}"
+        entry_rel = f"{rel}/{name}" if rel else name
+        if stat.S_ISDIR(info.st_mode):
+            os.mkdir(name, 0o700, dir_fd=dst_fd)
+            child_dst = _open_dir(dst_fd, name, entry_shown)
+            try:
+                os.fchown(child_dst, uid, gid)
+                child_src = _open_dir(src_fd, name, entry_shown)
+                try:
+                    copy_tree(child_src, child_dst, entry_shown, uid, gid, manifest, entry_rel)
+                finally:
+                    os.close(child_src)
+            finally:
+                os.close(child_dst)
+        elif stat.S_ISREG(info.st_mode):
+            in_fd = os.open(name, FILE_OPEN, dir_fd=src_fd)
+            try:
+                out_fd = os.open(name, NEW_FILE, 0o600, dir_fd=dst_fd)
+                try:
+                    with os.fdopen(in_fd, "rb", closefd=False) as fin, \
+                            os.fdopen(out_fd, "wb", closefd=False) as fout:
+                        size, digest = _read_hashing(fin, fout)
+                    os.fchown(out_fd, uid, gid)
+                finally:
+                    os.close(out_fd)
+            finally:
+                os.close(in_fd)
+            if manifest is not None:
+                manifest[entry_rel] = (size, digest)
+        else:
+            kind = "a symlink" if stat.S_ISLNK(info.st_mode) else "neither a regular file nor a directory"
+            raise Refused(
+                f"refusing {entry_shown}: it is {kind}, which this will not follow or copy. "
+                f"Nothing was migrated.")
+
+
+def hash_tree(root: Path) -> dict[str, tuple[int, str]]:
+    """Every regular file under `root`, by relative path, to its (size,
+    hex SHA-256).
+
+    Walked by path: by the time this runs, `root` holds only what this
+    tool itself just wrote under a directory it alone owns, so nothing
+    else can race this walk the way the source tree — left under
+    `agents`' own continued control for the whole run — could.
+    """
+    listing: dict[str, tuple[int, str]] = {}
+    for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
+        for name in filenames:
+            path = Path(dirpath, name)
+            with open(path, "rb") as f:
+                size, digest = _read_hashing(f)
+            listing[str(path.relative_to(root))] = (size, digest)
+    return listing
+
+
+def verify_tree_copy(manifest: dict[str, tuple[int, str]], dst: Path) -> None:
+    """Refuse unless every file `copy_tree` recorded into `manifest` while
+    reading the source has a same-size, same-hash match under `dst`."""
+    after = hash_tree(dst)
+    if manifest != after:
+        missing = sorted(set(manifest) - set(after))
+        wrong = sorted(k for k in set(manifest) & set(after) if manifest[k] != after[k])
+        extra = sorted(set(after) - set(manifest))
+        raise Refused(
+            f"the copy at {dst} does not match what was read from its source: missing={missing[:5]} "
+            f"wrong={wrong[:5]} unexpected={extra[:5]}. Nothing was migrated.")
+
+
+# --- row counts, the same check bin/builder-backup's own copy_database makes --
+
+
+def ordinary_tables(conn: sqlite3.Connection) -> list[str]:
+    return [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' "
+        "AND sql NOT LIKE 'CREATE VIRTUAL TABLE%' ORDER BY name")]
+
+
+def quoted(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def count_rows(conn: sqlite3.Connection, tables: list[str]) -> dict[str, int]:
+    return {t: conn.execute(f"SELECT count(*) FROM {quoted(t)}").fetchone()[0] for t in tables}
+
+
+def db_row_counts(path: Path, *, deadline_seconds: float = ROW_COUNT_DEADLINE_SECONDS,
+                   progress_steps: int = ROW_COUNT_PROGRESS_STEPS) -> dict[str, int] | None:
+    """Every ordinary table's row count in the database at `path`, or None
+    when there is no database there to count.
+
+    Bounded by `deadline_seconds`, checked by SQLite's own progress
+    handler every `progress_steps` VM instructions — not just the
+    lock-wait `timeout=` on the connection already bounds — so a
+    `COUNT(*)` against a table its owner made enormous cannot run for as
+    long as that owner likes. Past the deadline, SQLite aborts the
+    running statement with `sqlite3.OperationalError`, which this lets
+    propagate rather than swallow: counting rows is only ever one leg of
+    a verification, and any failure here has to read as one too.
+    """
+    if not path.is_file():
+        return None
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, isolation_level=None, timeout=30)
+    try:
+        start = time.monotonic()
+        conn.set_progress_handler(
+            lambda: 1 if time.monotonic() - start > deadline_seconds else 0, progress_steps)
+        tables = ordinary_tables(conn)
+        return count_rows(conn, tables)
+    finally:
+        conn.close()
+
+
+def verify_row_counts(src: Path, dst: Path, name: str,
+                       agents_ids: tuple[int, int], library_ids: tuple[int, int]) -> None:
+    """Refuse unless `name`'s table row counts match between `src` and
+    `dst`.
+
+    Each side is counted in a child dropped to its own file's owner —
+    `agents_ids` for `src`, `library_ids` for the already-copied, already
+    Library-owned `dst` — so root itself never opens a SQLite file either
+    account built with the native engine, parsing attacker-shaped bytes
+    as root. `run_as_account`'s own deadline-bounded child already turns
+    a timeout or any other failure there into a `Refused`; this just adds
+    the row-count name to it.
+    """
+    try:
+        before = run_as_account(*agents_ids, lambda: db_row_counts(src / name))
+        after = run_as_account(*library_ids, lambda: db_row_counts(dst / name))
+    except Refused as exc:
+        raise Refused(f"counting {name}'s rows failed: {exc} Nothing was migrated.") from exc
+    if before != after:
+        raise Refused(
+            f"{name}'s row counts differ after the move: {before} before, {after} after. "
+            f"Nothing was migrated.")
+
+
+# --- credential files ------------------------------------------------------------
+
+
+def copy_credentials(src_dir: Path, dst_dir: Path, uid: int, gid: int, agents_uid: int,
+                      copied: list[str]) -> None:
+    """Copy every Library-minted credential file directly under `src_dir`
+    into `dst_dir`, owned by `(uid, gid)`, appending each name to `copied`
+    as it succeeds.
+
+    `copied` is the caller's own list, mutated in place rather than built
+    locally and returned only at the end — so a caller whose run fails
+    partway through this loop still holds, in that same list, every name
+    this already wrote, and can roll each one back. Returning a fresh list
+    only on a clean return left a raise partway through with nothing to
+    clean up, which rollback silently treated as "nothing was written."
+
+    Refuses a symlink, a special file, or a destination that already holds
+    the name — the last being exactly the ambiguous state a previous,
+    not-fully-finished migration would leave.
+    """
+    if not src_dir.is_dir():
+        return
+    src_fd = os.open(str(src_dir), DIR_OPEN)
+    try:
+        if os.fstat(src_fd).st_uid != agents_uid:
+            raise Refused(f"refusing {src_dir}: it is not owned by {AGENTS}. Nothing was migrated.")
+        dst_dir.mkdir(mode=0o700, exist_ok=True)
+        dst_fd = os.open(str(dst_dir), DIR_OPEN)
+        try:
+            os.fchown(dst_fd, uid, gid)
+            for name in sorted(os.listdir(src_fd)):
+                if not is_known_credential(name):
+                    continue
+                info = os.stat(name, dir_fd=src_fd, follow_symlinks=False)
+                if not stat.S_ISREG(info.st_mode):
+                    raise Refused(
+                        f"refusing {src_dir}/{name}: it is not a plain regular file. "
+                        f"Nothing was migrated.")
+                in_fd = os.open(name, FILE_OPEN, dir_fd=src_fd)
+                try:
+                    try:
+                        out_fd = os.open(name, NEW_FILE, 0o600, dir_fd=dst_fd)
+                    except FileExistsError as exc:
+                        raise Refused(
+                            f"refusing {dst_dir}/{name}: it already exists there. This looks "
+                            f"like a previous migration that did not finish cleanly. Resolve "
+                            f"by hand. Nothing was migrated.") from exc
+                    try:
+                        with os.fdopen(in_fd, "rb", closefd=False) as fin, \
+                                os.fdopen(out_fd, "wb", closefd=False) as fout:
+                            shutil.copyfileobj(fin, fout)
+                        os.fchown(out_fd, uid, gid)
+                    finally:
+                        os.close(out_fd)
+                finally:
+                    os.close(in_fd)
+                copied.append(name)
+        finally:
+            os.close(dst_fd)
+    finally:
+        os.close(src_fd)
+
+
+def move_sibling_log(agents_home: Path, library_home: Path, agents_uid: int,
+                      library_ids: tuple[int, int]) -> bool:
+    """Copy `{agents_home}/.local/state/library.log` to the same place under
+    the Library account, if it is there at all. Returns whether it copied.
+
+    Called only after the Library's state has already been promoted into
+    place: this is best-effort cleanup, not a condition of the migration's
+    correctness, so a failure here is reported by the caller rather than
+    rolled back — which is also why its own refusals below never say
+    "Nothing was migrated," unlike the rest of this file's: by the time
+    this runs, something always was.
+
+    Opens `src` with `O_NOFOLLOW` first and checks the resulting fd with
+    `fstat`, matching every other copy in this file, rather than checking
+    the path with `lstat` and then opening it a second time by name —
+    `O_NOFOLLOW` alone already fails a symlink-swap in that window safely,
+    but the check-then-open order was the one thing here that did not
+    match the rest of the module's own pattern.
+    """
+    src = agents_home / STATE_REL / LIBRARY_LOG_NAME
+    try:
+        in_fd = os.open(str(src), FILE_OPEN)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise Refused(f"refusing {src}: {exc.strerror}.") from exc
+    try:
+        info = os.fstat(in_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != agents_uid:
+            raise Refused(f"refusing {src}: it is not a plain file owned by {AGENTS}.")
+        dst_dir = library_home / STATE_REL
+        mkdir_owned(dst_dir, *library_ids)
+        dst = dst_dir / LIBRARY_LOG_NAME
+        if os.path.lexists(dst):
+            raise Refused(f"refusing {dst}: it already exists there.")
+        out_fd = os.open(str(dst), NEW_FILE, 0o600)
+        try:
+            with os.fdopen(in_fd, "rb", closefd=False) as fin, \
+                    os.fdopen(out_fd, "wb", closefd=False) as fout:
+                shutil.copyfileobj(fin, fout)
+            os.fchown(out_fd, *library_ids)
+        finally:
+            os.close(out_fd)
+    finally:
+        os.close(in_fd)
+    return True
+
+
+# --- the migration itself -------------------------------------------------------
+
+
+def migrate(agents_home: Path, shape: str, platform: str, *, run=subprocess.run,
+            report=print, system_dir: str | None = None) -> None:
+    """Move the Library's state and credentials from `agents` to its own
+    account. Raises `Refused` on any failure, after rolling back whatever
+    this run had already written under the Library account's own home,
+    restoring any unit this run removed, and restarting any unit this run
+    stopped. Nothing under `agents` is ever touched until the destination
+    is verified complete.
+
+    `system_dir` overrides where a system-scope unit lives, in place of
+    `/Library/LaunchDaemons` or `/etc/systemd/system` — a testability
+    override only, the same one `install-jobs` and `uninstall-builder`
+    already take, so a test never points this at a real machine's own
+    supervisor directory.
+    """
+    library_name = library_account_name(platform)
+    actual_system_dir = system_dir or (LAUNCHD_SYSTEM_DIR if platform == "macos" else SYSTEMD_SYSTEM_DIR)
+    created_account = False
+    root: str | None = None
+    stopped = False
+    staging: Path | None = None
+    copied_credentials: list[str] = []
+    dst_oc: Path | None = None
+    removed_units: dict[Path, bytes] = {}
+
+    def rollback(reason: Exception) -> None:
+        if staging is not None and staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        if dst_oc is not None:
+            for name in copied_credentials:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(dst_oc / name)
+        if removed_units:
+            restore_agents_units(removed_units)
+        if stopped:
+            restart_problem = start_library_units(str(agents_home), root or "", platform, run=run)
+            if restart_problem:
+                raise Refused(
+                    f"{reason} Rolling back, but the Library's units could not be restarted "
+                    f"either: {restart_problem}. Start them by hand.") from reason
+
+    try:
+        created_account = ensure_library_account(shape, platform, run=run)
+        library_home_str = account_home(library_name)
+        if library_home_str is None:
+            raise Refused(f"{library_name} still does not exist. Nothing was migrated.")
+        library_home = Path(library_home_str)
+
+        library_ids = account_ids(library_name)
+        agents_ids = account_ids(AGENTS)
+        assert library_ids is not None and agents_ids is not None  # just resolved by name above
+
+        if not owned_by(str(agents_home), agents_ids[0]):
+            raise Refused(
+                f"refusing — {agents_home} (home of {AGENTS}) is not owned by its own "
+                f"account. Nothing was migrated.")
+        if not owned_by(str(library_home), library_ids[0]):
+            raise Refused(
+                f"refusing — {library_home} (home of {library_name}) is not owned by its "
+                f"own account. Nothing was migrated.")
+
+        root = agents_builder_root(str(agents_home), run=run)
+        # Set before the call, not after it returns: `install-jobs --stop`
+        # attempts each of the three units independently and can fail
+        # having stopped only some of them, and rollback has to try to
+        # restart all three either way rather than skip the restart
+        # entirely because the call that may have partly succeeded raised.
+        stopped = True
+        stop_library_units(str(agents_home), root, platform, run=run)
+
+        remove_agents_units(agents_home, platform, actual_system_dir, removed_units, run=run)
+
+        src_state = agents_library_state(agents_home)
+        dst_state_parent = library_home / STATE_REL
+        dst_state = dst_state_parent / LIBRARY_STATE_NAME
+        if os.path.lexists(dst_state):
+            raise Refused(
+                f"{dst_state} already exists, and {src_state} is still there too. This "
+                f"looks like a previous migration that did not finish cleanly. Resolve by "
+                f"hand. Nothing was migrated.")
+
+        dst_oc = library_home / ORIENT_CONTROL
+        copy_credentials(
+            agents_home / ORIENT_CONTROL, dst_oc, *library_ids, agents_ids[0], copied_credentials)
+
+        mkdir_owned(dst_state_parent, *library_ids)
+        staging = dst_state_parent / f".{LIBRARY_STATE_NAME}.migrating-{os.getpid()}"
+        manifest: dict[str, tuple[int, str]] = {}
+        src_fd = os.open(str(src_state), DIR_OPEN)
+        try:
+            if os.fstat(src_fd).st_uid != agents_ids[0]:
+                raise Refused(f"refusing {src_state}: it is not owned by {AGENTS}. Nothing was migrated.")
+            os.mkdir(staging, 0o700)
+            dst_fd = os.open(str(staging), DIR_OPEN)
+            try:
+                os.fchown(dst_fd, *library_ids)
+                copy_tree(src_fd, dst_fd, str(src_state), *library_ids, manifest)
+            finally:
+                os.close(dst_fd)
+        finally:
+            os.close(src_fd)
+
+        verify_tree_copy(manifest, staging)
+        verify_row_counts(src_state, staging, "library.db", agents_ids, library_ids)
+        verify_row_counts(src_state, staging, "cold.db", agents_ids, library_ids)
+
+        os.rename(staging, dst_state)
+        staging = None  # promoted: no longer a rollback candidate under that name
+    except Exception as exc:
+        rollback(exc)
+        if isinstance(exc, Refused):
+            raise
+        raise Refused(f"refusing — {exc}. Nothing was migrated.") from exc
+
+    # Past this point the new copy is verified and in place: removing what is
+    # left under `agents` is cleanup, not a condition of correctness, so a
+    # failure here is reported rather than unwound.
+    report(f"{PROG}: moved the Library's state to {dst_state}")
+    if created_account:
+        report(f"{PROG}: created the {library_name} account")
+
+    # Best-effort, run only after the state is already promoted: a failure
+    # here is reported, never rolled back, and never claims "Nothing was
+    # migrated" — the real data already moved by this point.
+    moved_log = False
+    try:
+        moved_log = move_sibling_log(agents_home, library_home, agents_ids[0], library_ids)
+    except Exception as exc:
+        report(f"{PROG}: migrated, but could not move the sibling log to "
+               f"{library_home / STATE_REL / LIBRARY_LOG_NAME}: {exc} "
+               f"Move {agents_home / STATE_REL / LIBRARY_LOG_NAME} there by hand.")
+
+    try:
+        shutil.rmtree(src_state)
+        src_log = agents_home / STATE_REL / LIBRARY_LOG_NAME
+        if moved_log and os.path.lexists(src_log):
+            os.remove(src_log)
+        for name in copied_credentials:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(agents_home / ORIENT_CONTROL / name)
+        deploy = agents_home / DEPLOY_LIBRARY_REL
+        if os.path.lexists(deploy) and not os.path.islink(deploy):
+            shutil.rmtree(deploy, ignore_errors=True)
+    except OSError as exc:
+        report(f"{PROG}: migrated, but could not clean up {AGENTS}'s old copy: {exc}. "
+               f"Remove it by hand: {agents_library_state(agents_home)}")
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Move an existing install's Library to its own service account.",
+    )
+    parser.add_argument("--shape", required=True, choices=("two", "three"))
+    parser.add_argument("--system-dir", help="where a system-scope job's unit lives, "
+                        "instead of /Library/LaunchDaemons or /etc/systemd/system")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="say what would happen, change nothing")
+    mode.add_argument("--check", action="store_true", help="report only; 1 if migration is pending")
+    mode.add_argument("--status", action="store_true", help="the same report, changing nothing")
+    args = parser.parse_args(argv)
+
+    if os.geteuid() != 0:
+        print(f"{PROG}: refusing — this needs root, to stop the Library's units and move "
+              f"both accounts' files. Nothing was migrated.", file=sys.stderr)
+        return 2
+
+    platform = "macos" if sys.platform == "darwin" else "linux"
+    agents_home_str = account_home(AGENTS)
+    if agents_home_str is None:
+        print(f"{PROG}: no {AGENTS} account on this machine — nothing to migrate.")
+        return 0
+    agents_home = Path(agents_home_str)
+
+    pending = needs_migration(agents_home)
+
+    if args.check or args.status:
+        if pending:
+            print(f"{PROG}: the Library's state is still under {AGENTS} — migration is pending")
+        else:
+            print(f"{PROG}: nothing pending — the Library is not running as {AGENTS}")
+        return 1 if (args.check and pending) else 0
+
+    if args.dry_run:
+        if pending:
+            print(f"{PROG}: would stop {', '.join(LIBRARY_UNIT_LABELS)}, move "
+                  f"{agents_library_state(agents_home)} and its credentials to the "
+                  f"{library_account_name(platform)} account, remove any of their unit "
+                  f"definitions still naming {AGENTS}, and remove the originals")
+        else:
+            print(f"{PROG}: nothing to do — the Library is not running as {AGENTS}")
+        return 0
+
+    if not pending:
+        print(f"{PROG}: nothing to migrate — the Library is not running as {AGENTS}")
+        return 0
+
+    try:
+        migrate(agents_home, args.shape, platform, system_dir=args.system_dir)
+    except Refused as exc:
+        print(f"{PROG}: refusing — {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

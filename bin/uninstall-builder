@@ -207,11 +207,13 @@ what was found, and leave the decision to the operator.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import importlib.machinery
 import importlib.util
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -230,11 +232,85 @@ PROG = "uninstall-builder"
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "tools"))
 
-from jobs import declaration, placeholders, render_launchd, render_systemd  # noqa: E402
-
 
 class Refused(Exception):
     """Something the operator has to decide about. Never a stack trace."""
+
+
+# `tools/jobs/declaration.py` NEEDS 3.11'S `tomllib`, imported the moment
+# this loads itself and every sibling installer below (see `_load`, just
+# past the reexec this guards). `payload/bin/builder-update`'s own
+# `reexec_argv`/`ROOT_INTERPRETERS` run this same check for the same
+# reason, before its own step 8 imports `tools/jobs/declaration`: on a Mac,
+# `python3` is Apple's 3.9.6 even for the operator, and Homebrew installs
+# only `python3.11`, never a bare `python3` pointing at it. Measured: `sudo
+# python3 bin/uninstall-builder --dry-run` on a macOS 26 three-account
+# install crashed at import with `ModuleNotFoundError: No module named
+# 'tomllib'`, and `payload/docs/after-installing.md`'s own documented
+# `python3 ~/src/shipwright/bin/uninstall-builder` crashes the same way.
+REEXEC_MARKER = "BUILDER_UNINSTALL_REEXECED"
+ROOT_INTERPRETERS = {"darwin": "/opt/homebrew/bin/python3.11", "linux": "/usr/bin/python3"}
+
+
+def reexec_interpreter() -> str:
+    """The interpreter `reexec_argv` runs this again under: the same ones
+    `payload/bin/builder-update`'s own `root_interpreter()` pins, so a
+    reader never has two answers for "what does this reexec into" on the
+    same machine. Overridable the way that function's own
+    `BUILDER_UPDATE_ROOT_INTERPRETER` is, for a test with no such
+    interpreter to find."""
+    key = "darwin" if sys.platform == "darwin" else "linux"
+    return os.environ.get("BUILDER_UNINSTALL_ROOT_INTERPRETER") or ROOT_INTERPRETERS[key]
+
+
+def reexec_argv(version: tuple[int, ...], argv: list[str], env: dict[str, str],
+                script: str) -> list[str] | None:
+    """The argv to run this again under, or `None` when this interpreter
+    will do. Mirrors `payload/bin/builder-update`'s own `reexec_argv`,
+    called here before the import that needs 3.11 rather than before that
+    file's own step 8.
+
+    `REEXEC_MARKER` stops a second try when the interpreter this reexecs
+    into is older too, or missing, the same way that file's own marker
+    does. `-I` on the reexeced command keeps it isolated from the caller's
+    own `PYTHONPATH` and site packages, the same way every other reexec
+    into a pinned interpreter in this codebase does (`bin/stand-up-backend`,
+    `bin/install-privileged`, and `builder-update` itself for every root
+    tool it reexecs).
+    """
+    if version >= (3, 11):
+        return None
+    target = reexec_interpreter()
+    if env.get(REEXEC_MARKER):
+        raise Refused(
+            f"this needs Python 3.11 or later, and {target} is older or missing. Install "
+            f"Python 3.11 or later and run this as `python3.11 {script} ...`. Nothing "
+            f"was removed."
+        )
+    if not os.access(target, os.X_OK):
+        raise Refused(
+            f"this needs Python 3.11 or later for tomllib, and this is "
+            f"{version[0]}.{version[1]}, with no Python 3.11 or later at {target} either. "
+            f"Install Python 3.11 or later (on a Mac: `brew install python@3.11`) and run "
+            f"this as `python3.11 {script} ...`. Nothing was removed."
+        )
+    return [target, "-I", script, *argv]
+
+
+if __name__ == "__main__":
+    try:
+        _reexec_again = reexec_argv(tuple(sys.version_info), sys.argv[1:], dict(os.environ),
+                                    os.path.abspath(__file__))
+    except Refused as exc:
+        print(f"{PROG}: refusing — {exc}", file=sys.stderr)
+        sys.exit(2)
+    if _reexec_again is not None:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.execve(_reexec_again[0], _reexec_again, {**os.environ, REEXEC_MARKER: "1"})
+
+
+from jobs import declaration, placeholders, render_launchd, render_systemd  # noqa: E402
 
 
 def _load(name: str, path: Path):
@@ -279,6 +355,18 @@ pa = _load("builder_uninstall_provision_accounts", REPO / "bin" / "provision-acc
 
 AGENTS = su.AGENTS
 REVIEWERS = next(name for name in pa.SERVICE_ACCOUNTS if name != AGENTS)
+# jobs/library.toml, jobs/library-cold-tier.toml and
+# jobs/library-cert-expiry-check.toml's own `account` field. The literal value
+# is the same on both platforms — only `account-macos` differs, and that is a
+# launchd-rendering detail this command never needs (see
+# `tools/jobs/FORMAT.md`, "account-macos").
+LIBRARY_JOB_ACCOUNT = "library"
+# jobs/orient.toml, jobs/orient-dashboard.toml and jobs/orient-backup.toml's
+# own `account` field, for the same reason `LIBRARY_JOB_ACCOUNT` is literal
+# rather than read off `provision-accounts`' own `orient_account_name`, which
+# answers the platform-specific name (`_orient` on macOS, `orient` on Linux)
+# a job declaration never names.
+ORIENT_JOB_ACCOUNT = "orient"
 # Which entities the install's record names, and the account pair each gets:
 # `pa`'s own `account_entities`, loaded by `provision-accounts` as its
 # sibling, so this never re-derives the rule from somewhere else.
@@ -438,9 +526,15 @@ def raw_jobs(jobs_dir: Path, platform: str) -> list[declaration.Job]:
     a removal target from: a field's *template*, not its resolved text, is
     what says whether `{root}` — the one placeholder read from the
     agent-writable `~/.config/convivy/session-agent.env` — fed it.
+
+    `ij.drop_account_only` runs before `ij.as_invoker`, the same order
+    `install-jobs --single-account` itself uses: a job declaring
+    `account-only` (jobs/library-backup.toml) was never installed under the
+    single-account shape at all, so there is nothing here for this
+    single-account mirror to remove for it either.
     """
     declared = ij.load_jobs(jobs_dir, platform)
-    return ij.as_invoker(declared)
+    return ij.as_invoker(ij.drop_account_only(declared))
 
 
 def resolved_jobs(jobs_dir: Path, platform: str, home: str, root: str,
@@ -518,7 +612,7 @@ def loaded_systemd_fragment(unit: str, run=subprocess.run) -> str | None:
 
 
 def stop_job(job: declaration.Job, platform: str, home: str,
-             left: list[tuple[str, str]], run=subprocess.run) -> bool:
+             left: list[tuple[str, str]], run=subprocess.run) -> tuple[bool, list[str]]:
     """Ask the supervisor to stop this job, but only once it is confirmed
     that what the supervisor has loaded for it IS the file this run is about
     to remove.
@@ -541,30 +635,32 @@ def stop_job(job: declaration.Job, platform: str, home: str,
     actually matters there.
 
     Returns whether a stop was actually issued (`launchctl bootout` or
-    `systemctl --user disable --now`). **A CALLER MUST READ THIS BEFORE
-    ACTING ON THE SUPERVISOR AGAIN** — `remove_jobs`'s `systemctl --user
-    daemon-reload` is scoped to this, not to whether the job merely resolved
-    to a unit path, since a mismatch or an absent load means nothing here was
-    touched for this run to reload.
+    `systemctl --user disable --now`), and, on Linux, the unit name(s) it
+    actually disabled. **A CALLER MUST READ THIS BEFORE ACTING ON THE
+    SUPERVISOR AGAIN** — `remove_jobs`'s `systemctl --user daemon-reload`
+    and `reset-failed` are scoped to this, not to whether the job merely
+    resolved to a unit path, since a mismatch or an absent load means
+    nothing here was touched for this run to reload or clear.
     """
     if platform == "macos":
         if not shutil.which("launchctl"):
-            return False
+            return False, []
         unit_paths = job_unit_paths(job, platform, home)
         loaded = loaded_launchd_path(job.label, run)
         if loaded is None:
-            return False
+            return False, []
         expected = unit_paths[0] if unit_paths else None
         if expected is None or os.path.realpath(loaded) != os.path.realpath(expected):
             left.append((job.label, f"launchd has {loaded} loaded for this label, not the "
                                     f"file this uninstall is removing; left running"))
-            return False
+            return False, []
         target = f"gui/{os.getuid()}/{job.label}"
         run(["launchctl", "bootout", target], capture_output=True, check=False)
-        return True
+        return True, []
     if not shutil.which("systemctl"):
-        return False
+        return False, []
     stopped = False
+    stopped_units: list[str] = []
     for path in job_unit_paths(job, platform, home):
         unit = Path(path).name
         fragment = loaded_systemd_fragment(unit, run)
@@ -577,13 +673,38 @@ def stop_job(job: declaration.Job, platform: str, home: str,
         run(["systemctl", "--user", "disable", "--now", unit],
             capture_output=True, check=False)
         stopped = True
-    return stopped
+        stopped_units.append(unit)
+    return stopped, stopped_units
+
+
+def reload_systemd(stopped_units: list[str], user: bool, run=subprocess.run) -> None:
+    """Reload systemd and clear `reset-failed` for every unit this run
+    actually stopped — never for one merely removed from disk, since a unit
+    nothing was loaded for, or one `stop_job`/`stop_system_job` left running
+    on a mismatch, was never told to reset. Without this, a unit systemd
+    once marked failed stays listed `failed failed` by `systemctl
+    list-units --all` after its file is gone (measured on a Debian
+    uninstall rehearsal): `daemon-reload` drops the unit's definition but
+    not its remembered exit state, and the state only clears on
+    `reset-failed` or a reboot. Scoped to `--user` for a per-account unit,
+    the system manager otherwise, matching `stop_job`/`stop_system_job`'s
+    own scope. Tolerates a unit `reset-failed` was never told about, or one
+    not currently marked failed, the same way every other `run(...,
+    check=False)` call in this file does.
+    """
+    if not shutil.which("systemctl"):
+        return
+    scope = ["systemctl", "--user"] if user else ["systemctl"]
+    run([*scope, "daemon-reload"], capture_output=True, check=False)
+    for unit in stopped_units:
+        run([*scope, "reset-failed", unit], capture_output=True, check=False)
 
 
 def remove_jobs(jobs: list[declaration.Job], platform: str, home: str, machine_state: str,
                  dry_run: bool, left: list[tuple[str, str]], removed: list[str],
                  run=subprocess.run) -> None:
     reloaded_linux = False
+    stopped_units: list[str] = []
     for job in jobs:
         unit_paths = job_unit_paths(job, platform, home)
         log_paths = sorted({p for p in (job.stdout, job.stderr) if p})
@@ -595,7 +716,7 @@ def remove_jobs(jobs: list[declaration.Job], platform: str, home: str, machine_s
                 if os.path.lexists(path):
                     print(f"  would remove log: {path}")
             continue
-        stopped = stop_job(job, platform, home, left, run)
+        stopped, units = stop_job(job, platform, home, left, run)
         for path in unit_paths:
             if remove_path(Path(path), left):
                 removed.append(path)
@@ -604,8 +725,9 @@ def remove_jobs(jobs: list[declaration.Job], platform: str, home: str, machine_s
                 removed.append(path)
         if platform == "linux" and stopped:
             reloaded_linux = True
-    if reloaded_linux and shutil.which("systemctl"):
-        run(["systemctl", "--user", "daemon-reload"], capture_output=True, check=False)
+            stopped_units.extend(units)
+    if reloaded_linux:
+        reload_systemd(stopped_units, user=True, run=run)
     record_dir = ij.record_path(
         placeholders.Machine.for_home(home, root="", python=sys.executable, state=machine_state)
     ).parent
@@ -730,7 +852,7 @@ def loaded_systemd_system_fragment(unit: str, run=subprocess.run) -> str | None:
 
 
 def stop_system_job(job: declaration.Job, platform: str, system_dir: str | None,
-                     left: list[tuple[str, str]], run=subprocess.run) -> bool:
+                     left: list[tuple[str, str]], run=subprocess.run) -> tuple[bool, list[str]]:
     """`stop_job`'s own rule, asked of the domain these jobs actually load
     into. **NEVER THE AGENTS ACCOUNT'S OWN GUI OR `--user` DOMAIN.** A
     system-scope job that names an account is installed as a LaunchDaemon or
@@ -745,26 +867,29 @@ def stop_system_job(job: declaration.Job, platform: str, system_dir: str | None,
     running and named, with the path that IS loaded; a label or unit nothing
     is loaded for, or a supervisor not on PATH, is left alone without comment.
 
-    Returns whether a stop was actually issued, for the same reason
-    `stop_job`'s own return does: a caller's systemd reload is scoped to this.
+    Returns whether a stop was actually issued, and, on Linux, the unit
+    name(s) it actually disabled, for the same reason `stop_job`'s own
+    return does: a caller's systemd reload and `reset-failed` are scoped
+    to this.
     """
     if platform == "macos":
         if not shutil.which("launchctl"):
-            return False
+            return False, []
         unit_paths = system_job_unit_paths(job, platform, system_dir)
         loaded = loaded_launchd_system_path(job.label, run)
         if loaded is None:
-            return False
+            return False, []
         expected = unit_paths[0] if unit_paths else None
         if expected is None or os.path.realpath(loaded) != os.path.realpath(expected):
             left.append((job.label, f"launchd has {loaded} loaded for this label, not the "
                                     f"file this uninstall is removing; left running"))
-            return False
+            return False, []
         run(["launchctl", "bootout", f"system/{job.label}"], capture_output=True, check=False)
-        return True
+        return True, []
     if not shutil.which("systemctl"):
-        return False
+        return False, []
     stopped = False
+    stopped_units: list[str] = []
     for path in system_job_unit_paths(job, platform, system_dir):
         unit = Path(path).name
         fragment = loaded_systemd_system_fragment(unit, run)
@@ -776,21 +901,232 @@ def stop_system_job(job: declaration.Job, platform: str, system_dir: str | None,
             continue
         run(["systemctl", "disable", "--now", unit], capture_output=True, check=False)
         stopped = True
-    return stopped
+        stopped_units.append(unit)
+    return stopped, stopped_units
 
 
-def remove_system_jobs(jobs: list[declaration.Job], platform: str, system_dir: str | None,
-                        log_dir: str, agents_home: str, state: str, dry_run: bool,
-                        left: list[tuple[str, str]], removed: list[str],
-                        run=subprocess.run) -> None:
-    """`remove_jobs`'s own shape, over the system domain and the root-owned
-    `log_dir` the three-account shape actually uses. The `install-jobs`
-    record this removes lives under `state` — the caller's own, never
-    `agents_home`'s default — since a job naming an account resolves
-    `{state}` against whatever `--state` the operator gave `install-jobs`,
-    the same reason `remove_jobs`'s own `record_dir` takes `machine_state`
-    rather than deriving it from `home` alone."""
+def library_system_jobs(jobs_dir: Path, platform: str) -> list[declaration.Job]:
+    """Every declared job the Library's own account runs: kept at system
+    scope, naming the Library's account, the same filter `agents_system_jobs`
+    applies for `agents`. Kept as templates, unresolved, for the same reason."""
+    declared = ij.load_jobs(jobs_dir, platform)
+    return [job for job in declared if job.scope == "system" and job.account == LIBRARY_JOB_ACCOUNT]
+
+
+def resolved_library_jobs(jobs_dir: Path, platform: str, library_home: str, root: str,
+                           log_dir: str, deploy: str, state: str, bin_dir: str) -> list[declaration.Job]:
+    """Every Library-account job, resolved against the Library's own home —
+    never `agents_home` — the same way `resolved_agents_jobs` resolves the
+    agents account's own jobs against that account's home. `deploy`, `state`
+    and `bin_dir` are this account's own defaults: nothing today lets an
+    operator override where the Library's own deploy area or state lives,
+    the way `--deploy`/`--state`/`--bin` do for the agents account.
+
+    A job that names `own-root` has `{root}` replaced for it alone, exactly as
+    `install-jobs`'s `resolve` does, so this models the paths the installed job
+    really uses rather than ones read from the agents account's `CREWS_ROOT`.
+    `state_plan` would exclude a `{root}`-templated field either way, since it
+    gates on the template, and `pa.remove` takes the Library's whole home; this
+    keeps the two resolvers in agreement so neither of those has to cover it."""
+    declared = library_system_jobs(jobs_dir, platform)
+    machine = placeholders.Machine.for_home(
+        library_home, root=root, python=sys.executable, deploy=deploy, state=state, bin=bin_dir,
+    )
+    programs = {name: "" for job in declared for name in job.programs}
+    out = []
+    for job in declared:
+        try:
+            target = machine
+            own_root = placeholders.own_root_value(job, machine, programs)
+            if own_root is not None:
+                target = dataclasses.replace(machine, root=own_root)
+            done = placeholders.resolve(job, target, programs)
+        except placeholders.PlaceholderError as exc:
+            raise Refused(f"{exc} Nothing was removed.") from exc
+        if done.stdout or done.stderr:
+            done = ij.account_log_paths(done, log_dir)
+        out.append(done)
+    return out
+
+
+def library_removal_plan(account_system: pa.System, platform: str, jobs_dir: Path,
+                          root: str, log_dir: str):
+    """The Library's own job declarations, resolved against the Library's
+    own account home, that account's home and state, and that account's
+    own `AccountIds`.
+
+    Returns `([], [], None, None, None)` when the Library's own account does
+    not exist on this machine — an install from before company decision
+    0025 point 5 gave the Library its own account, which the upgrade path
+    (not this slice) is what moves. Nothing here is removed twice:
+    `pa.remove`, at the foot of each shape's own `main`, already removes
+    this account's home wholesale through the ordinary
+    `accounts_for(shape, platform, entities)` it always walks; this only
+    finds what to stop and empty first, the state this account's own jobs
+    name, so that removal does not need `--purge-homes` for data this run
+    already decided to take.
+
+    **REFUSES BEFORE ANY OF THAT, WHEN THE HOME IS NOT THE ACCOUNT'S OWN.**
+    The caller deletes under `library_home` in a child dropped to the ids
+    this returns, never as root directly (the Library's home is mode 700,
+    unreadable to `agents`, which is why that drop is this account's own
+    rather than a reuse of `agents_home_steps`'s), so nothing else here
+    stands between a stale or misconfigured directory-service entry and a
+    real `rmtree` running as that account. `pa.remove`'s own `foreign`
+    check (`bin/provision-accounts`) exists for exactly this and runs this
+    same test, but only once it walks this account at the foot of
+    `main_two_account`/`main_three_account` — by then this function's
+    caller has already stopped and emptied what it found under that home.
+    The check is repeated here, first, in `pa.remove`'s own words, so this
+    plan is never even built against a home the account does not own.
+    """
+    library_name = pa.library_account_name(platform)
+    library_account = account_system.account(library_name)
+    if library_account is None:
+        return [], [], None, None, None
+    library_home = library_account.home
+    library_ids = AccountIds(pw_name=library_account.name, pw_uid=library_account.uid,
+                             pw_gid=library_account.gid)
+    home_owner = account_system.home_stat(library_home)
+    if home_owner is not None and home_owner.st_uid != library_account.uid:
+        raise Refused(
+            f"{library_home} (home of {library_name}, owned by uid {home_owner.st_uid}) "
+            f"is not owned by its account, so something else made it and this command "
+            f"does not delete it. Point the account at its own home, or remove it by "
+            f"hand. Nothing was removed."
+        )
+    library_state = f"{library_home}/.local/state"
+    if declarations_present(jobs_dir):
+        library_jobs = resolved_library_jobs(
+            jobs_dir, platform, library_home, root, log_dir,
+            f"{library_home}/.local/deploy", library_state, f"{library_home}/.local/bin",
+        )
+        library_templates = library_system_jobs(jobs_dir, platform)
+    else:
+        library_jobs, library_templates = [], []
+    return library_jobs, library_templates, library_home, library_state, library_ids
+
+
+def orient_system_jobs(jobs_dir: Path, platform: str) -> list[declaration.Job]:
+    """Every declared job Orient's own account runs: kept at system scope,
+    naming Orient's account, the same filter `library_system_jobs` applies
+    for the Library. Kept as templates, unresolved, for the same reason."""
+    declared = ij.load_jobs(jobs_dir, platform)
+    return [job for job in declared if job.scope == "system" and job.account == ORIENT_JOB_ACCOUNT]
+
+
+def resolved_orient_jobs(jobs_dir: Path, platform: str, orient_home: str, root: str,
+                         log_dir: str, deploy: str, state: str, bin_dir: str) -> list[declaration.Job]:
+    """Every Orient-account job, resolved against Orient's own home — never
+    `agents_home` — the same way `resolved_library_jobs` resolves the
+    Library's own jobs against that account's home. No declaration here
+    names `own-root`: `jobs/orient.toml`, `jobs/orient-dashboard.toml` and
+    `jobs/orient-backup.toml` use only `{home}`, `{deploy}`, `{state}` and
+    `{bin}`, so this never needs `resolved_library_jobs`'s own `own_root`
+    substitution."""
+    declared = orient_system_jobs(jobs_dir, platform)
+    machine = placeholders.Machine.for_home(
+        orient_home, root=root, python=sys.executable, deploy=deploy, state=state, bin=bin_dir,
+    )
+    programs = {name: "" for job in declared for name in job.programs}
+    out = []
+    for job in declared:
+        try:
+            done = placeholders.resolve(job, machine, programs)
+        except placeholders.PlaceholderError as exc:
+            raise Refused(f"{exc} Nothing was removed.") from exc
+        if done.stdout or done.stderr:
+            done = ij.account_log_paths(done, log_dir)
+        out.append(done)
+    return out
+
+
+def orient_removal_plan(account_system: pa.System, platform: str, jobs_dir: Path,
+                        root: str, log_dir: str):
+    """Orient's own job declarations, resolved against Orient's own account
+    home, and that account's home, state, deploy area and `AccountIds`.
+    Mirrors `library_removal_plan` for Orient's own no-login account
+    (company decision 0025 point 5): same refusal when the home is not the
+    account's own, same `([], [], None, None, None, None)` when the
+    account does not exist on this machine, and the same reason
+    `pa.remove`'s wholesale home removal is never asked to do this work
+    unassisted — a job stopped and a directory emptied here is one
+    `--purge-homes` never has to be passed for.
+
+    **ALSO RETURNS THE DEPLOY AREA**, unlike `library_removal_plan`: Orient's
+    own code is placed under its own account's deploy by `bin/place-orient`
+    (`install-backend --only convivy-orient`, run `sudo -u` that account),
+    where the agents-home deploy plan `agents_home_steps` builds never looks.
+    """
+    orient_name = pa.orient_account_name(platform)
+    orient_account = account_system.account(orient_name)
+    if orient_account is None:
+        return [], [], None, None, None, None
+    orient_home = orient_account.home
+    orient_ids = AccountIds(pw_name=orient_account.name, pw_uid=orient_account.uid,
+                            pw_gid=orient_account.gid)
+    home_owner = account_system.home_stat(orient_home)
+    if home_owner is not None and home_owner.st_uid != orient_account.uid:
+        raise Refused(
+            f"{orient_home} (home of {orient_name}, owned by uid {home_owner.st_uid}) "
+            f"is not owned by its account, so something else made it and this command "
+            f"does not delete it. Point the account at its own home, or remove it by "
+            f"hand. Nothing was removed."
+        )
+    orient_state = f"{orient_home}/.local/state"
+    orient_deploy = f"{orient_home}/.local/deploy"
+    if declarations_present(jobs_dir):
+        orient_jobs = resolved_orient_jobs(
+            jobs_dir, platform, orient_home, root, log_dir,
+            orient_deploy, orient_state, f"{orient_home}/.local/bin",
+        )
+        orient_templates = orient_system_jobs(jobs_dir, platform)
+    else:
+        orient_jobs, orient_templates = [], []
+    return orient_jobs, orient_templates, orient_home, orient_state, orient_deploy, orient_ids
+
+
+def unsafe_home_subdir(home: str, name: str) -> str | None:
+    """Whether `{home}/{name}` — the one ancestor every one of the agents
+    account's, the Library's and Orient's own state, deploy and
+    `builder-update` paths resolves through below that account's own home
+    (`.local`) — is still a plain directory, or `None` when it is, or when
+    nothing is there yet to check.
+
+    **THE HOME-OWNERSHIP REFUSAL `library_removal_plan`/`orient_removal_plan`
+    ALREADY RAISE DOES NOT COVER THIS.** An account owns its home outright,
+    so nothing stops it — or whoever has compromised it — from replacing
+    `{home}/{name}` with a symlink into another account's home at any
+    point after that one check runs; checked by `lstat`, never followed,
+    the same way `remove_path` itself refuses a symlink at the leaf it is
+    asked to remove, but one level higher, where every path below it
+    resolves through. Ownership is not compared here: the drop this feeds
+    into (`run_as_account`) is what makes a real cross-account symlink
+    fail, as that account's own permissions on whatever it points at, not
+    a check this file could do any more precisely by uid than the OS
+    itself already does when this runs dropped to the account.
+    """
+    path = Path(home) / name
+    try:
+        st = path.lstat()
+    except OSError:
+        return None
+    if not stat.S_ISDIR(st.st_mode):
+        return f"{path} is a symlink, not the plain directory this install placed there"
+    return None
+
+
+def stop_and_remove_job_units(jobs: list[declaration.Job], platform: str, system_dir: str | None,
+                               dry_run: bool, left: list[tuple[str, str]], removed: list[str],
+                               run=subprocess.run) -> tuple[bool, list[str]]:
+    """Stop and remove each job's unit file(s) and log file(s), over the
+    system domain. Returns whether systemd needs a reload (a unit was
+    actually stopped on Linux), and the unit name(s) it actually stopped —
+    `remove_system_jobs`'s own loop, pulled out so the Library's own jobs
+    can go through it too without also removing `install-jobs`' record a
+    second time (see `remove_system_jobs`)."""
     reloaded_linux = False
+    stopped_units: list[str] = []
     for job in jobs:
         unit_paths = system_job_unit_paths(job, platform, system_dir)
         log_paths = sorted({p for p in (job.stdout, job.stderr) if p})
@@ -802,7 +1138,7 @@ def remove_system_jobs(jobs: list[declaration.Job], platform: str, system_dir: s
                 if os.path.lexists(path):
                     print(f"  would remove log: {path}")
             continue
-        stopped = stop_system_job(job, platform, system_dir, left, run)
+        stopped, units = stop_system_job(job, platform, system_dir, left, run)
         for path in unit_paths:
             if remove_path(Path(path), left):
                 removed.append(path)
@@ -811,33 +1147,86 @@ def remove_system_jobs(jobs: list[declaration.Job], platform: str, system_dir: s
                 removed.append(path)
         if platform == "linux" and stopped:
             reloaded_linux = True
-    if reloaded_linux and shutil.which("systemctl"):
-        run(["systemctl", "daemon-reload"], capture_output=True, check=False)
+            stopped_units.extend(units)
+    return reloaded_linux, stopped_units
+
+
+def remove_system_jobs(jobs: list[declaration.Job], platform: str, system_dir: str | None,
+                        log_dir: str, dry_run: bool,
+                        left: list[tuple[str, str]], removed: list[str],
+                        run=subprocess.run) -> None:
+    """`remove_jobs`'s own shape, over the system domain and the root-owned
+    `log_dir` the three-account shape actually uses, plus the one
+    `install-jobs` record root keeps beside it, at `{prefix}/var/install-jobs`
+    — where `bin/stand-up-backend` points `install-jobs --record` on the
+    shapes that run it as root.
+
+    **STAYS ROOT'S ONLY BECAUSE THIS RECORD IS ROOT-OWNED, UNDER `prefix`.**
+    An install from before `--record` kept this same record under the agents
+    account's own `state` instead; removing THAT copy needs a drop to the
+    agents account first, the same reason every other agents-home path does,
+    so it is `remove_agents_install_jobs_record`'s own job, run inside the
+    caller's dropped child (see the two mains) rather than here as root."""
+    reloaded_linux, stopped_units = stop_and_remove_job_units(
+        jobs, platform, system_dir, dry_run, left, removed, run)
+    if reloaded_linux:
+        reload_systemd(stopped_units, user=False, run=run)
+    record_dir = Path(log_dir).parent / "install-jobs"
+    if dry_run:
+        if os.path.lexists(record_dir):
+            print(f"  would remove: {record_dir}")
+    elif remove_path(record_dir, left):
+        removed.append(str(record_dir))
+
+
+def remove_agents_install_jobs_record(agents_home: str, state: str, dry_run: bool,
+                                       left: list[tuple[str, str]], removed: list[str]) -> None:
+    """Remove the pre-`--record` copy of `install-jobs`' own record, under
+    the agents account's own `state` (never `agents_home`'s default, the
+    same reason `remove_jobs`'s own `record_dir` takes `machine_state`), when
+    an install from before `stand-up-backend` pointed `--record` at the
+    root-owned copy `remove_system_jobs` removes instead left one there.
+
+    **RUN INSIDE THE CALLER'S OWN DROP TO THE AGENTS ACCOUNT, NEVER AS
+    ROOT.** `state` resolves under `agents_home`, an account the agents
+    account itself owns outright, so root deleting through it directly is
+    exactly what `run_as_account` closes off for the Library's and Orient's
+    own homes (security review); this is that same closing-off for the
+    agents account's own. The caller is expected to have already refused a
+    symlinked `.local` on the way (`unsafe_home_subdir`) before calling
+    this, the same way `library_home_steps`/`orient_home_steps` do before
+    their own state removal."""
     record_dir = ij.record_path(
         placeholders.Machine.for_home(agents_home, root="", python=sys.executable, state=state)
     ).parent
     if dry_run:
         if os.path.lexists(record_dir):
             print(f"  would remove: {record_dir}")
-    else:
-        if remove_path(record_dir, left):
-            removed.append(str(record_dir))
+    elif remove_path(record_dir, left):
+        removed.append(str(record_dir))
 
 
 # --------------------------------------------------------------------------
-# Running the agents account's own steps as that account, never as root.
+# Running a no-login account's own steps as that account, never as root.
 # --------------------------------------------------------------------------
 
 
-def run_as_agents_account(ids, action, drop=None) -> tuple[list[tuple[str, str]], list[str]]:
-    """Run `action()` — which touches only the `agents` account's own home
-    and returns `(left, removed)` — in a child process that has dropped to
-    `ids` first, and return what the child reports.
+def run_as_account(ids, action, drop=None) -> tuple[list[tuple[str, str]], list[str]]:
+    """Run `action()` — which touches only `ids`'s own home and returns
+    `(left, removed)` — in a child process that has dropped to `ids` first,
+    and return what the child reports.
 
-    **A SEPARATE PROCESS, NOT A PERMANENT DROP.** `main_three_account` still
-    needs root after this returns, to stop the system-scope jobs, remove
-    the sudo rule and the prefix, and remove the accounts themselves — and
-    a real `os.setuid` cannot be undone in the same process the way `bin/
+    **ONE HELPER FOR EVERY NO-LOGIN ACCOUNT WHOSE HOME THIS TOUCHES**,
+    `agents`, the Library's own account and Orient's own account alike:
+    none of their home-scoped removals runs as root once this exists,
+    because an account's home is that account's to replace, including with
+    a symlink into another account's home, and root deleting through one
+    on its own behalf is exactly what this closes off (security review).
+
+    **A SEPARATE PROCESS, NOT A PERMANENT DROP.** The caller still needs
+    root after this returns, to stop system-scope jobs, remove the sudo
+    rule and the prefix, and remove the accounts themselves — and a real
+    `os.setuid` cannot be undone in the same process the way `bin/
     install-jobs`'s own `as_account` already forks for exactly this reason.
     `drop` is that file's own `drop_to_account` by default; a test that
     cannot become another account injects a no-op instead, the same way
@@ -892,7 +1281,7 @@ def run_as_agents_account(ids, action, drop=None) -> tuple[list[tuple[str, str]]
             "the child exited without reporting why; see its traceback above"
         )
         raise Refused(
-            f"removing what is inside the `{AGENTS}` account's own home failed: "
+            f"removing what is inside the `{ids.pw_name}` account's own home failed: "
             f"{reason}. Nothing further was removed."
         )
     left = [tuple(item) for item in decoded.get("left", [])]
@@ -1213,6 +1602,108 @@ def default_confirm(prompt: str) -> bool:
         )
     answer = input(f"{prompt} [y/N] ").strip().lower()
     return answer in ("y", "yes")
+
+
+# --------------------------------------------------------------------------
+# payload/bin/builder-update's own record of an update in progress or just
+# finished, which no job declaration in jobs/ names either.
+# --------------------------------------------------------------------------
+
+# `payload/bin/builder-update`'s own `DEFAULT_STATE_DIR`,
+# `Path.home() / ".local" / "state" / "builder-update"` — a standalone CLI
+# tool's own record, never a job declaration `state_plan` could read it
+# off. On the single-account shape the operator IS the account this runs
+# against, so this is their own `~/.local/state/builder-update`. On the
+# two-account and three-account shapes, `builder-update` runs from the
+# operator's own clone (`bin/builder-install`'s own `--update` handoff), so
+# `DEFAULT_STATE_DIR` writes the run's own record under the OPERATOR's
+# home, never the agents account's — see `apply_operator_builder_update_state_plan`,
+# which removes that copy. `take_snapshot_three` separately writes the same
+# name a second and third time, under the Library's and Orient's own homes
+# too — each no-login account gets its own snapshot into its own
+# `.local/state/builder-update`, alongside the agents account's.
+BUILDER_UPDATE_STATE_NAME = "builder-update"
+
+
+def apply_builder_update_state_plan(state: str, dry_run: bool, left: list[tuple[str, str]],
+                                     removed: list[str]) -> None:
+    """Remove `{state}/builder-update` by name, the same way
+    `apply_knowledge_index_plan` removes `~/.knowledge-index` by name: both
+    are a standalone tool's own record rather than anything a job
+    declaration names."""
+    path = Path(state) / BUILDER_UPDATE_STATE_NAME
+    if dry_run:
+        if os.path.lexists(path):
+            print(f"  would remove: {path}")
+        return
+    if remove_path(path, left):
+        removed.append(str(path))
+
+
+OPERATOR_BUILDER_UPDATE_LEFT_PATH = "<operator home>/.local/state/builder-update"
+
+
+def operator_login(args: argparse.Namespace) -> str | None:
+    """The operator's own login for the two-account and three-account
+    shapes: `--operator`, or `SUDO_USER` the way `bin/migrate-orient-
+    account`'s own `main` resolves it. `None` for a bare `root` the same as
+    for nothing at all — a root shell's `SUDO_USER` is sometimes unset and
+    sometimes `root` itself, neither of which names an account whose home
+    this could remove anything from."""
+    operator = args.operator or os.environ.get("SUDO_USER")
+    if not operator or operator == "root":
+        return None
+    return operator
+
+
+def apply_operator_builder_update_state_plan(account_system: pa.System, operator: str | None,
+                                              dry_run: bool, drop=None
+                                              ) -> tuple[list[tuple[str, str]], list[str]]:
+    """Remove the operator's own copy of `payload/bin/builder-update`'s
+    state, `apply_builder_update_state_plan`'s own shape applied to the
+    OPERATOR's home rather than an agents, Library or Orient one.
+
+    **ONLY ON THE TWO-ACCOUNT AND THREE-ACCOUNT SHAPES.** On those,
+    `builder-update` runs from the operator's own clone, never `agents`'
+    (`bin/builder-install`'s own `--update` handoff), so its record lands
+    under the operator's home, which nothing else here ever touches — a
+    three-account rehearsal found this left behind after an update and a
+    later uninstall both exited 0.
+
+    **DROPS TO THE OPERATOR'S OWN UID AND GID FIRST, NEVER DELETES AS
+    ROOT.** The operator's home is that account's to replace, including
+    with a symlink into another account's home, exactly the reasoning
+    `run_as_account`'s own docstring gives for the Library's and Orient's
+    homes; `unsafe_home_subdir` is run inside the same drop, before
+    anything is removed, for the same reason.
+
+    Returns `(left, removed)` rather than mutating lists passed in, since
+    the no-operator and no-such-account cases below build their own
+    one-item `left` with nothing to drop into."""
+    if operator is None:
+        return [(OPERATOR_BUILDER_UPDATE_LEFT_PATH,
+                 "could not determine the operator's own login; pass --operator to "
+                 "also remove this")], []
+    account = account_system.account(operator)
+    if account is None:
+        return [(OPERATOR_BUILDER_UPDATE_LEFT_PATH,
+                 f"the `{operator}` account does not exist on this machine; pass "
+                 f"--operator with the operator's own login")], []
+    operator_home = account.home
+    ids = AccountIds(pw_name=account.name, pw_uid=account.uid, pw_gid=account.gid)
+    operator_state = f"{operator_home}/.local/state"
+
+    def operator_steps() -> tuple[list[tuple[str, str]], list[str]]:
+        inner_left: list[tuple[str, str]] = []
+        inner_removed: list[str] = []
+        unsafe = unsafe_home_subdir(operator_home, ".local")
+        if unsafe is not None:
+            inner_left.append((str(Path(operator_home) / ".local"), unsafe))
+            return inner_left, inner_removed
+        apply_builder_update_state_plan(operator_state, dry_run, inner_left, inner_removed)
+        return inner_left, inner_removed
+
+    return run_as_account(ids, operator_steps, drop=drop)
 
 
 # --------------------------------------------------------------------------
@@ -1681,6 +2172,7 @@ def main_single_account(args: argparse.Namespace) -> int:
     names, has_orient_control = state_plan(jobs, templates, home, state)
     apply_state_plan(names, has_orient_control, home, state, args.dry_run, remove_data,
                      args.keep_data, left, removed)
+    apply_builder_update_state_plan(state, args.dry_run, left, removed)
 
     apply_knowledge_index_plan(home, args.dry_run, left, removed)
 
@@ -1707,17 +2199,20 @@ def main_two_account(args: argparse.Namespace, prefix: str,
                       system: pa.System | None = None, drop=None) -> int:
     """Remove the two-account shape: root's own half, over `prefix` and the
     agents account's own system-scope jobs, by the three-account shape's own
-    code for every piece the two shapes share; everything in the agents
-    home, run by a child that has dropped to the `agents` account first;
-    then the account.
+    code for every piece the two shapes share; the Library's and Orient's own
+    jobs, state and (for Orient) deploy area, once each, both no-login
+    accounts `provision-accounts` creates on this shape too, each run by a
+    child dropped to that account's own ids; everything in the agents home,
+    run by a child that has dropped to the `agents` account first; then the
+    accounts.
 
     **NEVER PROBES FOR A `reviewers` ACCOUNT, A SUDOERS FILE OR A REVIEW
     LAUNCHER.** `install-privileged --shape two` places none of the three,
     so this never looks for them: there is no `sudoers_dir` here to read,
     and `pa.remove` is called with shape "two", which touches only `agents`.
 
-    **`drop` IS `run_as_agents_account`'s OWN, THREADED THROUGH FOR A TEST
-    THAT CANNOT BECOME `agents`.** A real run never passes it, and gets
+    **`drop` IS `run_as_account`'s OWN, THREADED THROUGH FOR A TEST THAT
+    CANNOT BECOME ANOTHER ACCOUNT.** A real run never passes it, and gets
     `bin/install-jobs`'s own `drop_to_account`.
     """
     if os.geteuid() != 0:
@@ -1741,8 +2236,8 @@ def main_two_account(args: argparse.Namespace, prefix: str,
 
     # The same `System` `pa.remove` uses at the foot of this function, asked
     # early for the `agents` account's own uid and gids too, the same reason
-    # `main_three_account` asks early: `run_as_agents_account` needs them to
-    # drop to that account before anything below touches a path inside
+    # `main_three_account` asks early: `run_as_account` needs them to drop
+    # to that account before anything below touches a path inside
     # `agents_home`.
     account_system = system or pa.system_for_platform()
     account = account_system.account(AGENTS)
@@ -1752,6 +2247,10 @@ def main_two_account(args: argparse.Namespace, prefix: str,
             f"Nothing was removed."
         )
     ids = AccountIds(pw_name=account.name, pw_uid=account.uid, pw_gid=account.gid)
+    library_jobs, library_templates, library_home, library_state, library_ids = library_removal_plan(
+        account_system, platform, jobs_dir, root, log_dir)
+    (orient_jobs, orient_templates, orient_home, orient_state, orient_deploy,
+     orient_ids) = orient_removal_plan(account_system, platform, jobs_dir, root, log_dir)
 
     print(f"{PROG}: two-account, {platform}, {AGENTS} home {agents_home}, prefix {prefix}")
 
@@ -1759,8 +2258,20 @@ def main_two_account(args: argparse.Namespace, prefix: str,
     removed: list[str] = []
 
     # DECIDED BEFORE ANYTHING ELSE IS TOUCHED, for the same reason the
-    # single-account and three-account shapes decide it first.
+    # single-account and three-account shapes decide it first. A separate
+    # question for the Library's own store, which lives under its own
+    # account's home now, never the agents account's, and likewise for
+    # Orient's own backups (jobs/orient-backup.toml's own `--dest
+    # {state}/builder-backup`), under Orient's own home.
     remove_data = decide_data_removal(state, args.dry_run, args.keep_data, default_confirm)
+    library_remove_data = (
+        decide_data_removal(library_state, args.dry_run, args.keep_data, default_confirm)
+        if library_home is not None else None
+    )
+    orient_remove_data = (
+        decide_data_removal(orient_state, args.dry_run, args.keep_data, default_confirm)
+        if orient_home is not None else None
+    )
 
     if declarations_present(jobs_dir):
         jobs = resolved_agents_jobs(jobs_dir, platform, agents_home, root, log_dir,
@@ -1773,8 +2284,79 @@ def main_two_account(args: argparse.Namespace, prefix: str,
 
     # ROOT'S OWN: the same system-scope jobs the three-account shape stops,
     # rendered and removed through the same function.
-    remove_system_jobs(jobs, platform, args.system_dir, log_dir, agents_home, state,
-                        args.dry_run, left, removed)
+    remove_system_jobs(jobs, platform, args.system_dir, log_dir, args.dry_run, left, removed)
+
+    # THE LIBRARY'S OWN JOB UNITS, STILL ROOT'S: stopping and removing a
+    # system-scope unit needs root regardless of whose account it names.
+    # What is under the Library's own home is not touched here — see
+    # `library_home_steps`, below, which runs it dropped to that account.
+    if library_home is not None:
+        reloaded, stopped_units = stop_and_remove_job_units(library_jobs, platform, args.system_dir,
+                                                              args.dry_run, left, removed)
+        if reloaded:
+            reload_systemd(stopped_units, user=False)
+
+        def library_home_steps() -> tuple[list[tuple[str, str]], list[str]]:
+            """The Library's own state, under its own home, run in a child
+            dropped to the Library's own account — never root's, and never
+            reusing `agents_home_steps`'s drop either, since that account's
+            home is mode 700, unreadable to `agents` (company decision
+            0025 point 5)."""
+            inner_left: list[tuple[str, str]] = []
+            inner_removed: list[str] = []
+            unsafe = unsafe_home_subdir(library_home, ".local")
+            if unsafe is not None:
+                inner_left.append((str(Path(library_home) / ".local"), unsafe))
+                return inner_left, inner_removed
+            library_names, library_has_oc = state_plan(library_jobs, library_templates,
+                                                        library_home, library_state)
+            apply_state_plan(library_names, library_has_oc, library_home, library_state,
+                              args.dry_run, library_remove_data, args.keep_data,
+                              inner_left, inner_removed)
+            apply_builder_update_state_plan(library_state, args.dry_run, inner_left, inner_removed)
+            return inner_left, inner_removed
+
+        library_left, library_removed = run_as_account(library_ids, library_home_steps, drop=drop)
+        left.extend(library_left)
+        removed.extend(library_removed)
+
+    # ORIENT'S OWN JOB UNITS, STILL ROOT'S, FOR THE SAME REASON THE
+    # LIBRARY'S ARE. Without this, `com.convivy.orient`,
+    # `com.convivy.orient-dashboard` and `com.convivy.orient-backup` stay
+    # loaded and Orient's server keeps running as that account, measured on
+    # a macOS 26 three-account rehearsal, on the two-account shape too
+    # (`provision-accounts` creates Orient's own account on both). What is
+    # under Orient's own home is not touched here — see
+    # `orient_home_steps`, below.
+    if orient_home is not None:
+        reloaded, stopped_units = stop_and_remove_job_units(orient_jobs, platform, args.system_dir,
+                                                              args.dry_run, left, removed)
+        if reloaded:
+            reload_systemd(stopped_units, user=False)
+
+        def orient_home_steps() -> tuple[list[tuple[str, str]], list[str]]:
+            """Orient's own state and deploy area, under its own home, run
+            in a child dropped to Orient's own account, mirroring
+            `library_home_steps`."""
+            inner_left: list[tuple[str, str]] = []
+            inner_removed: list[str] = []
+            unsafe = unsafe_home_subdir(orient_home, ".local")
+            if unsafe is not None:
+                inner_left.append((str(Path(orient_home) / ".local"), unsafe))
+                return inner_left, inner_removed
+            orient_names, orient_has_oc = state_plan(orient_jobs, orient_templates,
+                                                      orient_home, orient_state)
+            apply_state_plan(orient_names, orient_has_oc, orient_home, orient_state,
+                              args.dry_run, orient_remove_data, args.keep_data,
+                              inner_left, inner_removed)
+            apply_builder_update_state_plan(orient_state, args.dry_run, inner_left, inner_removed)
+            apply_deploy_plan(Path(orient_deploy), Path(orient_home), args.dry_run,
+                              inner_left, inner_removed)
+            return inner_left, inner_removed
+
+        orient_left, orient_removed = run_as_account(orient_ids, orient_home_steps, drop=drop)
+        left.extend(orient_left)
+        removed.extend(orient_removed)
 
     def agents_home_steps() -> tuple[list[tuple[str, str]], list[str]]:
         """Everything the single-account shape removes, reused verbatim and
@@ -1787,6 +2369,10 @@ def main_two_account(args: argparse.Namespace, prefix: str,
         os.environ["HOME"] = agents_home
         inner_left: list[tuple[str, str]] = []
         inner_removed: list[str] = []
+        unsafe = unsafe_home_subdir(agents_home, ".local")
+        if unsafe is not None:
+            inner_left.append((str(Path(agents_home) / ".local"), unsafe))
+            return inner_left, inner_removed
         apply_link_plan(Path(deploy), Path(bin_dir), Path(skills_dir), Path(settings),
                         Path(agents_home), args.dry_run, inner_left, inner_removed)
         payload_area = Path(deploy) / PAYLOAD_REPOSITORY
@@ -1796,25 +2382,54 @@ def main_two_account(args: argparse.Namespace, prefix: str,
         names, has_orient_control = state_plan(jobs, templates, agents_home, state)
         apply_state_plan(names, has_orient_control, agents_home, state, args.dry_run, remove_data,
                          args.keep_data, inner_left, inner_removed)
+        apply_builder_update_state_plan(state, args.dry_run, inner_left, inner_removed)
         apply_knowledge_index_plan(agents_home, args.dry_run, inner_left, inner_removed)
+        remove_agents_install_jobs_record(agents_home, state, args.dry_run, inner_left, inner_removed)
         return inner_left, inner_removed
 
-    agent_left, agent_removed = run_as_agents_account(ids, agents_home_steps, drop=drop)
+    agent_left, agent_removed = run_as_account(ids, agents_home_steps, drop=drop)
     left.extend(agent_left)
     removed.extend(agent_removed)
 
-    remove_privileged_tree(prefix, args.dry_run, left, removed)
+    # THE OPERATOR'S OWN COPY OF payload/bin/builder-update's STATE: this
+    # shape runs `builder-update` from the operator's own clone, so its
+    # record lands in the operator's own home, never the agents account's
+    # — see `apply_operator_builder_update_state_plan`.
+    operator_left, operator_removed = apply_operator_builder_update_state_plan(
+        account_system, operator_login(args), args.dry_run, drop=drop)
+    left.extend(operator_left)
+    removed.extend(operator_removed)
 
     if args.dry_run:
+        remove_privileged_tree(prefix, args.dry_run, left, removed)
         print(f"  would remove the `{AGENTS}` account through provision-accounts "
               f"--shape two (pass --purge-homes to also delete a home that still "
               f"holds something)")
         print(f"\n{PROG}: dry run; nothing was changed")
     else:
+        accounts_removed = False
         try:
             removed.extend(pa.remove(account_system, "two", args.purge_homes))
+            accounts_removed = True
         except pa.Refused as exc:
-            left.append((f"the `{AGENTS}` account", str(exc)))
+            left.append((f"the `{AGENTS}` account, the Library's own account and "
+                        f"Orient's own account", str(exc)))
+        # `{prefix}/{PRIVILEGED_INSTALL_JSON}` IS THIS SHAPE'S OWN DETECTION
+        # MARKER (`refuse_unsupported_shape`), SO IT IS REMOVED ONLY ONCE THE
+        # ACCOUNTS ABOVE ARE GONE. Removing `prefix` whole before the accounts
+        # could be removed, as an earlier version of this did, left a rerun —
+        # the one `--purge-homes` names as the fix for a non-empty home —
+        # unable to tell this shape from an unfinished install at all:
+        # measured on a macOS 26 three-account rehearsal, where the first run
+        # removed `/opt/builder` and then refused on non-empty homes, and the
+        # `--purge-homes` rerun refused again, this time because
+        # `install.json` was already gone.
+        if accounts_removed:
+            remove_privileged_tree(prefix, args.dry_run, left, removed)
+        else:
+            left.append((prefix, "left in place so a rerun can still detect this shape and "
+                                 "finish removing the accounts above; rerun this once that "
+                                 "refusal is resolved"))
         print(f"\n{PROG}: removed {len(removed)} item(s)")
     if left:
         print(f"{PROG}: left {len(left)} item(s) in place:")
@@ -1834,13 +2449,16 @@ def main_two_account(args: argparse.Namespace, prefix: str,
 def main_three_account(args: argparse.Namespace, prefix: str,
                         system: pa.System | None = None, drop=None) -> int:
     """Remove the three-account shape: root's own half, over `prefix` and
-    the primary pair's agents account's own system-scope jobs; everything
-    the single-account shape removes, reused pointed at that account's home,
-    run by a child that has dropped to it first; then every entity's pair of
-    accounts.
+    the primary pair's agents account's own system-scope jobs; the Library's
+    and Orient's own jobs, state and (for Orient) deploy area, each once
+    regardless of how many entity pairs there are, each run by a child
+    dropped to that account's own ids; everything the single-account shape
+    removes, reused pointed at that account's home, run by a child that has
+    dropped to it first; then every entity's pair of accounts, plus the
+    Library's and Orient's own.
 
-    **`drop` IS `run_as_agents_account`'s OWN, THREADED THROUGH FOR A TEST
-    THAT CANNOT BECOME `agents`.** A real run never passes it, and gets
+    **`drop` IS `run_as_account`'s OWN, THREADED THROUGH FOR A TEST THAT
+    CANNOT BECOME ANOTHER ACCOUNT.** A real run never passes it, and gets
     `bin/install-jobs`'s own `drop_to_account`.
     """
     entities = read_entities_for_prefix(prefix)
@@ -1857,10 +2475,10 @@ def main_three_account(args: argparse.Namespace, prefix: str,
         )
 
     # The same `System` `pa.remove` uses at the foot of this function, asked
-    # early for every pair's accounts: `run_as_agents_account` needs the
-    # primary pair's own uid and gids to drop to it before anything below
-    # touches a path inside its home, and a `FakeAccountSystem` answers this
-    # the same way it already answers the shape detection above.
+    # early for every pair's accounts: `run_as_account` needs the primary
+    # pair's own uid and gids to drop to it before anything below touches a
+    # path inside its home, and a `FakeAccountSystem` answers this the same
+    # way it already answers the shape detection above.
     account_system = system or pa.system_for_platform()
     missing = [name for pair in pairs for name in pair if account_system.account(name) is None]
     if missing:
@@ -1884,6 +2502,11 @@ def main_three_account(args: argparse.Namespace, prefix: str,
     log_dir = args.log_dir or f"{prefix}/var/log"
     root = configured_root(agents_home)
 
+    library_jobs, library_templates, library_home, library_state, library_ids = library_removal_plan(
+        account_system, platform, jobs_dir, root, log_dir)
+    (orient_jobs, orient_templates, orient_home, orient_state, orient_deploy,
+     orient_ids) = orient_removal_plan(account_system, platform, jobs_dir, root, log_dir)
+
     note = f", entities: {', '.join(entities)}" if len(entities) > 1 else ""
     print(f"{PROG}: three-account, {platform}, {primary_agents} home {agents_home}, "
           f"prefix {prefix}{note}")
@@ -1896,6 +2519,99 @@ def main_three_account(args: argparse.Namespace, prefix: str,
     left: list[tuple[str, str]] = []
     removed: list[str] = []
 
+    # DECIDED BEFORE ANYTHING ELSE IS TOUCHED, for the same reason the
+    # single-account shape decides it first (see `main_single_account`).
+    # This asks whether the Library's own store — under its own account's
+    # home now, never an agents account's — should go. It runs once
+    # regardless of how many entity pairs there are, since the Library's
+    # account is one per install and counts toward no entity; it never
+    # touches a path itself, so it stays root's, the way the system jobs
+    # below stay root's.
+    library_remove_data = (
+        decide_data_removal(library_state, args.dry_run, args.keep_data, default_confirm)
+        if library_home is not None else None
+    )
+    # The same question for Orient's own backups (jobs/orient-backup.toml's
+    # own `--dest {state}/builder-backup`), under Orient's own home — one
+    # per install, counting toward no entity, for the same reason the
+    # Library's own question above runs once.
+    orient_remove_data = (
+        decide_data_removal(orient_state, args.dry_run, args.keep_data, default_confirm)
+        if orient_home is not None else None
+    )
+
+    # THE LIBRARY'S OWN JOB UNITS, STILL ROOT'S: stopping and removing a
+    # system-scope unit needs root regardless of whose account it names,
+    # and once regardless of how many entity pairs there are. What is under
+    # the Library's own home is not touched here — see `library_home_steps`,
+    # below, which runs it dropped to that account.
+    if library_home is not None:
+        reloaded, stopped_units = stop_and_remove_job_units(library_jobs, platform, args.system_dir,
+                                                              args.dry_run, left, removed)
+        if reloaded:
+            reload_systemd(stopped_units, user=False)
+
+        def library_home_steps() -> tuple[list[tuple[str, str]], list[str]]:
+            """The Library's own state, under its own home, run in a child
+            dropped to the Library's own account — never root's, and never
+            reusing `agents_home_steps`'s drop either, since that account's
+            home is mode 700, unreadable to any agents account (company
+            decision 0025 point 5)."""
+            inner_left: list[tuple[str, str]] = []
+            inner_removed: list[str] = []
+            unsafe = unsafe_home_subdir(library_home, ".local")
+            if unsafe is not None:
+                inner_left.append((str(Path(library_home) / ".local"), unsafe))
+                return inner_left, inner_removed
+            library_names, library_has_oc = state_plan(library_jobs, library_templates,
+                                                        library_home, library_state)
+            apply_state_plan(library_names, library_has_oc, library_home, library_state,
+                              args.dry_run, library_remove_data, args.keep_data,
+                              inner_left, inner_removed)
+            apply_builder_update_state_plan(library_state, args.dry_run, inner_left, inner_removed)
+            return inner_left, inner_removed
+
+        library_left, library_removed = run_as_account(library_ids, library_home_steps, drop=drop)
+        left.extend(library_left)
+        removed.extend(library_removed)
+
+    # ORIENT'S OWN JOB UNITS, STILL ROOT'S, FOR THE SAME REASON THE
+    # LIBRARY'S ARE, and once regardless of how many entity pairs there
+    # are. Without this, `com.convivy.orient`, `com.convivy.orient-dashboard`
+    # and `com.convivy.orient-backup` stay loaded and Orient's server keeps
+    # running as that account: measured on a macOS 26 three-account
+    # rehearsal. What is under Orient's own home is not touched here — see
+    # `orient_home_steps`, below.
+    if orient_home is not None:
+        reloaded, stopped_units = stop_and_remove_job_units(orient_jobs, platform, args.system_dir,
+                                                              args.dry_run, left, removed)
+        if reloaded:
+            reload_systemd(stopped_units, user=False)
+
+        def orient_home_steps() -> tuple[list[tuple[str, str]], list[str]]:
+            """Orient's own state and deploy area, under its own home, run
+            in a child dropped to Orient's own account, mirroring
+            `library_home_steps`."""
+            inner_left: list[tuple[str, str]] = []
+            inner_removed: list[str] = []
+            unsafe = unsafe_home_subdir(orient_home, ".local")
+            if unsafe is not None:
+                inner_left.append((str(Path(orient_home) / ".local"), unsafe))
+                return inner_left, inner_removed
+            orient_names, orient_has_oc = state_plan(orient_jobs, orient_templates,
+                                                      orient_home, orient_state)
+            apply_state_plan(orient_names, orient_has_oc, orient_home, orient_state,
+                              args.dry_run, orient_remove_data, args.keep_data,
+                              inner_left, inner_removed)
+            apply_builder_update_state_plan(orient_state, args.dry_run, inner_left, inner_removed)
+            apply_deploy_plan(Path(orient_deploy), Path(orient_home), args.dry_run,
+                              inner_left, inner_removed)
+            return inner_left, inner_removed
+
+        orient_left, orient_removed = run_as_account(orient_ids, orient_home_steps, drop=drop)
+        left.extend(orient_left)
+        removed.extend(orient_removed)
+
     # The detailed, per-step cleanup below (jobs, deploy areas, linked
     # commands, MCP registrations, the knowledge index) is the single-entity
     # shape's own: `place`, `link` and `register` run only as the literal
@@ -1906,9 +2622,9 @@ def main_three_account(args: argparse.Namespace, prefix: str,
     if len(pairs) == 1:
         # DECIDED BEFORE ANYTHING ELSE IS TOUCHED, for the same reason the
         # single-account shape decides it first (see `main_single_account`).
-        # This asks only whether the Library's store and the backups should go,
-        # never touching a path itself, so it stays root's, the way the system
-        # jobs below stay root's.
+        # This asks only whether the agents account's own backups should go,
+        # never touching a path itself, so it stays root's, the way the
+        # system jobs below stay root's.
         remove_data = decide_data_removal(state, args.dry_run, args.keep_data, default_confirm)
 
         if declarations_present(jobs_dir):
@@ -1923,15 +2639,14 @@ def main_three_account(args: argparse.Namespace, prefix: str,
         # ROOT'S OWN: the agents account's system-scope jobs are root's own,
         # machine-wide units naming `agents` through `UserName=`/`User=`, never
         # that account's own per-user job — see `stop_system_job`.
-        remove_system_jobs(jobs, platform, args.system_dir, log_dir, agents_home, state,
-                            args.dry_run, left, removed)
+        remove_system_jobs(jobs, platform, args.system_dir, log_dir, args.dry_run, left, removed)
 
         def agents_home_steps() -> tuple[list[tuple[str, str]], list[str]]:
             """Everything the single-account shape removes, reused verbatim and
             pointed at the agents home: the three-account shape's `place`,
             `link` and `register` steps are `agents`' own, the same installers
             the single-account shape runs for the operator. Run here, inside
-            the child `run_as_agents_account` has already dropped to `agents`,
+            the child `run_as_account` has already dropped to `agents`,
             so a path inside its home is only ever read or written by that
             account, and `claude mcp remove` (through `apply_mcp_plan`) execs
             with that account's own `HOME`, never root's.
@@ -1943,6 +2658,10 @@ def main_three_account(args: argparse.Namespace, prefix: str,
             os.environ["HOME"] = agents_home
             inner_left: list[tuple[str, str]] = []
             inner_removed: list[str] = []
+            unsafe = unsafe_home_subdir(agents_home, ".local")
+            if unsafe is not None:
+                inner_left.append((str(Path(agents_home) / ".local"), unsafe))
+                return inner_left, inner_removed
             apply_link_plan(Path(deploy), Path(bin_dir), Path(skills_dir), Path(settings),
                             Path(agents_home), args.dry_run, inner_left, inner_removed)
             payload_area = Path(deploy) / PAYLOAD_REPOSITORY
@@ -1952,26 +2671,58 @@ def main_three_account(args: argparse.Namespace, prefix: str,
             names, has_orient_control = state_plan(jobs, templates, agents_home, state)
             apply_state_plan(names, has_orient_control, agents_home, state, args.dry_run, remove_data,
                              args.keep_data, inner_left, inner_removed)
+            apply_builder_update_state_plan(state, args.dry_run, inner_left, inner_removed)
             apply_knowledge_index_plan(agents_home, args.dry_run, inner_left, inner_removed)
+            remove_agents_install_jobs_record(agents_home, state, args.dry_run, inner_left, inner_removed)
             return inner_left, inner_removed
 
-        agent_left, agent_removed = run_as_agents_account(ids, agents_home_steps, drop=drop)
+        agent_left, agent_removed = run_as_account(ids, agents_home_steps, drop=drop)
         left.extend(agent_left)
         removed.extend(agent_removed)
 
+    # THE OPERATOR'S OWN COPY OF payload/bin/builder-update's STATE, once
+    # regardless of how many entity pairs there are, for the same reason
+    # the Library's and Orient's own is: this shape runs `builder-update`
+    # from the operator's own clone, so its record lands in the operator's
+    # own home, never any agents account's — see
+    # `apply_operator_builder_update_state_plan`.
+    operator_left, operator_removed = apply_operator_builder_update_state_plan(
+        account_system, operator_login(args), args.dry_run, drop=drop)
+    left.extend(operator_left)
+    removed.extend(operator_removed)
+
     remove_sudo_rule(prefix, sudoers_dir, args.dry_run, left, removed)
-    remove_privileged_tree(prefix, args.dry_run, left, removed)
 
     if args.dry_run:
+        remove_privileged_tree(prefix, args.dry_run, left, removed)
         print(f"  would remove the {pair_names} accounts through "
               f"provision-accounts --shape three (pass --purge-homes to also delete "
               f"a home that still holds something)")
         print(f"\n{PROG}: dry run; nothing was changed")
     else:
+        accounts_removed = False
         try:
             removed.extend(pa.remove(account_system, "three", args.purge_homes, entities))
+            accounts_removed = True
         except pa.Refused as exc:
-            left.append((f"the {pair_names} accounts", str(exc)))
+            left.append((f"the {pair_names} accounts, the Library's own account and "
+                        f"Orient's own account", str(exc)))
+        # `{prefix}/{PRIVILEGED_INSTALL_JSON}` IS THIS SHAPE'S OWN DETECTION
+        # MARKER (`refuse_unsupported_shape`), SO IT IS REMOVED ONLY ONCE THE
+        # ACCOUNTS ABOVE ARE GONE. Removing `prefix` whole before the accounts
+        # could be removed, as an earlier version of this did, left a rerun —
+        # the one `--purge-homes` names as the fix for a non-empty home —
+        # unable to tell this shape from an unfinished install at all:
+        # measured on a macOS 26 three-account rehearsal, where the first run
+        # removed `/opt/builder` and then refused on non-empty homes, and the
+        # `--purge-homes` rerun refused again, this time because
+        # `install.json` was already gone.
+        if accounts_removed:
+            remove_privileged_tree(prefix, args.dry_run, left, removed)
+        else:
+            left.append((prefix, "left in place so a rerun can still detect this shape and "
+                                 "finish removing the accounts above; rerun this once that "
+                                 "refusal is resolved"))
         print(f"\n{PROG}: removed {len(removed)} item(s)")
     if left:
         print(f"{PROG}: left {len(left)} item(s) in place:")
@@ -1998,6 +2749,10 @@ def main(argv: list[str], system: pa.System | None = None, drop=None) -> int:
     parser.add_argument("--agents-home", help="the agents account's home directory, "
                         "for the two-account and three-account shapes (default: the "
                         "directory service's)")
+    parser.add_argument("--operator", help="the operator's own login, for the "
+                        "two-account and three-account shapes, to also remove "
+                        "payload/bin/builder-update's record from that account's own "
+                        "home (default: the user who ran sudo)")
     parser.add_argument("--deploy", help="deploy root (default: {home}/.local/deploy)")
     parser.add_argument("--bin", dest="bin_dir", help="linked commands directory "
                         "(default: {home}/.local/bin)")

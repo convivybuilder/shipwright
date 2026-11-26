@@ -129,6 +129,8 @@ def unknown_placeholders(job: Job) -> set[str]:
     found: set[str] = set()
     for text in _all_strings(job):
         found.update(PLACEHOLDER.findall(text))
+    if job.own_root is not None:
+        found.update(PLACEHOLDER.findall(job.own_root))
     return found - set(KNOWN) - set(job.programs)
 
 
@@ -138,6 +140,25 @@ def uses_placeholder(job: Job, name: str) -> bool:
 
 
 def _all_strings(job: Job):
+    """Every string `resolve` substitutes placeholders into.
+
+    `own_root` IS DELIBERATELY LEFT OUT. It is resolved once, on its own, by
+    `own_root_value`, against every placeholder but `{root}`, the one name it
+    exists to replace, so folding it in here would let it be substituted
+    through the ordinary path, `{root}` included, which is exactly backward.
+    It is also what `uninstall-builder`'s `state_plan` reads this generator
+    for to tell which of a job's resolved fields are safe to treat as a
+    removable name under `{state}`; that reasoning assumes every string here
+    went through the ordinary substitution, which `own_root` never does.
+
+    `account_environment` AND `account_prepare` ARE INCLUDED, unlike
+    `own_root`: both resolve against the same full placeholder set their
+    plain counterparts do, through the ordinary path, so there is nothing
+    backward about reading them here for the lint and unknown-placeholder
+    checks. `resolve` merges each into its plain counterpart and clears it,
+    so a resolved job's `account_environment` and `account_prepare` are
+    always empty and `state_plan`'s reasoning above still holds.
+    """
     yield from job.command
     if job.working_directory:
         yield job.working_directory
@@ -146,8 +167,13 @@ def _all_strings(job: Job):
     if job.stderr:
         yield job.stderr
     yield from job.environment.values()
+    yield from job.account_environment.values()
     yield from job.directories
     for step in job.prepare:
+        yield from step.argv
+        if step.creates:
+            yield step.creates
+    for step in job.account_prepare:
         yield from step.argv
         if step.creates:
             yield step.creates
@@ -188,13 +214,26 @@ def resolve(job: Job, machine: Machine, programs: Mapping[str, str] | None = Non
     def sub(text: str) -> str:
         return PLACEHOLDER.sub(lambda m: values[m.group(1)], text)
 
+    # account_environment and account_prepare apply only while the job's
+    # account is in force (FORMAT.md, "account-environment",
+    # "account-prepare"); dropping the account, as `install-jobs.as_invoker`
+    # does for `--single-account`, leaves nothing for either to apply to, so
+    # both are merged into their plain counterpart here and never on a job
+    # whose account has already been dropped.
+    environment = dict(job.environment)
+    prepare_steps = job.prepare
+    if job.account is not None:
+        environment.update(job.account_environment)
+        prepare_steps = (*job.prepare, *job.account_prepare)
+
     return replace(
         job,
         command=tuple(sub(part) for part in job.command),
         working_directory=sub(job.working_directory) if job.working_directory else None,
         stdout=sub(job.stdout) if job.stdout else None,
         stderr=sub(job.stderr) if job.stderr else None,
-        environment={key: sub(value) for key, value in job.environment.items()},
+        environment={key: sub(value) for key, value in environment.items()},
+        account_environment={},
         directories=tuple(sub(directory) for directory in job.directories),
         prepare=tuple(
             replace(
@@ -202,9 +241,42 @@ def resolve(job: Job, machine: Machine, programs: Mapping[str, str] | None = Non
                 argv=tuple(sub(part) for part in step.argv),
                 creates=sub(step.creates) if step.creates else None,
             )
-            for step in job.prepare
+            for step in prepare_steps
         ),
+        account_prepare=(),
     )
+
+
+def own_root_value(job: Job, machine: Machine, programs: Mapping[str, str] | None = None) -> str | None:
+    """What `{root}` becomes for this job alone, or `None` when it declares
+    no `own-root`.
+
+    Resolved against every placeholder `machine` carries but `{root}` itself;
+    `Job.__post_init__` already refuses an `own-root` that names `{root}`,
+    since that would need its own answer before it has one. The caller
+    substitutes the result for `machine.root` before calling `resolve`, so
+    every other field that names `{root}` gets this job's own answer.
+    """
+    if job.own_root is None:
+        return None
+    programs = programs or {}
+    unknown = set(PLACEHOLDER.findall(job.own_root)) - set(KNOWN) - set(job.programs)
+    if unknown:
+        known = ", ".join(sorted(KNOWN))
+        raise PlaceholderError(
+            f"{job.source}: own-root uses unknown placeholder(s) "
+            f"{', '.join('{' + name + '}' for name in sorted(unknown))}. "
+            f"Known placeholders are {known}."
+        )
+    values = {**machine.as_map(), **{name: programs[name] for name in job.programs}}
+    resolved = PLACEHOLDER.sub(lambda m: values[m.group(1)], job.own_root)
+    if not resolved.startswith("/"):
+        raise PlaceholderError(
+            f"{job.source}: own-root resolves to {resolved!r}, which is not an "
+            f"absolute path. Every field that uses {{root}} is written assuming "
+            f"it is one."
+        )
+    return resolved
 
 
 def unresolved_absolute_paths(job: Job) -> list[str]:
@@ -219,4 +291,6 @@ def unresolved_absolute_paths(job: Job) -> list[str]:
     for text in _all_strings(job):
         if HOSTILE_TO_PORTABILITY.search(text):
             offenders.append(text)
+    if job.own_root is not None and HOSTILE_TO_PORTABILITY.search(job.own_root):
+        offenders.append(job.own_root)
     return offenders

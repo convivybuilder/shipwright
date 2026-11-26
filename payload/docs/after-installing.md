@@ -80,31 +80,49 @@ python3 ~/src/shipwright/bin/stand-up-backend --shape single --status
 
 ## Moving to a later release
 
-`builder-update --shape single` is how you move a single-account install to a later release:
+Move an install to a later release with the one command that installs Builder, adding `--update`
+and naming your install's shape:
+
+```
+curl -fsSL https://convivybuilder.org/install.sh | sh -s -- --update --shape single
+brew upgrade builder && builder-install --update --shape single          # on a Mac with Homebrew
+```
+
+Name the shape the way [One account vs. multiple accounts on the
+server](accounts-on-the-server.md) names it: `--shape single`, `--shape two` or `--shape three`.
+
+On a two- or three-account install, run the command from the administrator's own account, never
+from `agents`, and expect the administrator password once.
+
+`--update` installs nothing itself: it finds your install's own `builder-update` and hands off to
+it, passing `--release` and `--plan` along when you give them. An install whose release already
+carries `builder-update` can also run it directly:
 
 ```
 builder-update --shape single
 ```
 
-It reports what moving would do, asks you to confirm, then moves every clone, stops every job,
-snapshots the database, places the new release (running `install-payload`, `install-backend`,
-`link-commands` and `register-mcp` for you), re-renders and starts the jobs again, and checks
-itself, putting everything back if a step fails. `--plan` reports without asking or changing
-anything, `--release vX.Y.Z` names a release instead of the latest one, and `--rollback` finishes
-an update that stopped partway.
+It reports the installed release, the release it will move to, every step it will take and which
+account runs each one, warns that the Library and Orient will be down until it finishes, and asks
+you to confirm. `--plan` prints the same report and stops there without asking anything;
+`--release vX.Y.Z` names a release other than the latest one.
+
+Once you confirm, it moves every clone, stops every job, takes a snapshot of the database, places
+the new release — running `install-payload`, `install-backend`, `link-commands` and
+`register-mcp` for you, and, on the three-account install, the root-owned half as well —
+re-renders and starts the jobs again, and checks itself, putting everything back if a step fails.
+`--rollback` finishes an update that stopped partway.
 
 Before it moves anything, it checks the target release the same way `builder-install --verify`
 does, using the INSTALLED release's own copy of `release-signers`. It fetches the target's signed
 manifest and checks the manifest's signature against that trust list, and each clone's commit
 against what the manifest names. An install made before 0.7.0 carries no `release-signers` of its
-own, so it refuses at that check; only an install already on a signed release can move past it.
-`--shape two` refuses before it reads anything, and `--shape three` fetches the target release,
-verifies it, and prints the full plan, then refuses, because the root half and the `sudo -u
-agents` steps are not built for either shape yet; only `--shape single` moves anything. Nobody
-has yet run an update end to end on a real machine.
+own, so it refuses at that check; only an install already on a signed release can move past it. A
+two- or three-account install also needs a release carrying `--restore-previous` (0.8.0) before it
+can update; an install on an earlier release refuses.
 
-Moving an install from before 0.7.0 needs the manual route below once, to reach a signed release;
-`builder-update` works from there on.
+Moving a single-account install from before 0.7.0 needs the manual route below once, to reach a
+signed release; `builder-update` works from there on.
 
 Running `install-payload`, which the step above does for you, also brings the starter set in your
 knowledge repository up to the new release, when the repository's remote is a folder on this
@@ -124,11 +142,12 @@ git -C ~/src/library pull --ff-only origin stable
 git -C ~/src/convivy-orient pull --ff-only origin stable
 git -C ~/src/convivy-deck pull --ff-only origin stable
 git -C ~/src/write-better fetch origin
-git -C ~/src/write-better checkout --detach "$(curl -fsSL https://convivybuilder.org/releases/X.Y.Z/release-manifest | awk '$1 == "write-better" {print $2}')"
+git -C ~/src/write-better checkout -B main "$(curl -fsSL https://convivybuilder.org/releases/X.Y.Z/release-manifest | awk '$1 == "write-better" {print $2}')"
 ```
 
 `write-better` has no `stable` branch; each release names the commit of it that belongs to the
-release, and the last line checks that commit out. What these commands pull is unverified until you
+release, and the last line puts the clone's `main` at that commit, where `builder-update` expects
+it. What these commands pull is unverified until you
 check it yourself. Run `curl -fsSL https://convivybuilder.org/install.sh | sh -s -- --verify
 vX.Y.Z`, naming the release you just pulled, before running `install-payload` and
 `stand-up-backend`. Use the site's copy rather than `bin/builder-install` from your clone: a copy
@@ -192,6 +211,99 @@ claude
 The first line moves into the steward's folder, and the second starts Claude there; the conversation
 that opens is the steward.
 
+## Approving from Deck with a Touch ID press
+
+Deck's **Approve**, **Decline** and model-choice buttons work without any of this, carrying your
+account's own credential the way every other call to the server does. What this section adds is a
+proof, signed on your Mac with a Touch ID press, that the server checks before it accepts one of
+those three acts — so the act is tied to a key only your Mac's Secure Enclave holds, rather than to
+whichever process on the server happens to hold Deck's credential. Skip this section and those three
+buttons keep working exactly as they do today; add it and they start asking for a Touch ID press,
+and the server starts refusing an approve, a decline or a model choice that arrives without one.
+
+**Do this once per Mac, and once per server.** The root below is made once, ever, on whichever Mac
+makes it first. Each Mac that runs Deck then gets its own signing certificate, under that same root;
+a second Mac never makes a second root. The server gets the root certificate once, and gets one more
+signing certificate enrolled for every Mac you add after the first.
+
+### On the Mac: make the root, once
+
+`root-ca` is linked into `~/.local/bin` by the laptop install, alongside Deck itself, so it is already
+on your PATH once Deck is installed. Making the root asks for Touch ID (or your account's password, on
+a Mac with no Touch ID), because the key it protects is generated inside the Secure Enclave and never
+leaves it:
+
+```
+root-ca generate-root --out ~/root-ca.crt
+```
+
+Keep `~/root-ca.crt`; you will copy it to the server below, and to every other Mac's own copy of this
+step is unnecessary — only the FIRST Mac runs `generate-root`. A second Mac goes straight to the next
+section, using this same root certificate, carried over from the first.
+
+### On the Mac: make this Mac's own signing key, in Deck
+
+Open Deck's signing-key settings and create this Mac's own Secure Enclave key and a certificate
+request from it; Deck exports the request as a file. This is also behind Touch ID, since the key it
+makes is a second Secure Enclave key, never the root's.
+
+### On the Mac: sign this Mac's request
+
+```
+root-ca sign-signer --email <your email> --machine your-mac-name \
+  --csr ~/Downloads/deck-signing-request.csr --root-cert ~/root-ca.crt --out ~/deck-signer.crt
+```
+
+`--email` is your own email, lower case; `--machine` is a short name for this Mac (lowercase letters,
+digits and hyphens only), which is what the server's refusal message below names when this Mac's
+signature does not verify. This asks for Touch ID again, to use the root's key, and prints the
+request's own public-key fingerprint before it signs — compare that against the fingerprint Deck's
+settings show for the request it made, and stop if they differ; signing the wrong request would hand
+a certificate naming this Mac to a key that is not this Mac's own. It then prints the issued
+certificate's fingerprint and expiry, which is what the server will report back once you enroll it.
+
+### On the Mac: give the certificate back to Deck
+
+Back in Deck's signing-key settings, import `~/deck-signer.crt`. Deck now holds, behind the Secure
+Enclave, the one key it needs to sign an approve, a decline or a model choice.
+
+### On the server: enroll this Mac's signing certificate
+
+Copy both files to the server — `scp` or any other way you already trust — then run the one command
+that places the root (the first time) and enrolls this Mac's signer (every time):
+
+```
+python3 ~/src/shipwright/bin/enroll-signer --root-cert root-ca.crt --signer-cert deck-signer.crt
+```
+
+It checks the signing certificate against every rule the Library's protocol states for one — signed
+directly by the root, with the right purpose, key usage and subject names — before it changes
+anything, and refuses naming which rule failed if the certificate does not meet them. On a two- or
+three-account install, run it with `sudo`; the Library's own account holds the root certificate and
+the registry this enrolls into, and only root can reach that account without opening its home
+directly. `--check` reports whether the root is placed and whether a given signer is enrolled,
+without changing anything:
+
+```
+python3 ~/src/shipwright/bin/enroll-signer --check --root-cert root-ca.crt --signer-cert deck-signer.crt
+```
+
+**If you skip this, or enroll the wrong certificate, Deck's Approve, Decline and model-choice acts
+still work for everyone else**, and for this Mac too, carried by your account's own credential as
+they were before. The one thing that changes once ANY Mac has been enrolled is that an act carrying a
+signature the server cannot verify — a certificate it has never seen, one signed by a different root,
+or one whose Touch ID proof has expired — is refused rather than quietly falling back; Deck shows that
+as a failed approve or decline, and re-pressing it asks for Touch ID again.
+
+### Adding a second Mac
+
+Repeat "make this Mac's own signing key, in Deck", "sign this Mac's request" and "give the
+certificate back to Deck" on the new Mac, using the SAME `root-ca.crt` the first Mac made — copy that
+one file over, rather than running `root-ca generate-root` again. Then run `bin/enroll-signer` on the
+server again, with that new Mac's own `--signer-cert` and the same `--root-cert`; the server already
+holds the root, so this only enrolls the new signer. Making a second root would strand every
+certificate the first one signed, and `bin/enroll-signer` refuses before it would let that happen.
+
 ## Your first crew
 
 When the steward creates a crew, three things appear:
@@ -239,6 +351,14 @@ none would work after a restore: a new install makes its own notification key.
 
 The backups stay on this machine, in `~/.local/state/builder-backup`. Your machine's own backups,
 such as a VM snapshot, are what carry them off it.
+
+**This covers the single-account install this page describes.** On the two- and three-account
+shapes, the `agents` account that takes this backup must never get a readable copy of the
+Library's database, cold store or blobs, so those three are backed up separately, every six hours,
+by a job that runs as the Library's own service account, into `.local/state/builder-backup` under
+that account's own home. On those shapes, `agents`' own `~/.local/state/builder-backup` holds only
+Orient's database and the knowledge repository. The stale-backup notice at the start of a session
+reports `agents`' backup alone, so nothing warns you if the Library account's backup stops. Restoring either shape is not written up here yet; nobody has rehearsed it end to end.
 
 To take one now, before a reboot for instance:
 
@@ -326,21 +446,34 @@ in `~/.local/state/orient.log`, because it starts while the Library is still sta
 ## Removing Builder
 
 This covers the single-account install this page describes. `bin/uninstall-builder` also removes
-the two- and three-account shapes, each detected from what `install-privileged` recorded and
-needing `sudo`; nobody has yet run it end to end on a real machine for any shape.
+the two- and three-account shapes, each detected from what `install-privileged` recorded; those two
+need `sudo`, since each stops the agents account's own system-scope jobs and removes the root-owned
+tree and the accounts themselves. A three-account rehearsal found four defects in it, since fixed;
+a two-account removal has not yet been rehearsed on real hardware.
 
 ```
 python3 ~/src/shipwright/bin/uninstall-builder --dry-run
 python3 ~/src/shipwright/bin/uninstall-builder
 ```
 
-The first line lists what it would remove and changes nothing. The second stops and removes Builder's
-background jobs, the deploy areas under `~/.local/deploy`, the linked commands and skills, the MCP
-registrations, the one hook it added to `~/.claude/settings.json`, and the rest of Builder's state
-under `~/.local/state`. It also removes `~/.claude/CLAUDE.md` when it still matches what this install
-shipped, and `~/.knowledge-index` when every entry in it is one it recognizes as part of agent-platform's
-derived index. It removes only what an install placed; a file or link it did not make stays, and the
-closing report names it and says why.
+On the two-account and three-account shapes, run the same command with `sudo`:
+
+```
+sudo python3 ~/src/shipwright/bin/uninstall-builder --dry-run
+sudo python3 ~/src/shipwright/bin/uninstall-builder
+```
+
+Every line above runs under whatever `python3` is first on `PATH`. On a Mac that is Apple's own,
+older than the Python 3.11 a job declaration needs to read; this reexecs itself under Homebrew's
+`python3.11` before that matters, or refuses, naming what to install, when neither is new enough.
+
+The first line of each pair lists what it would remove and changes nothing. The second stops and
+removes Builder's background jobs, the deploy areas under `~/.local/deploy`, the linked commands
+and skills, the MCP registrations, the one hook it added to `~/.claude/settings.json`, and the rest
+of Builder's state under `~/.local/state`. It also removes `~/.claude/CLAUDE.md` when it still matches
+what this install shipped, and `~/.knowledge-index` when every entry in it is one it recognizes as part
+of agent-platform's derived index. It removes only what an install placed; a file or link it did not
+make stays, and the closing report names it and says why.
 
 It asks before removing the Library's store and your backups, since they hold your work: the work
 queue, the Library's own copy of what it has indexed, and every backup `builder-backup` has taken.

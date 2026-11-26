@@ -13,7 +13,13 @@ job's `prepare` step: `prepare` runs before the job's service starts, and the
 Library is not yet serving anything. Run there, every document was refused
 with "the project registry could not be read", the index stayed at 0 docs,
 and prepare's own marker stopped it from ever being retried — a rehearsal on
-a fresh, clean machine hit exactly that. `bin/stand-up-backend` now runs this
+a fresh, clean machine hit exactly that. The wait below probes `/whoami` with
+`agent-platform-registry-reader-token`, the credential `agentctl kb sync`
+itself presents for that same registry read, so "the Library answers" means
+"the Library answers the sync" on every shape — a three-account rehearsal
+(2026-11-19) found this script probing with Orient's own credential instead,
+which `agents` cannot read once Orient has its own account.
+`bin/stand-up-backend` now runs this
 after `supervise` has started the Library (with `--activate`), and
 `payload/bin/builder-update` runs it after its own restart step, passing
 `--soft`: an update's index is usually already built, and a sync that
@@ -55,23 +61,35 @@ def default_deploy_root() -> Path:
     return root.expanduser()
 
 
-def orient_token_path() -> Path:
-    """Orient's own Library credential, minted by `jobs/library.toml`'s prepare steps."""
-    return Path.home() / ".orient-control" / "library-token"
+REGISTRY_READER_TOKEN_NAME = "agent-platform-registry-reader-token"
+
+
+def registry_reader_token_path() -> Path:
+    """The credential `agentctl kb sync` itself presents to the Library when it
+    reads the project registry — minted by `jobs/library.toml`'s `prepare`
+    steps into the account that runs this script on every shape: the shared
+    operator home on a single-account install, and `agents`' own home on the
+    two- and three-account shapes, where `bin/deliver-library-credentials`
+    copies it out of the Library's own account. Orient's own credential,
+    `library-token`, is never read here: on the two- and three-account shapes
+    it stays in Orient's own account, which `agents` cannot read, and probing
+    with it is what the three-account rehearsal (2026-11-19) refused on."""
+    return Path.home() / ".orient-control" / REGISTRY_READER_TOKEN_NAME
 
 
 def library_answers(timeout: float, url: str = LIBRARY_URL, token_path: Path | None = None) -> str | None:
-    """None once the Library answers `/whoami` for Orient's credential, else why not.
+    """None once the Library answers `/whoami` for the credential `agentctl kb
+    sync` itself presents, else why not.
 
     `timeout` of 0 makes this a single probe, with no wait — what --check and
     --status run. The credential reaches `curl` on its standard input, never
     on its command line, the way `payload/docs/after-installing.md` passes it.
     """
-    token_path = token_path or orient_token_path()
+    token_path = token_path or registry_reader_token_path()
     try:
         token = token_path.read_text(encoding="utf-8").strip()
     except OSError as exc:
-        return f"cannot read Orient's Library credential at {token_path}: {exc}"
+        return f"cannot read {REGISTRY_READER_TOKEN_NAME} at {token_path}: {exc}"
     deadline = time.monotonic() + timeout
     while True:
         try:
@@ -84,7 +102,8 @@ def library_answers(timeout: float, url: str = LIBRARY_URL, token_path: Path | N
         except OSError as exc:
             why = f"curl could not run: {exc}"
         if why is None or time.monotonic() >= deadline:
-            return None if why is None else f"the Library did not answer /whoami for Orient's credential: {why}"
+            return (None if why is None
+                    else f"the Library did not answer /whoami for {REGISTRY_READER_TOKEN_NAME}: {why}")
         time.sleep(2)
 
 

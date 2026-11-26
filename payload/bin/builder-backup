@@ -2,6 +2,10 @@
 """Write a verified copy of what this machine's Builder cannot rebuild.
 
     builder-backup                     take a backup now
+    builder-backup --library-only      take only the Library's own three pieces
+    builder-backup --orient-only       take only Orient's database
+    builder-backup --skip-library      take everything except the Library's three pieces
+    builder-backup --skip-orient       take everything except Orient's database
     builder-backup --status            when the last backup succeeded; 1 if too long ago
     builder-backup --session-hook      the same check, said only when it is STALE
 
@@ -15,6 +19,25 @@ which the machine's own backups (a VM snapshot, a disk image) carry off it:
 - Orient's database, `control.db`;
 - the Library's blobs, the files those records point at;
 - the knowledge repository, as a git bundle of every ref.
+
+**ON THE SHAPES WITH A LIBRARY ACCOUNT AND AN ORIENT ACCOUNT, THE FIVE PIECES
+ARE THREE SEPARATE RUNS, AS THREE DIFFERENT ACCOUNTS.** `agents` must never
+get a readable copy of the Library's database, cold store or blobs, nor of
+Orient's database, so on those shapes `jobs/builder-backup.toml` passes both
+`--skip-library` and `--skip-orient` (by way of `BUILDER_BACKUP_SKIP_LIBRARY`
+and `BUILDER_BACKUP_SKIP_ORIENT` — see that declaration) and backs up only the
+knowledge repository; `jobs/library-backup.toml` runs as the Library's own
+account and passes `--library-only`, backing up only the Library's three
+pieces, into a destination under that account's own home; `jobs/
+orient-backup.toml` runs as Orient's own account and passes `--orient-only`,
+backing up only Orient's database, into a destination under Orient's own
+home. None of these flags changes `--status` or `--session-hook`: each still
+reports on whatever `--dest` it is pointed at, so agents' own check means
+"what agents backs up is fresh", not "the Library's or Orient's backup is
+fresh" — nothing on those shapes runs an interactive session as either
+account, so nothing surfaces its staleness to an operator the way the session
+hook does for agents'. The single-account shape passes none of these flags
+and keeps backing up everything in one pass, as it always has.
 
 **ALL THREE DATABASES MUST BE THERE.** The install creates `cold.db` with
 `init_cold.py` (jobs/library.toml), and the Library refuses to start without it,
@@ -291,23 +314,38 @@ def lock_and_clear(dest: Path) -> int:
     return lock
 
 
-def take(library_state: Path, knowledge: Path, dest: Path, orient_db: Path) -> dict:
-    """One backup; the caller holds the lock `lock_and_clear` took."""
+def take(library_state: Path, knowledge: Path | None, dest: Path, orient_db: Path | None,
+        *, library_only: bool = False, skip_library: bool = False,
+        orient_only: bool = False, skip_orient: bool = False) -> dict:
+    """One backup; the caller holds the lock `lock_and_clear` took.
+
+    With no flag, every piece is taken, as always. `library_only` takes only
+    the Library's database, cold store and blobs. `orient_only` takes only
+    Orient's database. `skip_library` and `skip_orient` each take everything
+    except the piece they name. Any combination that would take nothing —
+    `library_only` with `skip_library` or `orient_only`, or `orient_only`
+    with `skip_orient` — is refused together by `main`, never here.
+    """
+    do_library = not skip_library and not orient_only
+    do_orient = not library_only and not skip_orient
+    do_knowledge = not library_only and not orient_only
     started = now()
     staging = dest / f".staging-{os.getpid()}"
     staging.mkdir(mode=0o700)
     try:
-        manifest = {
-            "started": stamp(started),
-            "database": copy_database(library_state / DB_NAME, staging / DB_NAME),
-            "cold_store": copy_database(library_state / COLD_NAME, staging / COLD_NAME,
-                                        "Library cold store"),
-            "orient": copy_database(orient_db, staging / ORIENT_NAME, "Orient database",
-                                    drop=ORIENT_DROPPED),
+        manifest = {"started": stamp(started)}
+        if do_library:
+            manifest["database"] = copy_database(library_state / DB_NAME, staging / DB_NAME)
+            manifest["cold_store"] = copy_database(library_state / COLD_NAME, staging / COLD_NAME,
+                                                    "Library cold store")
+        if do_orient:
+            manifest["orient"] = copy_database(orient_db, staging / ORIENT_NAME, "Orient database",
+                                               drop=ORIENT_DROPPED)
+        if do_library:
             # After the database, so each blob a copied row names already exists.
-            "blobs": copy_blobs(library_state / "blobs", dest / "blobs"),
-            "knowledge": bundle_knowledge(knowledge, staging / BUNDLE_NAME),
-        }
+            manifest["blobs"] = copy_blobs(library_state / "blobs", dest / "blobs")
+        if do_knowledge:
+            manifest["knowledge"] = bundle_knowledge(knowledge, staging / BUNDLE_NAME)
         manifest["finished"] = stamp(now())
         private_file(staging / MANIFEST_NAME, json.dumps(manifest, indent=2) + "\n")
 
@@ -410,7 +448,56 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--max-age-hours", type=int, default=DEFAULT_MAX_AGE_HOURS,
                         help=f"how old the last success may be under --status "
                              f"(default {DEFAULT_MAX_AGE_HOURS})")
+    # --skip-library and --skip-orient are deliberately NOT mutually exclusive
+    # with each other: the agents job on a shape with both a Library and an
+    # Orient account sets both defaults at once (by way of their own
+    # environment variables), taking the knowledge repository alone, and that
+    # is a real mode, not a contradiction. Each is still refused together with
+    # ITS OWN "only" flag below, since that pairing always takes nothing.
+    only_mode = parser.add_mutually_exclusive_group()
+    only_mode.add_argument("--library-only", action="store_true",
+                           help="take only the Library's database, cold store and blobs — for "
+                                "the job that runs as the Library's own account on the shapes "
+                                "where it has one")
+    only_mode.add_argument("--orient-only", action="store_true",
+                           help="take only Orient's database — for the job that runs as "
+                                "Orient's own account on the shapes where it has one")
+    parser.add_argument(
+        "--skip-library", action="store_true",
+        # BUILDER_BACKUP_SKIP_LIBRARY IS THE DEFAULT, NEVER A SEPARATE PATH: on
+        # the shapes with a Library account, jobs/builder-backup.toml sets it
+        # in `[account-environment]`, which applies only while `agents` is in
+        # force (FORMAT.md, "account-environment") — so --single-account, which
+        # drops that entry with the account, gets the same default this flag
+        # has always had, and the command this job runs stays byte-identical
+        # there. An explicit --skip-library on the command line always wins.
+        default=os.environ.get("BUILDER_BACKUP_SKIP_LIBRARY") == "1",
+        help="take everything except the Library's database, cold store and blobs — for the "
+             "job that runs as agents on the shapes where the Library has its own account, "
+             "which agents must never read a copy of. Defaults to true when "
+             "BUILDER_BACKUP_SKIP_LIBRARY=1 is set")
+    parser.add_argument(
+        "--skip-orient", action="store_true",
+        # BUILDER_BACKUP_SKIP_ORIENT IS THE DEFAULT, NEVER A SEPARATE PATH, the
+        # same reasoning as BUILDER_BACKUP_SKIP_LIBRARY above: set in
+        # [account-environment], dropped with the account under
+        # --single-account, which keeps the command byte-identical there.
+        default=os.environ.get("BUILDER_BACKUP_SKIP_ORIENT") == "1",
+        help="take everything except Orient's database — for the job that runs as agents on "
+             "the shapes where Orient has its own account, which agents must never read a "
+             "copy of. Defaults to true when BUILDER_BACKUP_SKIP_ORIENT=1 is set")
     args = parser.parse_args(argv)
+    # library_only with orient_only is already refused by the group above,
+    # since both are always explicit flags, never environment defaults. Each
+    # "only" flag with ITS OWN skip flag is refused here instead, since the
+    # skip side may be an environment default the group above cannot see, and
+    # either way the pairing would take nothing.
+    if args.library_only and args.skip_library:
+        parser.error("--library-only cannot run with --skip-library "
+                     "(BUILDER_BACKUP_SKIP_LIBRARY=1 sets it): together they take nothing")
+    if args.orient_only and args.skip_orient:
+        parser.error("--orient-only cannot run with --skip-orient "
+                     "(BUILDER_BACKUP_SKIP_ORIENT=1 sets it): together they take nothing")
 
     if args.status:
         return status(args.dest, args.max_age_hours)
@@ -421,8 +508,10 @@ def main(argv: list[str]) -> int:
     lock = None
     try:
         lock = lock_and_clear(args.dest)
-        knowledge = args.knowledge or default_knowledge()
-        manifest = take(args.library_state, knowledge, args.dest, args.orient_db)
+        knowledge = None if (args.library_only or args.orient_only) else (args.knowledge or default_knowledge())
+        manifest = take(args.library_state, knowledge, args.dest, args.orient_db,
+                        library_only=args.library_only, skip_library=args.skip_library,
+                        orient_only=args.orient_only, skip_orient=args.skip_orient)
     # A database or disk error is a failed run like any check that fails, and it
     # is recorded the same way: a traceback left no last-failure behind, so
     # --status could not say why the backup had stopped.
@@ -440,15 +529,34 @@ def main(argv: list[str]) -> int:
     finally:
         if lock is not None:
             os.close(lock)
-    db, blobs = manifest["database"], manifest["blobs"]
-    cold, orient = manifest["cold_store"], manifest["orient"]
     print(f"{PROG}: backed up to {args.dest / 'latest'} at {manifest['finished']}: "
-          f"{db['tables']} tables and {db['rows']} rows, integrity_check ok; "
-          f"cold store {cold['rows']} rows and Orient {orient['rows']} rows, both integrity_check ok"
-          f"{''.join(f', {n} {t} row(s) dropped' for t, n in orient['dropped'].items())}; "
-          f"{blobs['copied']} blob(s) added, {blobs['held']} held; "
-          f"knowledge at {manifest['knowledge']['head'][:12]}, bundle verified")
+          f"{'; '.join(summary_parts(manifest))}")
     return 0
+
+
+def summary_parts(manifest: dict) -> list[str]:
+    """One phrase per piece `take` actually ran, in the same order the old,
+    unconditional summary always printed them — each piece is present in
+    `manifest` only when the run that produced it was asked for it."""
+    parts = []
+    if "database" in manifest:
+        db = manifest["database"]
+        parts.append(f"{db['tables']} tables and {db['rows']} rows, integrity_check ok")
+    if "cold_store" in manifest:
+        cold = manifest["cold_store"]
+        parts.append(f"cold store {cold['rows']} rows, integrity_check ok")
+    if "orient" in manifest:
+        orient = manifest["orient"]
+        parts.append(
+            f"Orient {orient['rows']} rows, integrity_check ok"
+            f"{''.join(f', {n} {t} row(s) dropped' for t, n in orient['dropped'].items())}"
+        )
+    if "blobs" in manifest:
+        blobs = manifest["blobs"]
+        parts.append(f"{blobs['copied']} blob(s) added, {blobs['held']} held")
+    if "knowledge" in manifest:
+        parts.append(f"knowledge at {manifest['knowledge']['head'][:12]}, bundle verified")
+    return parts
 
 
 if __name__ == "__main__":
